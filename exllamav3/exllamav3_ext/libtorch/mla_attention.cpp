@@ -12,6 +12,7 @@
 #include "../hgemm.cuh"
 #include "../add.cuh"
 #include "../dsa_topk.cuh"
+#include "../cublas_handle.cuh"
 
 BC_MLAttention::BC_MLAttention
 (
@@ -856,9 +857,11 @@ void BC_MLAttention::run
 
     if (!s.graph->ready)
     {
-        s.graph->capture_begin();
+        // A slot can be warmed on a different CPU thread during loading.
+        if (idx_mode == 1) (void) exl3_cublas_handle(stream);
+        GraphCapture capture(*s.graph);
         run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, regime, t_total, ext_indices, s.graph.get());
-        s.graph->capture_end();
+        capture.finish();
         s.runs = 2;
     }
 
