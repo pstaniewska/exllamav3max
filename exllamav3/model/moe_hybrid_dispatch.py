@@ -13,8 +13,8 @@ Hybrid CPU/GPU expert dispatcher (EXL3_HYBRID_MOE=1 / -mh).
 One dispatcher per model component (main model, MTP head, draft model), each with its own worker
 group (moe_numa_hosts.HostGroup); all components on a device share that device's single
 ExpertCache owner and budget (moe_expert_cache). Speculative decoding is invisible here: a verify
-forward is just a forward with more rows, routed through the same decode (rows below the
-streaming threshold) or prefill path. Nothing depends on q_len == 1.
+forward is just a forward with more rows, routed through the same decode (rows up to the CPU
+slot capacity, EXL3_EXPERT_DECODE_MAX_ROWS) or prefill path. Nothing depends on q_len == 1.
 
 Numerics: every GPU lane runs the unmodified ExLlamaV3 kernels on the original EXL3 weights,
 whether read from VRAM or over PCIe, so with EXL3_EXPERT_DISPATCH_POLICY=gpu_exact the layer is
@@ -84,6 +84,12 @@ class HybridTuning:
         self.cpu_frac_init = float(os.environ.get("EXL3_MOE_ZC_CPU_FRAC_INIT", 0.5))
         self.zc_fused_rows = int(os.environ.get("EXL3_EXPERT_CACHE_ZC_FUSED_ROWS", 32))
         self.prefill_gpu_min = int(os.environ.get("EXL3_EXPERT_PREFILL_GPU_MIN", 8))
+        # Widest pass that takes the decode path (cost model, cache admission, no host sync),
+        # capped by the CPU slot capacity. Unset: the slot capacity, so speculative verify passes
+        # (batch x (draft + 1) rows, hybrid drafts of up to 63 tokens at batch 1) and batched
+        # decode stay decode-shaped. Below EXL3_MOE_STREAM_MIN_ROWS restores the former boundary
+        dmr = os.environ.get("EXL3_EXPERT_DECODE_MAX_ROWS", "").strip()
+        self.decode_max_rows = int(dmr) if dmr else None
         self.ema = float(os.environ.get("EXL3_MOE_ADAPTIVE_EMA", 0.1))
         self.debug = os.environ.get("EXL3_HYBRID_MOE_DEBUG", "0") not in ("", "0")
         # Exposed CPU-lane wait measured with CUDA events (no host sync: completed event pairs
@@ -93,6 +99,13 @@ class HybridTuning:
 
 
 HT = HybridTuning()
+
+
+def decode_rows(cap_rows: int) -> int:
+    """Rows up to which a pass takes the decode path: EXL3_EXPERT_DECODE_MAX_ROWS, at most the CPU
+    slot capacity (the decode path stages every row of the call into one worker slot)"""
+    want = cap_rows if HT.decode_max_rows is None else HT.decode_max_rows
+    return max(0, min(want, cap_rows))
 
 
 class Telemetry:
@@ -177,7 +190,7 @@ class HybridLayer:
         self.cpuloc = cpuloc                # (num_hosts, E) worker-local index or -1
         self.cache_layer = None
         self.finalized = False
-        # Decode-size static buffers (rows below the streaming threshold): masked selection
+        # Decode-size static buffers (rows up to the slot capacity): masked selection
         cap = max(dispatcher.cap_rows, 1) * self.topk
         self.sel_buf = torch.empty((cap,), dtype = torch.long, device = self.device)
         self.lane_buf = torch.empty((EMAX,), dtype = torch.int32, device = self.device)
@@ -231,6 +244,7 @@ class HybridDispatcher:
                     h.home = i == keep
         self.cap_rows = HOST_TUNING.cap_rows
         self.prefill_rows = HOST_TUNING.stream_min_rows
+        self.decode_rows = decode_rows(self.cap_rows)
         self.layers: list[HybridLayer] = []
         self.notices = set()
         self._init_runtime(self.group.num_nodes)
@@ -595,8 +609,8 @@ class HybridDispatcher:
         for dev in self.devices:
             cache = ExpertCache.for_device(dev)
             stream = torch.cuda.current_stream(dev) if dev.type == "cuda" else None
-            cache.begin_pass(rows, self.prefill_rows, stream)
-            if rows >= self.prefill_rows:
+            cache.begin_pass(rows, self.decode_rows + 1, stream)
+            if rows > self.decode_rows:
                 extra = max((self.worst_case(hl, rows) for hl in self.layers if hl.device == dev), default = 0)
                 cache.ensure_headroom(extra)
         self._update_lane_params()
@@ -744,7 +758,7 @@ class HybridDispatcher:
         w = routing_weights.contiguous()
         sel = selected_experts.contiguous()
         n = rows * hl.topk
-        if rows < self.prefill_rows and rows <= self.cap_rows:
+        if rows <= self.decode_rows:
             res, nodes = self._nodes_decode(hl, rows)
             sel_gpu = hl.sel_buf[:n]
             gpu_max, cpu_frac, admit, lane_cost = self._lane_args(n)
@@ -876,6 +890,29 @@ def _bounce_linear(l, bounce: torch.Tensor, off: int, nbytes: int, device):
 def finalize_all(config):
     for d in getattr(config, "moe_hybrid_dispatchers", {}).values():
         d.finalize()
+
+
+def note_kv_staging(model):
+    """Once per load, at the model's first forward (every cache is attached by then): the largest
+    quantized-cache prefill staging scratch of the model's attention layers, per device, joins
+    the expert cache floor. Autosplit loads measure it already (max-merged, not counted twice);
+    loads with an explicit split would otherwise leave only the fixed reserve free for it"""
+    if getattr(model, "_hybrid_kv_staging_noted", False):
+        return
+    model._hybrid_kv_staging_noted = True
+    from .moe_expert_cache import note_device_transient
+    margin = int(os.environ.get("EXL3_AUTOSPLIT_MARGIN_MB", 256)) << 20
+    per_device = {}
+    for m in model.get_cache_layers():
+        fn = getattr(m, "qc_staging_bytes", None)
+        nbytes = fn() if fn is not None else 0
+        if nbytes and m.device is not None:
+            dev = torch.device(m.device)
+            if dev.type == "cuda":
+                i = dev.index if dev.index is not None else 0
+                per_device[i] = max(per_device.get(i, 0), nbytes)
+    for i, nbytes in per_device.items():
+        note_device_transient(i, nbytes + margin)
 
 
 def begin_pass_all(config, x, component: str | None = None):

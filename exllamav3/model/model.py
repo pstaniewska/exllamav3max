@@ -590,6 +590,9 @@ class Model(Model_TPMixin, Model_LSMixin):
             # into what is left at the next forward pass
             from .moe_hybrid_dispatch import release_all_caches
             release_all_caches()
+            # The quantized-cache staging scratch joins the expert cache floor again at this
+            # load's first forward (moe_hybrid_dispatch.note_kv_staging)
+            self._hybrid_kv_staging_noted = False
 
             assert not (bool(reserve_per_device) and bool(use_per_device)), \
                 "Cannot specify both memory usage and memory reserve."

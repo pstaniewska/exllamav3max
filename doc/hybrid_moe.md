@@ -131,13 +131,17 @@ the memory actually available (`cudaMemGetInfo` free plus the caching allocator'
 reserved-but-unallocated pool) minus a floor. The floor is the larger of:
 
 - `EXL3_EXPERT_CACHE_RESERVE_MB`;
-- the largest known transient plus `EXL3_EXPERT_CACHE_MIN_FREE_MB`. The transient comes from three
+- the largest known transient plus `EXL3_EXPERT_CACHE_MIN_FREE_MB`. The transient comes from four
   places:
   - every autosplit load of any component on the device (main model, MTP head, vision tower,
     draft model), plus `EXL3_AUTOSPLIT_MARGIN_MB`. These are max-merged per device, so a later
     component never lowers them, whichever loading API it used. They are cleared when the device's
     last hybrid layer unloads, so a smaller model loaded next is measured afresh.
   - transients noted on the owner;
+  - the quantized KV cache's prefill staging scratch (fp16 K and V of the whole cache pool, plus
+    `EXL3_AUTOSPLIT_MARGIN_MB`), noted at each load's first forward. Autosplit loads already measure
+    it; loads with an explicit `--gpu_split` would otherwise keep only the fixed reserve free for a
+    scratch that every long prefill chunk allocates at full size;
   - the largest prefill MoE bound seen so far.
 
 `EXL3_EXPERT_CACHE_LIMIT_GB` caps the size. Nothing is hard-coded to a card size.
@@ -337,7 +341,8 @@ the end of each slot before publishing `done`.
 
 ## Prefill
 
-Calls of at least `EXL3_MOE_STREAM_MIN_ROWS` rows mark hits only. A non-resident expert with a
+Calls wider than the decode boundary (`EXL3_EXPERT_DECODE_MAX_ROWS`, default and maximum the CPU
+slot capacity `EXL3_MOE_CPU_SLOT_ROWS`) take the prefill path and mark hits only. A non-resident expert with a
 GPU-readable home runs zero-copy when it has at least `EXL3_EXPERT_PREFILL_GPU_MIN` rows in the
 chunk; otherwise it goes to its node's CPU lane. `gpu_exact` sends every readable expert to the GPU.
 
@@ -360,9 +365,16 @@ The GPU tiers are the upstream ones with two changes:
 ## Speculative decoding
 
 Verify forwards from MTP heads, draft models, DFlash2 and n-gram drafting are forwards with
-`jobs × (1 + window)` rows. They take the decode path (fewer rows than the streaming threshold, up
-to `EXL3_MOE_CPU_SLOT_ROWS`) or the prefill path. Nothing in the dispatcher, cache or workers
-assumes one row.
+`jobs × (1 + window)` rows. They take the decode path up to `EXL3_EXPERT_DECODE_MAX_ROWS` rows
+(default `EXL3_MOE_CPU_SLOT_ROWS`, 64) and the prefill path above it. Nothing in the dispatcher,
+cache or workers assumes one row.
+
+The boundary sits at the slot capacity rather than at `EXL3_MOE_STREAM_MIN_ROWS` (32) so that
+hybrid suffix-match drafting (`-hdt`), whose rounds verify `jobs × (1 + hybrid_draft_tokens)` rows,
+and batched speculative decoding keep the decode lane policy (measured cost model, no host sync per
+layer) instead of the prefill rule that sends every non-resident expert with fewer than
+`EXL3_EXPERT_PREFILL_GPU_MIN` rows to a CPU lane. Set `EXL3_EXPERT_DECODE_MAX_ROWS=31` for the former
+boundary.
 
 Each component (main, `mtp`, a draft model) gets its own dispatcher and worker group, and they
 share each device's cache owner. DFlash2's drafter has no MoE. Drafters and acceptance rules are
@@ -394,6 +406,7 @@ classic paths, `EXL3_NUMA_ENABLE=1`) is set.
 | `EXL3_EXPERT_CACHE_DEBUG` | `0` | print growth / shrink / warm start |
 | `EXL3_EXPERT_HOME` | `native_copy` | `native_copy` or `worker_arena` |
 | `EXL3_EXPERT_HOME_PIN_LIMIT_GB` | unset | registered-bytes cap for homes |
+| `EXL3_EXPERT_DECODE_MAX_ROWS` | slot rows (`64`) | widest call on the decode path; wider calls take the prefill path |
 | `EXL3_EXPERT_PREFILL_GPU_MIN` | `8` | prefill rows for a non-resident expert to go zero-copy |
 | `EXL3_MOE_ZC_MAX` | `auto` | GPU quota of misses per decode call |
 | `EXL3_MOE_ZC_CPU_FRAC_INIT` | `0.5` | CPU share of flexible misses until the cost model is measured |

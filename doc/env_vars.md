@@ -802,7 +802,9 @@ its default. In short:
   and its experts take CPU lanes.
 - **Lanes:** `EXL3_MOE_ZC_MAX`. `auto` uses a measured cost model: a miss goes to a CPU node only
   if that shortens the call's slowest lane. Also `EXL3_MOE_ZC_CPU_FRAC_INIT` (the share used
-  until the costs are measured), `EXL3_MOE_COST_REMEASURE`, `EXL3_EXPERT_PREFILL_GPU_MIN`, `EXL3_MOE_ADAPTIVE_EMA`,
+  until the costs are measured), `EXL3_MOE_COST_REMEASURE`, `EXL3_EXPERT_DECODE_MAX_ROWS` (widest
+  call on the decode lane policy, default the CPU slot rows; wider calls use the prefill rule),
+  `EXL3_EXPERT_PREFILL_GPU_MIN`, `EXL3_MOE_ADAPTIVE_EMA`,
   `EXL3_HYBRID_MOE_DEBUG`, and `EXL3_HYBRID_MOE_PROFILE` (CPU-lane wait measured with CUDA events,
   no host sync).
 - **NUMA:** `EXL3_NUMA_ENABLE` (one CPU worker per node; also applies to `-mcl` / `-mcs`, whose

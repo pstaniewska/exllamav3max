@@ -99,6 +99,7 @@ def make(E = 16, N = 2, rows = 1, topk = 4, h = 8, **ht):
     d.group = type("G", (), dict(hosts = hosts, pref = -1, num_nodes = N))()
     d.node_policy = 0
     d.cap_rows, d.prefill_rows = 64, 32
+    d.decode_rows = D.decode_rows(d.cap_rows)
     d.layers, d.notices, d.tag, d.comp = [], set(), "text", "text"
     d._init_runtime(N)
     d.devices.add(torch.device("cpu"))
@@ -181,13 +182,17 @@ def test_cost_model_only_from_measurements():
     assert d._lane_args(4)[3] is None           # exact mode never passes costs
 
 
-@pytest.mark.parametrize("rows", [1, 8, 9, 31, 32, 64, 128, 256, 512])
-def test_row_boundaries_pick_the_path_and_fold_cpu_partials(rows):
-    # rows < prefill_rows (32) and <= slot capacity: decode path (slot protocol); otherwise the
+@pytest.mark.parametrize("decode_max", [None, 31])
+@pytest.mark.parametrize("rows", [1, 8, 9, 31, 32, 33, 64, 65, 128, 256, 512])
+def test_row_boundaries_pick_the_path_and_fold_cpu_partials(rows, decode_max):
+    # rows <= the decode boundary (EXL3_EXPERT_DECODE_MAX_ROWS, default the slot capacity 64; 31
+    # is the former streaming-threshold boundary): decode path (slot protocol); otherwise the
     # prefill path (CPU rows compacted per node, folded in after the GPU tiers). Admission only
     # for calls with <= EXL3_EXPERT_CACHE_ADMIT_MAX picks
     topk, E, N = 4, 32, 2
-    d, hl, hosts, cache = make(E = E, N = N, rows = rows, topk = topk, dispatch = "hybrid", zc_max = 1)
+    d, hl, hosts, cache = make(E = E, N = N, rows = rows, topk = topk, dispatch = "hybrid", zc_max = 1,
+                               decode_max_rows = decode_max)
+    assert d.decode_rows == (64 if decode_max is None else decode_max)
     hl.hi = hl.h = 8
     torch.manual_seed(rows)
     sel = torch.stack([torch.randperm(E)[:topk] for _ in range(rows)])
@@ -195,7 +200,7 @@ def test_row_boundaries_pick_the_path_and_fold_cpu_partials(rows):
     w = torch.rand((rows, topk)).half()
     admits0 = cache.stats()["admits"]
     pend, sel_gpu = d.submit(hl, y, sel, w)
-    decode = rows < d.prefill_rows and rows <= d.cap_rows
+    decode = rows <= d.decode_rows
     assert pend.kind == ("decode" if decode else "prefill")
     if decode:
         for h in hosts:
@@ -225,9 +230,9 @@ def test_row_boundaries_pick_the_path_and_fold_cpu_partials(rows):
 
 
 def test_prefill_gpu_exact_keeps_the_fused_plan():
-    d, hl, hosts, cache = make(E = 16, N = 2, rows = 40, dispatch = "gpu_exact", zc_max = None)
-    sel = torch.stack([torch.randperm(16)[:4] for _ in range(40)])
-    pend, sel_gpu = d.submit(hl, torch.randn((40, 8)).half(), sel, torch.rand((40, 4)).half())
+    d, hl, hosts, cache = make(E = 16, N = 2, rows = 80, dispatch = "gpu_exact", zc_max = None)
+    sel = torch.stack([torch.randperm(16)[:4] for _ in range(80)])
+    pend, sel_gpu = d.submit(hl, torch.randn((80, 8)).half(), sel, torch.rand((80, 4)).half())
     assert pend.kind == "prefill" and pend.fused_cap is None
     assert torch.equal(sel_gpu, sel) and pend.items == []
 
@@ -388,3 +393,46 @@ def test_cost_model_remeasures_when_cpu_samples_stop():
     hosts[0].tel = [(6, 380, 4, 4, 1)]          # a new sample resets the count
     d._update_lane_params()
     assert d.cost_stale == 0
+
+
+@pytest.mark.parametrize("env, want", [(None, 64), (31, 31), (200, 64), (0, 0)])
+def test_decode_boundary_is_capped_by_the_slot_capacity(env, want):
+    D.HT.decode_max_rows = env
+    assert D.decode_rows(64) == want
+
+
+def test_kv_staging_joins_the_floor_once_per_load():
+    # An explicit-split load has no autosplit measurement: the quantized-cache prefill staging
+    # scratch (largest per device, plus the autosplit margin) must reach the cache floor at the
+    # first forward, max-merged with what autosplit noted, and only once per load
+    class Attn:
+        def __init__(self, device, nbytes):
+            self.device, self.nbytes, self.calls = device, nbytes, 0
+
+        def qc_staging_bytes(self):
+            self.calls += 1
+            return self.nbytes
+
+    class Model:
+        def __init__(self, layers):
+            self.layers = layers
+
+        def get_cache_layers(self):
+            return self.layers
+
+    H.cache.ExpertCache._drop_registry()
+    margin = 256 << 20
+    layers = [Attn("cuda:0", 300 << 20), Attn("cuda:0", 500 << 20), Attn("cuda:1", 0), Attn(None, 1 << 30),
+              Attn(torch.device("cpu"), 1 << 30)]
+    model = Model(layers)
+    H.cache.note_device_transient(1, 7 << 20)
+    D.note_kv_staging(model)
+    assert H.cache._DEVICE_TRANSIENT[("cuda", 0)] == (500 << 20) + margin
+    assert H.cache._DEVICE_TRANSIENT[("cuda", 1)] == 7 << 20      # nothing staged there
+    D.note_kv_staging(model)
+    assert all(a.calls == 1 for a in layers)
+    H.cache.note_device_transient(0, 2 << 30)                       # autosplit measured more
+    model._hybrid_kv_staging_noted = False                          # next load
+    D.note_kv_staging(model)
+    assert H.cache._DEVICE_TRANSIENT[("cuda", 0)] == 2 << 30
+    H.cache.ExpertCache._drop_registry()
