@@ -24,6 +24,13 @@ approximation as -mcl / -mcs); the hybrid policy trades that for latency, explic
 Lane policy inputs are measured, not assumed: the PCIe rate comes from a timed copy out of a
 registered home at finalize, each node's CPU cost from per-job worker telemetry (compute time per
 assignment). Until both are measured, EXL3_MOE_ZC_CPU_FRAC_INIT sets the CPU share of misses.
+
+Prefill uses the same measurements. A node's job cost is fitted as a per expert plus b per
+assignment (prefill_cost), and each call chooses the row threshold between the zero-copy and CPU
+lanes (choose_prefill_gpu_min). Experts with fewer rows go to the CPU, larger ones are read over
+PCIe, so the PCIe reads and the CPU nodes finish together. A faster CPU kernel (the AMX tier)
+lowers b, and the threshold rises with it. Until the fit exists, the bootstrap threshold
+PREFILL_GPU_MIN_BOOT applies; EXL3_EXPERT_PREFILL_GPU_MIN=<n> fixes the threshold.
 """
 
 from __future__ import annotations
@@ -52,6 +59,12 @@ _LIVE_TAGS: set = set()
 # CPU cost samples come only from decode-shaped jobs (rows per job up to this many): prefill
 # jobs carry many rows per expert and would overstate the per-expert cost of a decode miss
 COST_SAMPLE_MAX_ROWS = 8
+
+# Prefill threshold (rows for a non-resident expert to go zero-copy) until the prefill cost fit
+# is measured, and the former fixed default
+PREFILL_GPU_MIN_BOOT = 8
+# Decay per telemetry sample of the prefill cost fit
+PREFILL_FIT_DECAY = 0.98
 
 
 def acquire_tag(comp: str) -> str:
@@ -83,7 +96,9 @@ class HybridTuning:
         self.zc_max = None if zc == "auto" else int(zc)
         self.cpu_frac_init = float(os.environ.get("EXL3_MOE_ZC_CPU_FRAC_INIT", 0.5))
         self.zc_fused_rows = int(os.environ.get("EXL3_EXPERT_CACHE_ZC_FUSED_ROWS", 32))
-        self.prefill_gpu_min = int(os.environ.get("EXL3_EXPERT_PREFILL_GPU_MIN", 8))
+        # Unset or "auto": chosen per prefill call from measured costs; a number fixes it
+        pgm = os.environ.get("EXL3_EXPERT_PREFILL_GPU_MIN", "auto").strip().lower()
+        self.prefill_gpu_min = None if pgm in ("", "auto") else int(pgm)
         # Widest pass that takes the decode path (cost model, cache admission, no host sync),
         # capped by the CPU slot capacity. Unset: the slot capacity, so speculative verify passes
         # (batch x (draft + 1) rows, hybrid drafts of up to 63 tokens at batch 1) and batched
@@ -106,6 +121,62 @@ def decode_rows(cap_rows: int) -> int:
     slot capacity (the decode path stages every row of the call into one worker slot)"""
     want = cap_rows if HT.decode_max_rows is None else HT.decode_max_rows
     return max(0, min(want, cap_rows))
+
+
+class PrefillCostFit:
+    """One node's CPU job cost as a * experts + b * assignments (microseconds), least squares
+    over the node's telemetry records with exponential forgetting. Decode jobs (about one
+    assignment per expert) pin a; prefill jobs (many per expert) separate b from it"""
+
+    def __init__(self, decay: float = PREFILL_FIT_DECAY):
+        self.decay = decay
+        self.s = np.zeros(5)                # sum ee, ea, aa, eu, au
+
+    def add(self, experts: int, assignments: int, us: float):
+        e, a = float(experts), float(assignments)
+        self.s *= self.decay
+        self.s += (e * e, e * a, a * a, e * us, a * us)
+
+    def solve(self) -> tuple[float, float] | None:
+        """(a, b), both >= 0, or None while the records cannot separate them"""
+        ee, ea, aa, eu, au = self.s
+        if ee <= 0 or aa <= 0:
+            return None
+        det = ee * aa - ea * ea
+        if det <= 1e-3 * ee * aa:
+            return None
+        a = (eu * aa - au * ea) / det
+        b = (au * ee - eu * ea) / det
+        if b < 0:
+            return eu / ee, 0.0
+        if a < 0:
+            return 0.0, au / aa
+        return a, b
+
+
+def choose_prefill_gpu_min(counts: np.ndarray, t_gpu0: float, t_zc: float, t_fixed: float,
+                           a: float, b: float, nodes: int) -> int:
+    """Row threshold for one prefill call: non-resident experts with at least this many rows read
+    over PCIe (t_zc each, after t_gpu0 of other GPU work), the rest go to the CPU nodes (t_fixed
+    once, then a + b * rows per expert, spread over `nodes`). The CPU side costs more per row and
+    the PCIe side does not, so the smallest experts are the CPU's. Minimizes the later of the two
+    finishing times; ties keep the experts on the GPU (exact numerics)"""
+    c = np.sort(counts[counts > 0])
+    m = c.size
+    if not m:
+        return PREFILL_GPU_MIN_BOOT
+    nodes = max(nodes, 1)
+    cpu = np.concatenate(([0.0], np.cumsum(a + b * c.astype(np.float64)))) / nodes
+    k = np.arange(m + 1)
+    cpu = np.where(k > 0, cpu + t_fixed, 0.0)
+    gpu = t_gpu0 + (m - k) * t_zc
+    worst = np.maximum(cpu, gpu)
+    # A threshold cannot split equal counts: only k at a change of count (or the ends)
+    ok = np.ones(m + 1, dtype = bool)
+    ok[1:m] = c[1:] != c[:-1]
+    worst = np.where(ok, worst, np.inf)
+    best = int(np.argmin(worst))
+    return int(c[best]) if best < m else int(c[-1]) + 1
 
 
 class Telemetry:
@@ -264,6 +335,10 @@ class HybridDispatcher:
         self.lane_cost = torch.zeros((4,), dtype = torch.float)
         self.telemetry = Telemetry(n) if HT.profile else None
         self.cost_stale = 0                 # passes since the last decode-shaped CPU sample
+        self.prefill_fit = [PrefillCostFit() for _ in range(n)]
+        self.prefill_cost = None            # (a, b) us, slowest node, from the fits
+        self.prefill_stale = 0              # prefill calls without a CPU lane in a row
+        self.prefill_gpu_min_last = None    # threshold of the last prefill call
         self.explore = False                # this pass uses the bootstrap share (re-measure)
         self.side = {}                      # (host index, device index) -> stream
         # Decode jobs reserved but not yet collected: [host, reservation, published]. Normally
@@ -625,6 +700,9 @@ class HybridDispatcher:
             lane_cost_us = dict(hit = float(self.lane_cost[LC_HIT]), zero_copy = float(self.lane_cost[LC_ZC]),
                                 cpu_fixed = float(self.lane_cost[LC_CPU_FIXED]), cpu = float(self.lane_cost[LC_CPU])),
             cost_model = bool(self.lane_cost[LC_ZC] > 0 and self.lane_cost[LC_CPU] > 0),
+            prefill_cost_us = None if self.prefill_cost is None else
+                dict(per_expert = round(self.prefill_cost[0], 2), per_row = round(self.prefill_cost[1], 3)),
+            prefill_gpu_min = self.prefill_gpu_min_last,
             cpu_frac_bootstrap = self.cpu_frac,
             cpu_us_per_expert = list(self.cpu_us),
             caches = [ExpertCache.for_device(d).summary() for d in sorted(self.devices, key = str)],
@@ -636,11 +714,14 @@ class HybridDispatcher:
     def _update_lane_params(self):
         """Node costs and the CPU share of misses from measurements (telemetry, PCIe probe)"""
         changed = False
+        fit_changed = False
         for i, h in enumerate(self.group.hosts):
             for slot, (seq, us, na, ne, rows) in enumerate(h.read_telemetry()):
                 if not na or self.tel_seen[i].get(slot) == seq:
                     continue
                 self.tel_seen[i][slot] = seq
+                self.prefill_fit[i].add(ne, na, us)
+                fit_changed = True
                 if rows > COST_SAMPLE_MAX_ROWS:
                     continue
                 # Per distinct expert: a job streams each selected expert's weights once, so that
@@ -648,6 +729,11 @@ class HybridDispatcher:
                 v = us / max(ne, 1)
                 self.cpu_us[i] = v if self.cpu_us[i] is None else (1 - HT.ema) * self.cpu_us[i] + HT.ema * v
                 changed = True
+        if fit_changed:
+            fits = [f.solve() for f in self.prefill_fit]
+            fits = [f for f in fits if f is not None]
+            # Slowest node per term, as for decode: a CPU lane is never assumed faster than it is
+            self.prefill_cost = (max(f[0] for f in fits), max(f[1] for f in fits)) if fits else None
         # Re-measure: once the cost model keeps every flexible miss on the GPU, decode yields no
         # new CPU samples and a stale (e.g. pessimistic) estimate would persist. After
         # EXL3_MOE_COST_REMEASURE passes without a sample, one pass uses the bootstrap share
@@ -763,7 +849,7 @@ class HybridDispatcher:
             sel_gpu = hl.sel_buf[:n]
             gpu_max, cpu_frac, admit, lane_cost = self._lane_args(n)
             cache.issue(hl.cache_layer, sel, y, w, sel_gpu, None, None, nodes, self.node_cost, hl.hi,
-                        0, admit, gpu_max, cpu_frac, HT.prefill_gpu_min, self.node_policy, self.group.pref,
+                        0, admit, gpu_max, cpu_frac, PREFILL_GPU_MIN_BOOT, self.node_policy, self.group.pref,
                         lane_cost)
             for _, h, r in res:
                 h.fused_publish(r)
@@ -781,7 +867,8 @@ class HybridDispatcher:
         sel_gpu = torch.empty((n,), dtype = torch.long, device = dev)
         cpu_sel = torch.empty((N, n), dtype = torch.int32, device = dev)
         nodes = torch.zeros((ND_ROWS, N), dtype = torch.long)
-        gpu_min = 0 if HT.dispatch == "gpu_exact" else HT.prefill_gpu_min
+        gpu_min = self._prefill_gpu_min(hl, cache, sel)
+        self.prefill_gpu_min_last = gpu_min
         cache.issue(hl.cache_layer, sel, y, w, sel_gpu, hl.lane_buf, cpu_sel, nodes, self.node_cost, hl.hi,
                     1, 0, -1, 0.0, gpu_min, self.node_policy, self.group.pref)
         # One host sync for the tier plan and the CPU row compression (the GPU tiers sync on
@@ -832,6 +919,45 @@ class HybridDispatcher:
         # of resident experts too, so gpu_exact keeps the regular plan (exact, more PCIe reads)
         any_zc = bool((lanes == LANE_ZC).any()) and HT.dispatch != "gpu_exact"
         return HybridPending("prefill", items, HT.zc_fused_rows if any_zc else None), sel_gpu.view(rows, hl.topk)
+
+    def _prefill_gpu_min(self, hl, cache, sel) -> int:
+        """Rows for a non-resident expert to go zero-copy in this prefill call: fixed by
+        EXL3_EXPERT_PREFILL_GPU_MIN, else chosen from the call's counts and the measured costs
+        (one host sync for the counts and residency). Bootstrap value until the costs exist, and
+        once after EXL3_MOE_COST_REMEASURE calls that left the CPU idle, so a stale estimate that
+        sends everything to the GPU gets new samples"""
+        if HT.dispatch == "gpu_exact":
+            return 0
+        if HT.prefill_gpu_min is not None:
+            return HT.prefill_gpu_min
+        if self.prefill_cost is None or not self.zc_us:
+            return PREFILL_GPU_MIN_BOOT
+        if HT.remeasure and self.prefill_stale >= HT.remeasure:
+            self.prefill_stale = 0
+            return PREFILL_GPU_MIN_BOOT
+        E, L = hl.num_experts, hl.cache_layer.L
+        a = cache.arrays
+        s = sel.view(-1)
+        s = torch.where((s >= 0) & (s < E), s, E)
+        counts = torch.bincount(s, minlength = E + 1)[:E]
+        resident = a["slotof"][L * EMAX: L * EMAX + E] >= 0
+        mapped = a["reg_home"][L * EMAX: L * EMAX + E] != 0
+        loc = a["reg_cpuloc"][L * MAX_NODES * EMAX: (L + 1) * MAX_NODES * EMAX].view(MAX_NODES, EMAX)[:, :E]
+        has_cpu = (loc >= 0).any(dim = 0)
+        st = torch.stack([counts.to(torch.long), resident.long(), mapped.long(), has_cpu.long()]).cpu().numpy()
+        counts, resident, mapped, has_cpu = st[0], st[1] > 0, st[2] > 0, st[3] > 0
+        used = counts > 0
+        miss = used & ~resident
+        flex = miss & mapped & has_cpu
+        forced_gpu = int((miss & mapped & ~has_cpu).sum())
+        t_gpu0 = float(self.hit_us or 0.0) * int((used & resident).sum()) + float(self.zc_us) * forced_gpu
+        nodes = sum(1 for idx in hl.host_idx if idx >= 0)
+        pa, pb = self.prefill_cost
+        gpu_min = choose_prefill_gpu_min(counts[flex], t_gpu0, float(self.zc_us),
+                                         float(self.cpu_fixed_us or 0.0), pa, pb, nodes)
+        cpu_any = bool((counts[flex] < gpu_min).any()) if flex.any() else False
+        self.prefill_stale = 0 if cpu_any else self.prefill_stale + 1
+        return gpu_min
 
     def combine(self, hl: HybridLayer, final_hidden_states, pending: HybridPending):
         """Fold the CPU lanes' partials into the routed sum (fp32, rows x h), stream-ordered"""

@@ -436,3 +436,102 @@ def test_kv_staging_joins_the_floor_once_per_load():
     D.note_kv_staging(model)
     assert H.cache._DEVICE_TRANSIENT[("cuda", 0)] == 2 << 30
     H.cache.ExpertCache._drop_registry()
+
+
+def test_prefill_cost_fit_separates_per_expert_and_per_row_cost():
+    f = D.PrefillCostFit()
+    assert f.solve() is None
+    for _ in range(20):                         # decode-shaped only: one assignment per expert
+        f.add(4, 4, 4 * 300 + 4 * 20)
+    assert f.solve() is None                    # a and b not separable yet
+    for ne, na in ((8, 120), (3, 90), (16, 200), (5, 15)):
+        f.add(ne, na, ne * 300 + na * 20)
+    a, b = f.solve()
+    assert a == pytest.approx(300, rel = 1e-6) and b == pytest.approx(20, rel = 1e-6)
+    g = D.PrefillCostFit()
+    for ne, na in ((2, 50), (4, 10), (6, 90)):
+        g.add(ne, na, 5.0 * na)                 # pure per-row cost: a clamps to zero
+    a, b = g.solve()
+    assert a == pytest.approx(0, abs = 1e-6) and b == pytest.approx(5, rel = 1e-6)
+
+
+def test_choose_prefill_gpu_min_balances_pcie_and_cpu():
+    counts = np.array([1, 2, 2, 3, 5, 8, 13, 21, 34, 55, 0])
+    pick = lambda **kw: D.choose_prefill_gpu_min(counts, **dict(dict(t_gpu0 = 0.0, t_zc = 1000.0, t_fixed = 50.0,
+                                                                      a = 100.0, b = 10.0, nodes = 2), **kw))
+    # Cheap CPU: every expert fits on the CPU before one PCIe read would finish
+    assert pick(a = 1.0, b = 0.1) == 56
+    # CPU slower than PCIe for any expert: everything stays on the GPU
+    assert pick(a = 1e6, b = 1e3) == 1
+    # In between: the small experts go to the CPU, the threshold never splits equal counts
+    t = pick()
+    assert 1 < t <= 55
+    c = np.sort(counts[counts > 0])
+    k = int((c < t).sum())
+    worst = lambda k: max((50.0 + (100 * k + 10 * c[:k].sum()) / 2) if k else 0.0, (c.size - k) * 1000.0)
+    assert worst(k) == min(worst(j) for j in range(c.size + 1) if j in (0, c.size) or c[j] != c[j - 1])
+    # More GPU work already queued (hits): more experts move to the CPU
+    assert pick(t_gpu0 = 5000.0) >= t
+    assert D.choose_prefill_gpu_min(np.zeros(4, dtype = np.int64), 0, 1, 0, 1, 1, 1) == D.PREFILL_GPU_MIN_BOOT
+
+
+def test_prefill_threshold_bootstrap_fixed_and_measured():
+    topk, E, N, rows = 4, 32, 2, 128
+    torch.manual_seed(7)
+    sel = torch.stack([torch.randperm(E)[:topk] for _ in range(rows)])
+    sel[:, 0] = 0                               # one heavy expert (128 rows), the rest ~12 each
+    y = torch.randn((rows, 8)).half()
+    w = torch.rand((rows, topk)).half()
+
+    def run(**ht):
+        d, hl, hosts, cache = make(E = E, N = N, rows = rows, topk = topk, dispatch = "hybrid", zc_max = None, **ht)
+        return d, hl, hosts, cache
+
+    d, hl, hosts, cache = run(prefill_gpu_min = None)
+    pend, sel_gpu = d.submit(hl, y, sel, w)
+    assert d.prefill_gpu_min_last == D.PREFILL_GPU_MIN_BOOT     # nothing measured yet
+
+    d, hl, hosts, cache = run(prefill_gpu_min = 40)
+    d.submit(hl, y, sel, w)
+    assert d.prefill_gpu_min_last == 40                         # fixed by the env
+
+    # Measured: PCIe read 5000 us per expert, CPU 100 us per expert + 5 us per row
+    d, hl, hosts, cache = run(prefill_gpu_min = None)
+    d.zc_us, d.hit_us, d.cpu_fixed_us = 5000.0, 50.0, 30.0
+    for q, h in enumerate(hosts):
+        h.tel = [(1, 4 * 100 + 4 * 5, 4, 4, 1), (2, 8 * 100 + 160 * 5, 160, 8, 40)]
+    d._update_lane_params()
+    assert d.prefill_cost == pytest.approx((100.0, 5.0))
+    pend, sel_gpu = d.submit(hl, y, sel, w)
+    t = d.prefill_gpu_min_last
+    assert t > int((sel == 0).sum())            # cheap CPU: even the heavy expert stays on the CPU
+    assert int((sel_gpu == E).sum()) == rows * topk
+    final = torch.zeros((rows, 8))
+    lanes = torch.tensor([e % N for e in range(E)])
+    assert torch.allclose(d.combine(hl, final, pend), fake_expert_sum(sel, w, y, lanes, E, N), atol = 1e-2)
+    assert d.summary()["prefill_gpu_min"] == t
+
+    # Slow CPU per row: the heavy expert is read over PCIe, the small ones stay on the CPU
+    d.prefill_cost = (100.0, 200.0)
+    pend, sel_gpu = d.submit(hl, y, sel, w)
+    t = d.prefill_gpu_min_last
+    assert 1 < t <= int((sel == 0).sum())
+    assert bool((sel_gpu[:, 0] == 0).all())
+    assert int((sel_gpu == E).sum()) > 0
+    d.combine(hl, torch.zeros((rows, 8)), pend)
+
+
+def test_prefill_threshold_remeasures_when_the_cpu_stays_idle():
+    topk, E, N, rows = 4, 16, 2, 100
+    d, hl, hosts, cache = make(E = E, N = N, rows = rows, topk = topk, dispatch = "hybrid", zc_max = None,
+                               prefill_gpu_min = None, remeasure = 2)
+    d.zc_us, d.hit_us, d.cpu_fixed_us = 10.0, 1.0, 1.0
+    d.prefill_cost = (1e5, 1e4)                  # pessimistic: the CPU never wins
+    sel = torch.stack([torch.randperm(E)[:topk] for _ in range(rows)])
+    y, w = torch.randn((rows, 8)).half(), torch.rand((rows, topk)).half()
+    got = []
+    for _ in range(4):
+        pend, _ = d.submit(hl, y, sel, w)
+        d.combine(hl, torch.zeros((rows, 8)), pend)
+        got.append(d.prefill_gpu_min_last)
+    assert got[2] == D.PREFILL_GPU_MIN_BOOT and got[0] == got[1] == got[3] != D.PREFILL_GPU_MIN_BOOT
