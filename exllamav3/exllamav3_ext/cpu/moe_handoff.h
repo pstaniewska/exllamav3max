@@ -17,9 +17,9 @@
 //     u32 jobs_tail     @ 256  parent producer index (job ring)
 //     u32 jobs_head     @ 320  child consumer index
 //     MoeJob ring       @ 384  MOE_JOB_RING entries
-//     u32 data_ready[]  @ SLOT_FLAGS_OFFSET       per slot, stride 64: GPU publishes job seq
-//     u32 done[]        @ SLOT_FLAGS_OFFSET + 64*MOE_MAX_SLOTS, stride 64: child publishes seq
-//     u32 consumed[]    @ SLOT_FLAGS_OFFSET + 2*64*MOE_MAX_SLOTS, stride 64: the collecting
+//     flag data_ready[] @ SLOT_FLAGS_OFFSET       per slot, stride 64: GPU publishes job seq
+//     flag done[]       @ SLOT_FLAGS_OFFSET + 64*MOE_MAX_SLOTS, stride 64: child publishes seq
+//     flag consumed[]   @ SLOT_FLAGS_OFFSET + 2*64*MOE_MAX_SLOTS, stride 64: the collecting
 //                         device's stream publishes seq after reading the slot output back.
 //                         Slot reuse waits on this, not done: with offloaded layers spread
 //                         over multiple GPUs, the next tenant's issue runs on a different
@@ -34,6 +34,20 @@
 // memcpys and the data_ready publish for that seq, so the child always sees the descriptor
 // before it can see the data flag. Sequence numbers increase monotonically from 1; slot reuse is
 // safe because the GPU stream serializes on the wait kernel of the oldest outstanding job.
+//
+// Flag width: the GPU waits for a flag to reach a sequence number with a stream memory operation.
+// CUDA's 32-bit wait compares cyclically ((int32_t)(*addr - value) >= 0), so 32-bit flags may wrap.
+// HIP's compares as plain unsigned >=, which a wrapped 32-bit flag would satisfy early, so ROCm
+// builds use 64-bit flags that never wrap. Either way each flag owns a 64-byte line, and the job
+// descriptor carries the sequence number as two 32-bit halves. CPU-side waits compare the low
+// halves cyclically, which is exact for any width.
+#if defined(USE_ROCM)
+#define MOE_FLAG_BITS 64
+typedef uint64_t moe_flag_t;
+#else
+#define MOE_FLAG_BITS 32
+typedef uint32_t moe_flag_t;
+#endif
 
 #define MOE_JOB_RING 256
 #define MOE_MAX_SLOTS 8
@@ -68,13 +82,13 @@ struct MoeJob
     uint32_t kind;
     uint32_t prev_seq;   // stage: pinned_free value to wait for before overwriting the slot
     uint32_t experts[MOE_JOB_MAX_EXPERTS];
-    uint32_t _pad;
+    uint32_t seq_hi;     // high 32 bits of seq (published in full on 64-bit flags)
 };
 
 #define MOE_CTRL_JOBS_OFFSET 384
 #define MOE_SLOT_FLAGS_OFFSET (MOE_CTRL_JOBS_OFFSET + MOE_JOB_RING * sizeof(MoeJob))
 
-// Flag order: data_ready[MAX_SLOTS], done[MAX_SLOTS], stage_done[MAX_WSLOTS],
+// Flag order: data_ready[MAX_SLOTS], done[MAX_SLOTS], consumed[MAX_SLOTS], stage_done[MAX_WSLOTS],
 // pinned_free[MAX_WSLOTS], each entry 64-byte strided
 #define MOE_FLAGS_SIZE (3 * 64 * MOE_MAX_SLOTS + 2 * 64 * MOE_MAX_WSLOTS)
 
@@ -110,5 +124,22 @@ void exl3_moe_cpu_worker_run
     int64_t num_wslots,
     int64_t wslot_size,
     int64_t threads,
-    int64_t stage_threads
+    int64_t stage_threads,
+    int64_t telemetry_offset = -1  // >= 0: byte offset inside each compute slot where the worker
+                                   // publishes per-job telemetry (MoeJobTelemetry, 64 bytes the
+                                   // parent reserves at the end of the slot); -1: off (default)
 );
+
+// Per-job telemetry (opt-in, see telemetry_offset): written after the output and before the
+// done flag is published, so a reader that observes done >= seq sees the matching record. The
+// hybrid dispatcher's adaptive node policy reads it to estimate each worker node's cost per
+// assignment from measured compute times, instead of assumed latencies
+struct MoeJobTelemetry
+{
+    uint32_t seq;           // low half of the job's sequence number
+    uint32_t compute_us;    // wall time of exl3_moe_cpu_forward_raw (0 for a skipped job)
+    uint32_t assignments;   // (token, expert) pairs computed
+    uint32_t rows;
+    uint32_t experts;       // distinct experts computed
+    uint32_t pad[11];
+};

@@ -21,6 +21,18 @@ A few defaults differ between the CUDA and ROCm builds. They are collected in
 
 ## Attention
 
+### `EXL3_GRAPHS` (default: `1` on CUDA, `0` on ROCm)
+
+Whether the decode paths capture their kernel sequences into device graphs and replay them. With
+`0` every graphed site (attention, MLA, GDN, the MLP and block-sparse decode kernels) runs the same
+C++ launch sequence eagerly on each call, kernels and order unchanged, so the switch changes only
+host submission. On CUDA replay is a few percent faster at decode. On ROCm the HIP runtime launches a
+graph node no faster than a plain kernel, the measured difference is within noise, and every
+instantiated graph exec reserves a 2 MB device-side kernel-argument pool that grows with each
+parameter update until the exec is destroyed (an open HIP runtime issue); a speculative-decoding
+server holds hundreds of execs, so disabling graphs there also frees over a gigabyte of VRAM.
+Set `EXL3_GRAPHS=1` on ROCm to test the graph path.
+
 ### `EXL3_BC_ATTN` (default: `1`)
 
 Graph-captured C++ decode attention. For decode steps (bsz ≤ 8, q_len ≤ 16) the whole attention
@@ -170,21 +182,42 @@ affects quantized caches.
 - `1` - prefill staging (default): prefill chunks of 256+ tokens dequantize the referenced
   cache window once into a shared fp16 scratch and run the fp16 kernel over it, putting
   quantized-cache prefill within ~1–3% of fp16. Decode stays on the direct path. The scratch is
-  sized for the full cache at batch size 1 (`2 * max_num_tokens * num_kv_heads * head_dim`
-  fp16 elements, shared across layers per device) and is allocated by the autosplit measuring
-  pass, so the space is reserved at load time rather than discovered at the first long prefill.
-  For very large caches this reservation is the tradeoff to weigh against `0` (e.g. ~4 GB at
+  a per-call transient of one fixed size, the full cache at batch size 1
+  (`2 * max_num_tokens * num_kv_heads * head_dim` fp16 elements; QSA layers use their bounded
+  dense window instead), so the allocator sees the same request on every prefill chunk rather
+  than a size that grows with the context. The autosplit measuring pass budgets it, so the
+  space is accounted for at load time; loads with an explicit split map it at the first long
+  prefill. For very large caches this is the tradeoff to weigh against `0` (e.g. ~4 GB at
   1M tokens with 8 kv heads of dim 128).
 - `2` - full staging: legacy dequantize-then-attend path; whole cache layers are expanded into
   full-size fp16 temporaries before attention. Debug/A-B mode (same effect as the former
   `EXL3_QC_ATTN=0`); only affects decode if `EXL3_BC_ATTN` is also disabled, since the graphed
   decode path reads the packed cache directly.
 
-### `EXL3_QC_PF_TWO_PASS_MIN_Q` (default: `256`)
+### `EXL3_QC_PF_TWO_PASS_MIN_Q` (default: `256`, `9` on Turing)
 
 Query-length threshold for the prefill staging pass at `EXL3_QC_STAGING=1`. Chunks shorter than
 this keep the direct path, which reads less global memory (relevant for short trailing chunks
-over long contexts at low cache bitrates). Tuning/testing knob.
+over long contexts at low cache bitrates). Where the staged window feeds SDPA (`EXL3_SDPA_PREFILL`
+below) every prefill chunk stages. Tuning/testing knob.
+
+### `EXL3_SDPA_PREFILL` (default: on for sm_75, off elsewhere)
+
+Prefill chunks (more than 8 query rows, causal, no sliding window, softcap or sinks) attend over a
+dense fp16 copy of their window instead of running the Triton paged prefill kernel: the staged
+dequantization of a quantized cache, or the fp16 cache's own pages, viewed where they are
+consecutive and gathered otherwise, then PyTorch's memory-efficient SDPA per KV group (its
+cutlass kernel refuses `enable_gqa`). Triton emits no tensor-core instructions for sm_75, so the
+Triton kernel runs on scalar FMA there and prefill time grows steeply with context; the SDPA
+kernel keeps Turing's HMMA units busy. Decode and draft verification stay on the Triton kernels.
+`1` forces the path on any CUDA device (it is exact, so this is a testing switch), `0` forces it
+off on Turing.
+
+### `EXL3_FA75` (default: on for sm_75, off elsewhere)
+
+On the path above, head_dim 256 attention runs the `fa75` kernel (`exllamav3_ext/turing/fa75.cu`,
+`mma.sync.m16n8k8`) instead of SDPA, whose cutlass kernel handles 256-wide heads at a fraction of
+its 128-wide rate. Plain PTX for sm_75 and later; `1` forces it on any CUDA device.
 
 ### `EXL3_QC_PREFILL_NS` (default: `0` = measure)
 
@@ -284,6 +317,24 @@ pipeline everywhere, for A/B testing.
 Override the path of the on-disk autotune cache for the cooperative GEMM kernels (kernel shape
 selection results, persisted across runs).
 
+### `EXL3_RDNA_OCC_MAX` (ROCm; default: `1`)
+
+Upper bound on the blocks per WGP the EXL3 GEMM autotuner may schedule. On ROCm the GEMM kernels
+use a plain launch with a software device barrier, so every block of a grid must be resident at
+once; the autotuner sizes its candidate grids from `hipOccupancyMaxActiveBlocksPerMultiprocessor`,
+whose per-target resource accounting is not reliable (gfx1150 reports more blocks per WGP than its
+LDS holds for these kernels, and the barrier then deadlocks with the GPU at 100%). The default
+clamps grids to one block per WGP, which is what the API returns anyway for the regular shapes on
+gfx1100 and gfx1201. Set higher to allow more blocks per WGP, or `0` to trust the API. The fused
+MoE kernel has its own bound (`EXL3_ROCM_MOE_BPS=1` forces one block per WGP there).
+
+### `EXL3_DEBUG_AUTOTUNE` (default: unset)
+
+Print every GEMM autotune candidate (shape, LDS, blocks per WGP before and after the clamp, grid)
+and synchronize after each probe and measurement launch, naming it first, so a launch that never
+completes is identified instead of hanging silently. Autotune-only; it does not affect tuned
+launches.
+
 ## Sampling
 
 ### `EXL3_FUSED_SAMPLER` (default: `1`)
@@ -349,7 +400,7 @@ into the pinned staging ring, concurrently with the compute pool working the CPU
 threads saturate host memcpy bandwidth; raising this mainly helps wide streamed batches on
 models with many small experts (see issue trace on Qwen3.6-35B-A3B).
 
-### `EXL3_MOE_STREAM_T` (default: per-device, bandwidth-scaled from `16`)
+### `EXL3_MOE_STREAM_T` (default: per-device, bandwidth-scaled from `8`)
 
 Minimum per-expert token-assignment count (in a prefill chunk) for an expert's weights to be
 streamed to the GPU instead of computed on the CPU tail. Unset, the effective threshold scales
@@ -415,17 +466,20 @@ testing. Read once per process (parent and worker independently).
 
 ### `EXL3_MOE_CPU_SWIZZLE` (default: `1`)
 
-Repack the CPU worker's expert trellis copies into a band-contiguous ("swizzled") layout at
-load, so each GEMV band streams sequentially from DRAM instead of in short strided runs
-(+45-75% cold decode GEMV throughput measured on a 7960X, reaching the sequential-read
-roofline). Takes effect on every AVX-512 kernel tier: `vbmi`, whose byte-gather extraction
-leaves the register headroom for the wide bands the swizzled layout wants at m > 1, `bw`
-(+2-29% on Skylake-SP, where the sequential per-band k-stream beats 96-128 B strided reads)
-and `vnni` (the dword kernel with the same band structure; +40% cold-expert decode measured
-with the tier forced on a 7960X). The `avx2` and `scalar` tiers read the native layout. K8
-tensors always stay in the native layout (they route to the dword kernel). The GPU-streaming
-prefill path un-swizzles during staging, so staged bytes reaching the GPU dequant are
-unaffected. Set to `0` to keep the native layout.
+Repack the CPU worker's expert trellis copies into a packed layout at load, so each GEMV band
+streams sequentially from DRAM instead of in short strided runs. The layout is per kernel tier
+(rule: `exl3_moe_cpu_swizzle_group`): the AVX-512 tiers (`vbmi`, `bw`, `vnni`) band output tiles
+in groups of 8, except K8 tensors, which route to the dword kernel and stay native (+45-75%
+cold decode GEMV throughput on a 7960X, reaching the sequential-read roofline). The `avx2` tier
+bands integer rates in groups of 2 and additionally repacks each tile's 32-bit words into the
+"planar" order (dword `w` moves to `8 * (w % bits) + w / bits`): under the tensor-core tile
+permutation a half-row's 8 source words then live in one AVX2 register, so every weight gather
+collapses to a single `vpermd` instead of walking the tile's registers, which removes the
+rate-proportional extraction cost of the native layout. Half-integer rates stay native on this
+tier. The `scalar` tier reads the native layout. The GPU-streaming prefill path restores the native
+tile and word order after each DMA, into a second VRAM ring allocated only when a layer's
+experts arrive packed, so staged bytes reaching the GPU dequant are unaffected. Set to `0` to
+keep the native layout.
 
 ### `EXL3_MOE_MEMOPS` (default: `1`)
 
@@ -711,6 +765,52 @@ errors print a notice and leave the host unpinned.
 ### `EXL3_MOE_HANDOFF_PROF` (default: unset)
 
 Enable GPU/CPU handoff profiling, for debug purposes. 
+
+### `EXL3_MOE_CPU_SPLIT`, `EXL3_MOE_CPU_SPLIT_LAYERS`, `EXL3_MOE_CPU_SPLIT_STATS`
+
+`EXL3_MOE_CPU_SPLIT` is the default of `-mcs` (tail experts per layer on the CPU worker).
+`EXL3_MOE_CPU_SPLIT_LAYERS` limits how many layers are split. `EXL3_MOE_CPU_SPLIT_STATS` names a
+JSON file of per-layer selection counts for a static hot-to-cold placement (only with
+`EXL3_MOE_CPU_SWAP=0`).
+
+### `EXL3_MOE_CPU_SWAP` (default: `1`), `EXL3_MOE_CPU_SWAP_INTERVAL` (`128`), `EXL3_MOE_CPU_SWAP_MAX` (`64`), `EXL3_MOE_CPU_SWAP_HYST` (`2.0`), `EXL3_MOE_CPU_SWAP_FLOOR` (`8.0`), `EXL3_MOE_CPU_SWAP_DEBUG`, `EXL3_MOE_CPU_SWAP_VERIFY`
+
+Dynamic hot/cold placement of the `-mcs` split. Every `INTERVAL` forward passes a sweep is marked
+pending and runs when the generator's queue drains. The sweep moves up to `MAX` experts in total,
+swapping a CPU expert with a GPU expert while the CPU one's decayed hit count clears `HYST` times
+the GPU one's and `FLOOR` times the mean. Both sides of a swap are re-read from the checkpoint.
+`0` keeps the initial placement. The hybrid mode below replaces this mechanism and does not use it.
+
+## Hybrid MoE, expert cache and NUMA workers
+
+`-mh` / `--moe_hybrid` (or `EXL3_HYBRID_MOE=1`): every eligible MoE layer's experts live in host
+RAM. Each pick is computed from a shared per-device GPU expert cache, by zero-copy reads of a
+pinned host home, or on the CPU worker of a NUMA node. Off by default. The architecture,
+eligibility rules and limitations are in `doc/hybrid_moe.md`, which also lists every variable with
+its default. In short:
+
+- **Mode:** `EXL3_HYBRID_MOE` and `EXL3_EXPERT_DISPATCH_POLICY` (`legacy`, `gpu_exact` or
+  `hybrid`).
+- **Cache:** `EXL3_EXPERT_CACHE_POLICY`, `_LIMIT_GB`, `_RESERVE_MB`, `_MIN_FREE_MB`,
+  `_GROW_HYST_MB`, `_ADMIT_MAX`, `_GATHER_MAX`, `_GATHER_BLOCKS`, `_CHUNK_SLOTS`, `_MAX_LAYERS`,
+  `_DECAY`, `_WARM`, `_SAVE_STATS`, `_ZC_FUSED_ROWS`, `_DEBUG`. The cache is sized at the first
+  forward to the free VRAM minus a floor: the larger of the reserve and the autosplit loader's
+  measured transients of every component plus margins. It shrinks before prefill passes that
+  need more, and regrows when idle without reaching back into the largest prefill bound seen.
+- **Homes:** `EXL3_EXPERT_HOME` (`native_copy` or `worker_arena`) and
+  `EXL3_EXPERT_HOME_PIN_LIMIT_GB`. A home chunk whose page-locked registration fails stays pageable
+  and its experts take CPU lanes.
+- **Lanes:** `EXL3_MOE_ZC_MAX`. `auto` uses a measured cost model: a miss goes to a CPU node only
+  if that shortens the call's slowest lane. Also `EXL3_MOE_ZC_CPU_FRAC_INIT` (the share used
+  until the costs are measured), `EXL3_MOE_COST_REMEASURE`, `EXL3_EXPERT_PREFILL_GPU_MIN`, `EXL3_MOE_ADAPTIVE_EMA`,
+  `EXL3_HYBRID_MOE_DEBUG`, and `EXL3_HYBRID_MOE_PROFILE` (CPU-lane wait measured with CUDA events,
+  no host sync).
+- **NUMA:** `EXL3_NUMA_ENABLE` (one CPU worker per node; also applies to `-mcl` / `-mcs`, whose
+  layers then go round-robin over the nodes), `EXL3_NUMA_POLICY`, `EXL3_NUMA_MEMORY_POLICY`
+  (`shard` or `replicate`), `EXL3_NUMA_SHARD` (`mod` or `blocked`), `EXL3_NUMA_CPU_MAP`,
+  `EXL3_NUMA_GPU_NODE` and `EXL3_NUMA_DEBUG`. An undeterminable GPU node stays unknown and is
+  never assumed. Hybrid mode supports at most 8 worker nodes and stops with an error before
+  starting workers on a host with more.
 
 ## Model loading
 

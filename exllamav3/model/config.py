@@ -47,6 +47,11 @@ class InferParams:
         # CPU GEMMs overlap each layer's own GPU expert compute. Mutually exclusive with
         # moe_cpu_offload. Layer-split mode only; requires mul1-codebook experts
         self.moe_cpu_split = int(os.environ.get("EXL3_MOE_CPU_SPLIT", 0))
+        # Hybrid MoE (model/moe_hybrid_dispatch.py): every eligible MoE layer's experts held by
+        # CPU workers (one per NUMA node with EXL3_NUMA_ENABLE), computed through one shared GPU
+        # expert cache per device, zero-copy reads of the pinned host homes, or CPU lanes.
+        # Mutually exclusive with moe_cpu_offload / moe_cpu_split
+        self.moe_hybrid = os.environ.get("EXL3_HYBRID_MOE", "0") not in ("", "0")
         self.moe_cpu_component = "text"
         # Worker thread count per component; None defers to EXL3_MOE_CPU_THREADS, then MoeCpuTuning
         # (see moe_cpu_host.MoeCpuTuning)
@@ -146,6 +151,8 @@ class Config(ABC):
         self.bos_token_id = self.read_cfg(int, ["bos_token_id", "text_config->bos_token_id"], None)
         self.eos_token_id = self.read_cfg([int, list], ["eos_token_id", "text_config->eos_token_id"], None)
         self.pad_token_id = self.read_cfg(int, ["pad_token_id", "text_config->pad_token_id"], None)
+        # Placeholder token a multimodal prompt carries in place of each image (older configs: image_token_index)
+        self.image_token_id = self.read_cfg(int, ["image_token_id", "image_token_index"], None)
         self.vocab_size = self.read_cfg(int, ["vocab_size", "text_config->vocab_size"], None)
         if isinstance(self.eos_token_id, list):
             self.eos_token_id_list = self.eos_token_id
