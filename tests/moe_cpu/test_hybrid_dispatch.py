@@ -167,8 +167,9 @@ def test_cost_model_only_from_measurements():
     d._update_lane_params()
     assert float(d.lane_cost.abs().sum()) == 0 and d.cpu_frac == 0.5     # nothing measured
     d.zc_us, d.hit_us, d.cpu_fixed_us = 200.0, 20.0, 30.0
-    hosts[0].tel = [(5, 400, 8, 4)]             # 100 us per distinct expert (8 assignments)
-    hosts[1].tel = [(9, 300, 2, 2)]             # 150 us per distinct expert
+    hosts[0].tel = [(5, 400, 8, 4, 2)]          # 100 us per distinct expert (8 assignments)
+    hosts[1].tel = [(9, 300, 2, 2, 1),          # 150 us per distinct expert
+                    (11, 9000, 64, 2, 32)]      # prefill-shaped job: not a decode cost sample
     d._update_lane_params()
     assert d.lane_cost.tolist() == pytest.approx([20.0, 200.0, 30.0, 150.0])   # slowest node
     before = d.cpu_us[:]
@@ -243,9 +244,13 @@ def test_decode_skips_a_node_without_experts_of_the_layer():
     d.combine(hl, torch.zeros((1, 8)), pend)
 
 
-def test_component_tags_are_unique():
-    D._COMP_SERIAL.clear()
-    assert [D.component_tag(c) for c in ("text", "mtp", "text", "text")] == ["text", "mtp", "text#1", "text#2"]
+def test_component_tags_are_unique_and_released():
+    D._LIVE_TAGS.clear()
+    tags = [D.acquire_tag(c) for c in ("text", "mtp", "text", "text")]
+    assert tags == ["text", "mtp", "text#1", "text#2"]
+    D.release_tag("text")
+    assert D.acquire_tag("text") == "text"      # a reload gets the plain name back
+    D._LIVE_TAGS.clear()
 
 
 def test_last_detach_resets_per_load_state():
@@ -367,3 +372,19 @@ def test_interrupted_forward_leaves_no_stuck_slot():
     assert (hosts[0].sel == -1).all()                       # stale selections cleared before publish
     assert hosts[0].events.count("collect") == 2 and hosts[1].events.count("collect") == 1
     assert hosts[0].events.count("publish") == 2
+
+
+def test_cost_model_remeasures_when_cpu_samples_stop():
+    d, hl, hosts, cache = make(dispatch = "hybrid", zc_max = None, remeasure = 3)
+    d.zc_us, d.hit_us, d.cpu_fixed_us = 200.0, 20.0, 30.0
+    hosts[0].tel = [(5, 400, 4, 4, 1)]
+    d._update_lane_params()
+    assert d._lane_args(4)[3] is d.lane_cost and not d.explore
+    for i in range(3):                          # no new decode-shaped CPU samples
+        d._update_lane_params()
+    assert d.explore and d._lane_args(4)[3] is None   # one pass on the bootstrap share
+    d._update_lane_params()
+    assert not d.explore
+    hosts[0].tel = [(6, 380, 4, 4, 1)]          # a new sample resets the count
+    d._update_lane_params()
+    assert d.cost_stale == 0

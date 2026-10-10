@@ -135,7 +135,8 @@ reserved-but-unallocated pool) minus a floor. The floor is the larger of:
   places:
   - every autosplit load of any component on the device (main model, MTP head, vision tower,
     draft model), plus `EXL3_AUTOSPLIT_MARGIN_MB`. These are max-merged per device, so a later
-    component never lowers them, whichever loading API it used.
+    component never lowers them, whichever loading API it used. They are cleared when the device's
+    last hybrid layer unloads, so a smaller model loaded next is measured afresh.
   - transients noted on the owner;
   - the largest prefill MoE bound seen so far.
 
@@ -179,8 +180,12 @@ device budget in proportion to the expert bytes registered in each:
   keys (or `component:key`) to per-expert counts, the same format as `EXL3_MOE_CPU_SPLIT_STATS`.
 - `EXL3_EXPERT_CACHE_SAVE_STATS=<json>` writes the decayed pick history, merged into the file,
   each time the last layer of a component unregisters, and at exit.
-- **Layer ids** are `component:key`. A second dispatcher with the same component name, such as a
-  draft model loaded as `text`, gets `text#1`, so its layers never collide with the main model's.
+- **Layer ids** are `component:key`. A second live dispatcher with the same component name, such
+  as a draft model loaded as `text`, gets `text#1`, so its layers never collide with the main
+  model's. A dispatcher returns its tag when its last layer unloads, so a reload gets the plain name
+  and the same warm-start and stats keys back.
+- A stats file holds per-layer counts by these keys, so it belongs to one model. A file shared
+  between models with equal keys and expert counts would warm-start one with the other's counts.
 
 See [Telemetry](#telemetry) for the counters.
 
@@ -257,7 +262,8 @@ Memory checks and limits:
 - Arena chunks, lazy ones included, are checked against the node's available memory as well as the
   global and cgroup limits. Lazy chunks are bound to the node too.
 - A CPU node without memory binds its worker's memory to the nearest node that has memory, by the
-  distance row.
+  distance row. The GPU-adjacent buffers (native home copy, handoff ring) are remapped the same way
+  when the GPU's node has no memory.
 - Hybrid mode supports at most 8 worker nodes. A host with more CPU nodes gets an explicit error
   before any worker starts. The fix is to restrict the CPUs with `EXL3_NUMA_CPU_MAP` or a cpuset,
   or to set `EXL3_NUMA_ENABLE=0`. The classic per-layer path has no such limit.
@@ -308,6 +314,11 @@ nothing else changes.
     - `t_hit`: one expert's bytes at the rate of a timed device-to-device copy;
     - `t_cpu_fixed`: the median round trip of an empty gated job to each node, worst node;
     - `t_cpu`: worker telemetry, compute time per distinct expert of a job, EMA, slowest node.
+      Only decode-shaped jobs of at most 8 rows count; prefill jobs carry many rows per expert.
+
+    Once the model keeps every flexible miss on the GPU, decode produces no new CPU samples. So
+    after `EXL3_MOE_COST_REMEASURE` passes (default 256, `0` = off) without a sample, one pass
+    uses the bootstrap share to measure the CPU again.
 
     Until `t_zc` and `t_cpu` are both measured, `EXL3_MOE_ZC_CPU_FRAC_INIT` sets the CPU share of
     the misses that could take either lane. No Xeon or PCIe latency is assumed anywhere. The model
@@ -387,6 +398,7 @@ classic paths, `EXL3_NUMA_ENABLE=1`) is set.
 | `EXL3_MOE_ZC_MAX` | `auto` | GPU quota of misses per decode call |
 | `EXL3_MOE_ZC_CPU_FRAC_INIT` | `0.5` | CPU share of flexible misses until the cost model is measured |
 | `EXL3_MOE_ADAPTIVE_EMA` | `0.1` | smoothing of measured CPU cost |
+| `EXL3_MOE_COST_REMEASURE` | `256` | passes without a CPU cost sample before one pass re-measures (`0` = never) |
 | `EXL3_HYBRID_MOE_DEBUG` | `0` | print the cost probes (PCIe, VRAM, CPU round trip) |
 | `EXL3_HYBRID_MOE_PROFILE` | `0` | GPU-side CPU-lane wait profile with CUDA events (see [Telemetry](#telemetry)) |
 | `EXL3_NUMA_ENABLE` | `0` | one CPU worker per NUMA node (hybrid: at most 8) |

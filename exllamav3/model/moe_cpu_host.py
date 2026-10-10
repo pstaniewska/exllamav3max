@@ -1603,16 +1603,16 @@ class MoeCpuHost:
             ext.moe_split_collect_add(final_2d, slot["out_dev"], r["counts"], r["slot_idx"], r["ho"])
             ext.exl3_moe_flag_write(slot["consumed"], r["seq"])
 
-    def read_telemetry(self) -> list[tuple[int, int, int, int]]:
-        """Latest (seq, compute_us, assignments, experts) per slot (telemetry on), as published
-        with each job's done flag. Host read of pinned memory, no stream interaction"""
+    def read_telemetry(self) -> list[tuple[int, int, int, int, int]]:
+        """Latest (seq, compute_us, assignments, experts, rows) per slot (telemetry on), as
+        published with each job's done flag. Host read of pinned memory, no stream interaction"""
         out = []
         if not self.started or not self.telemetry:
             return out
         for slot in self.slots:
             t = slot.get("tel")
             if t is not None:
-                out.append((int(t[0]), int(t[1]), int(t[2]), int(t[4])))
+                out.append((int(t[0]), int(t[1]), int(t[2]), int(t[4]), int(t[3])))
         return out
 
     def submit_collect_fused(self, handle, final_2d):

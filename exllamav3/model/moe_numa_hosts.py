@@ -121,6 +121,10 @@ class HostGroup:
         if numa and self.numa and self.gpu_node is None:
             print(" -- NUMA: GPU node unknown (set EXL3_NUMA_GPU_NODE=dev:node to declare it); "
                   "GPU-adjacent host buffers keep default placement")
+        # GPU-adjacent buffers (native home copy, handoff ring) bind to the GPU's node, or to the
+        # nearest node with memory when that node has none
+        gnode = self.topo.node(self.gpu_node) if (self.topo is not None and self.gpu_node is not None) else None
+        gpu_mem_node = _memory_node(self.topo, gnode) if gnode is not None else self.gpu_node
         hosts = getattr(config, "moe_cpu_hosts", None)
         if hosts is None:
             hosts = {}
@@ -129,8 +133,8 @@ class HostGroup:
         for i, w in enumerate(self.plan["workers"]):
             spec = dict(index = i, node = w["node"], cpus = w["cpus"], mem_node = w["mem_node"],
                         threads = w["threads"], home = home == "native_copy",
-                        home_node = self.gpu_node, map_arena = home == "worker_arena",
-                        telemetry = telemetry, handoff_node = self.gpu_node)
+                        home_node = gpu_mem_node, map_arena = home == "worker_arena",
+                        telemetry = telemetry, handoff_node = gpu_mem_node)
             h = MoeCpuHost(config, numa = spec)
             hosts[f"{comp}@{i}"] = h
             self.hosts.append(h)

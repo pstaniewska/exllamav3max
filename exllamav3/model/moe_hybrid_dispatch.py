@@ -44,15 +44,28 @@ NODE_POLICIES = {"numa_local": 0, "numa_sharded": 0, "numa_balanced": 1, "numa_a
 HOME_MODES = ("native_copy", "worker_arena")
 
 # Cache layer ids must be unique per device: a draft model loads with the main model's component
-# name ("text") and usually the same module keys. The first dispatcher of a component keeps the
-# plain name (stable warm-start / stats keys), later ones get "#n"
-_COMP_SERIAL: dict = {}
+# name ("text") and usually the same module keys. A dispatcher takes its tag when its first layer
+# loads and gives it back when its last layer detaches: the plain component name when no live
+# dispatcher holds it (stable warm-start / stats keys across reloads), else "<comp>#n"
+_LIVE_TAGS: set = set()
+
+# CPU cost samples come only from decode-shaped jobs (rows per job up to this many): prefill
+# jobs carry many rows per expert and would overstate the per-expert cost of a decode miss
+COST_SAMPLE_MAX_ROWS = 8
 
 
-def component_tag(comp: str) -> str:
-    n = _COMP_SERIAL.get(comp, 0)
-    _COMP_SERIAL[comp] = n + 1
-    return comp if n == 0 else f"{comp}#{n}"
+def acquire_tag(comp: str) -> str:
+    tag, n = comp, 0
+    while tag in _LIVE_TAGS:
+        n += 1
+        tag = f"{comp}#{n}"
+    _LIVE_TAGS.add(tag)
+    return tag
+
+
+def release_tag(tag: str | None):
+    if tag is not None:
+        _LIVE_TAGS.discard(tag)
 
 
 class HybridTuning:
@@ -76,6 +89,7 @@ class HybridTuning:
         # Exposed CPU-lane wait measured with CUDA events (no host sync: completed event pairs
         # are read at the next pass start with Event.query)
         self.profile = os.environ.get("EXL3_HYBRID_MOE_PROFILE", "0") not in ("", "0")
+        self.remeasure = int(os.environ.get("EXL3_MOE_COST_REMEASURE", 256))
 
 
 HT = HybridTuning()
@@ -202,7 +216,7 @@ class HybridDispatcher:
         from .moe_cpu_host import TUNING as HOST_TUNING
         self.config = config
         self.comp = comp
-        self.tag = component_tag(comp)
+        self.tag = None                     # acquired with the first layer (acquire_tag)
         self.device0 = torch.device(device)
         self.node_policy = NODE_POLICIES.get(HT.node_policy, 0)
         telemetry = HT.node_policy == "numa_adaptive" or (HT.dispatch == "hybrid" and HT.zc_max is None)
@@ -235,6 +249,8 @@ class HybridDispatcher:
         # Cost model handed to the issue kernel (HY_LC_*); zeros until ZC and CPU are measured
         self.lane_cost = torch.zeros((4,), dtype = torch.float)
         self.telemetry = Telemetry(n) if HT.profile else None
+        self.cost_stale = 0                 # passes since the last decode-shaped CPU sample
+        self.explore = False                # this pass uses the bootstrap share (re-measure)
         self.side = {}                      # (host index, device index) -> stream
         # Decode jobs reserved but not yet collected: [host, reservation, published]. Normally
         # empty between layer calls; anything left (an exception or interrupt between submit and
@@ -331,6 +347,8 @@ class HybridDispatcher:
             for j, e in enumerate(sh):
                 cpuloc[i, e] = j
 
+        if self.tag is None:
+            self.tag = acquire_tag(self.comp)
         try:
             module.device = device
             experts = set(module.gates + module.ups + module.downs)
@@ -353,6 +371,9 @@ class HybridDispatcher:
             for h, idx in zip(hosts, host_idx):
                 if idx >= 0:
                     h.unregister()
+            if not self.layers:
+                release_tag(self.tag)
+                self.tag = None
             raise
         self.layers.append(hl)
         self.devices.add(device)
@@ -408,6 +429,8 @@ class HybridDispatcher:
             # Last layer gone: the workers have shut down (homes unmapped). A reload starts a new
             # worker generation, so per-load state must not survive: finalize again from scratch
             self._init_runtime(self.group.num_nodes)
+            release_tag(self.tag)
+            self.tag = None
 
     # ---- finalize ---------------------------------------------------------------------------
 
@@ -600,15 +623,28 @@ class HybridDispatcher:
         """Node costs and the CPU share of misses from measurements (telemetry, PCIe probe)"""
         changed = False
         for i, h in enumerate(self.group.hosts):
-            for slot, (seq, us, na, ne) in enumerate(h.read_telemetry()):
+            for slot, (seq, us, na, ne, rows) in enumerate(h.read_telemetry()):
                 if not na or self.tel_seen[i].get(slot) == seq:
                     continue
                 self.tel_seen[i][slot] = seq
+                if rows > COST_SAMPLE_MAX_ROWS:
+                    continue
                 # Per distinct expert: a job streams each selected expert's weights once, so that
                 # is the unit the cost model compares with one zero-copy expert read
                 v = us / max(ne, 1)
                 self.cpu_us[i] = v if self.cpu_us[i] is None else (1 - HT.ema) * self.cpu_us[i] + HT.ema * v
                 changed = True
+        # Re-measure: once the cost model keeps every flexible miss on the GPU, decode yields no
+        # new CPU samples and a stale (e.g. pessimistic) estimate would persist. After
+        # EXL3_MOE_COST_REMEASURE passes without a sample, one pass uses the bootstrap share
+        self.explore = False
+        if changed:
+            self.cost_stale = 0
+        elif float(self.lane_cost[LC_CPU]) > 0:
+            self.cost_stale += 1
+            if HT.remeasure and self.cost_stale >= HT.remeasure:
+                self.cost_stale = 0
+                self.explore = True
         if not changed:
             return
         known = [c for c in self.cpu_us if c]
@@ -695,7 +731,7 @@ class HybridDispatcher:
         gpu_exact = HT.dispatch == "gpu_exact"
         gpu_max = -1 if (gpu_exact or HT.zc_max is None) else HT.zc_max
         cpu_frac = 0.0 if gpu_exact else self.cpu_frac
-        lane_cost = None if (gpu_exact or HT.zc_max is not None) else self.lane_cost
+        lane_cost = None if (gpu_exact or HT.zc_max is not None or self.explore) else self.lane_cost
         admit = int(n_picks <= CACHE_TUNING.admit_max)
         return gpu_max, cpu_frac, admit, lane_cost
 

@@ -430,6 +430,8 @@ class ExpertCache:
                 self.transient_hint = 0
                 self.extra_seen = 0
                 self.warmed = False
+                with _CACHES_LOCK:
+                    _DEVICE_TRANSIENT.pop((self.device.type, self.device.index or 0), None)
             elif not layer.cls.layers:
                 # The class is dead: its chunks would stay allocated and count against the limit
                 # while no layer can use them
