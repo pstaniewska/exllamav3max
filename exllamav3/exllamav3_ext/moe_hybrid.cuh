@@ -61,7 +61,26 @@
 #define HY_ST_CALLS       7
 #define HY_ST_NO_LANE     8      // picks with no lane at all (must stay 0; a configuration error)
 #define HY_ST_PREFILL     9
-#define HY_STATS_SIZE    16
+#define HY_ST_ADMIT_BYTES 10     // bytes copied into slots by admissions (host -> VRAM over PCIe)
+#define HY_ST_ZC_BYTES   11      // expert bytes of zero-copy lanes (lower bound of the PCIe reads)
+#define HY_ST_CPU_NODE   16      // + node: non-resident experts sent to that CPU node
+#define HY_STATS_SIZE    32
+
+// lane cost model (decode, gpu_max < 0): float CPU [4], microseconds, measured by the dispatcher
+#define HY_LC_HIT         0      // GPU time per resident expert
+#define HY_LC_ZC          1      // GPU time per zero-copy (or admitted) expert
+#define HY_LC_CPU_FIXED   2      // CPU job round trip (issue, wake, readback) per node used
+#define HY_LC_CPU         3      // CPU compute per expert of a job (its weights are streamed once)
+
+// nodes descriptor rows (int64 CPU [HY_ND_ROWS, nodes])
+#define HY_ND_SEL         0      // int32* job slot selections (pinned, mapped)
+#define HY_ND_X           1      // half* job slot activations
+#define HY_ND_W           2      // half* job slot weights
+#define HY_ND_COUNT       3      // int32* per-slot gate array (device)
+#define HY_ND_SLOT        4      // slot index into the gate array
+#define HY_ND_XCAP        5      // capacity of the activation section, halves
+#define HY_ND_SELCAP      6      // capacity of the selection / weight sections, entries
+#define HY_ND_ROWS        7
 
 // lanes (per expert, per call)
 #define HY_LANE_NONE     -2
@@ -86,13 +105,17 @@ void moe_hybrid_issue
     at::Tensor sel_gpu,             // int64 [>= rows * topk] out: router id for GPU lanes, num_experts = masked
     const c10::optional<at::Tensor>& lane_out,   // int32 [num_experts] out (optional)
     const c10::optional<at::Tensor>& cpu_sel,    // int32 [nodes, rows * topk] out, prefill mode (optional)
-    const at::Tensor& nodes,        // int64 CPU [5, nodes]: h_sel, h_x, h_w, dev_count, slot (decode mode; ignored in prefill)
+    const at::Tensor& nodes,        // int64 CPU [HY_ND_ROWS, nodes] (decode mode; ignored in prefill). A node
+                                    // column of all zeros is absent (no experts of this layer there)
     const at::Tensor& node_cost,    // float CPU [nodes] relative cost per assignment (adaptive policy)
     int64_t hi,                     // worker input width (zero-padded)
     int64_t prefill,                // 1: prefill mode (no admission, CPU picks into cpu_sel)
     int64_t admit,                  // 1: admission allowed for this call
     int64_t gpu_max,                // decode: misses kept on the GPU (>= 0), or -1 = derive from cpu_frac
     double cpu_frac,                // decode: share of GPU-readable misses sent to CPU lanes when gpu_max < 0
+                                    // and the cost model is not measured yet
+    const at::Tensor& lane_cost,    // float CPU [4] HY_LC_*: when ZC and CPU costs are > 0, decode misses
+                                    // go to a CPU node only if that lowers the call's slowest lane
     int64_t prefill_gpu_min,        // prefill: min rows for a non-resident expert to run zero-copy on the GPU
     int64_t node_policy,            // 0 local/sharded, 1 balanced, 2 adaptive
     int64_t pref_node               // preferred node for replicated experts (GPU-local), -1 = none

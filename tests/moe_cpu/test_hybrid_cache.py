@@ -97,19 +97,21 @@ class Nodes:
         self.x = [torch.zeros((rows * hi,), dtype = torch.half) for _ in range(N)]
         self.w = [torch.zeros((n,), dtype = torch.half) for _ in range(N)]
         self.count = [torch.full((8,), -1, dtype = torch.int32) for _ in range(N)]
-        t = torch.zeros((5, N), dtype = torch.long)
+        t = torch.zeros((ref.ND_ROWS, N), dtype = torch.long)
         for i in range(N):
-            t[0, i] = self.sel[i].data_ptr()
-            t[1, i] = self.x[i].data_ptr()
-            t[2, i] = self.w[i].data_ptr()
-            t[3, i] = self.count[i].data_ptr()
-            t[4, i] = 0
+            t[ref.ND_SEL, i] = self.sel[i].data_ptr()
+            t[ref.ND_X, i] = self.x[i].data_ptr()
+            t[ref.ND_W, i] = self.w[i].data_ptr()
+            t[ref.ND_COUNT, i] = self.count[i].data_ptr()
+            t[ref.ND_SLOT, i] = 0
+            t[ref.ND_XCAP, i] = rows * hi           # real capacities of the buffers above
+            t[ref.ND_SELCAP, i] = n
         self.t = t
         self.cost = torch.ones((N,), dtype = torch.float)
 
 
 def issue(cache, fl, sel, rows = None, hi = 8, nodes = None, prefill = 0, admit = 1, gpu_max = -1,
-          cpu_frac = 0.0, gmin = 0, policy = 0, pref = -1, h = 8):
+          cpu_frac = 0.0, gmin = 0, policy = 0, pref = -1, h = 8, lane_cost = None):
     sel = torch.tensor(sel, dtype = torch.long).view(-1)
     n = sel.numel()
     rows = rows or n
@@ -120,12 +122,11 @@ def issue(cache, fl, sel, rows = None, hi = 8, nodes = None, prefill = 0, admit 
     lane = torch.empty((EMAX,), dtype = torch.int32)
     N = nodes.t.shape[1] if nodes is not None else 0
     cpu_sel = torch.empty((max(N, 1), n), dtype = torch.int32) if prefill else None
-    if nodes is not None and not prefill:
-        assert nodes.x[0].numel() >= rows * hi and nodes.sel[0].numel() >= n, "node buffers too small"
-    nt = nodes.t if nodes is not None else torch.zeros((5, 0), dtype = torch.long)
+    nt = nodes.t if nodes is not None else torch.zeros((ref.ND_ROWS, 0), dtype = torch.long)
     cost = nodes.cost if nodes is not None else torch.ones((0,), dtype = torch.float)
+    lc = torch.tensor(lane_cost, dtype = torch.float) if lane_cost is not None else None
     cache.issue(fl.layer, sel, y, w, sel_gpu, lane, cpu_sel, nt, cost, hi, prefill, admit, gpu_max,
-                cpu_frac, gmin, policy, pref)
+                cpu_frac, gmin, policy, pref, lc)
     return dict(sel = sel, sel_gpu = sel_gpu, lane = lane[:fl.E].clone(), y = y, w = w, cpu_sel = cpu_sel, topk = topk)
 
 
@@ -452,3 +453,335 @@ def test_register_mapped_home_fallback(monkeypatch):
     assert h.register_mapped_home(0x1000, 1 << 30, "t") == 0x1000 + 0x7000_0000_0000
     assert h.register_mapped_home(0x2000, 2 << 30, "t") != 0
     assert h.register_mapped_home(0x3000, 1 << 30, "t") == 0      # over the pin limit
+
+
+# ---- hardening round: regressions and stress ------------------------------------------------
+
+def gpu_read_ok(cache, fl, r):
+    """What the GPU tiers would read for this call is the right data: every GPU-lane expert's
+    rows point at its home, or at a slot that holds exactly its home bytes"""
+    st = cache.ref_state
+    for e in set(int(x) for x in r["sel"].tolist()):
+        ln = int(r["lane"][e])
+        if ln not in (ref.LANE_GPU, ref.LANE_ZC):
+            continue
+        s = int(st.slotof[fl.layer.L * EMAX + e])
+        if ln == ref.LANE_GPU:
+            assert s >= 0, "GPU lane without a slot"
+            assert fl.rows(e) == fl.expect(int(st.slot_base[s]))
+            assert torch.equal(slot_bytes(cache, fl, e), fl.home[e * fl.eb: (e + 1) * fl.eb]), "stale slot"
+        else:
+            assert s < 0 and fl.rows(e) == fl.expect(int(fl.homes[e])), "zero-copy row not at home"
+
+
+def class_range(cache, cl):
+    ctl = cache.ref_state.ctl
+    return int(ctl[ref.CTL_CLASS_LO + 2 * cl.id]), int(ctl[ref.CTL_CLASS_HI + 2 * cl.id])
+
+
+def test_clock_range_is_the_enabled_prefix():
+    # Reviewer's case: a layout sized for a large device total, a small budget enabled. The scan
+    # must stay inside the enabled prefix, so admissions never end in no_victim while free
+    # (unpinned) slots exist
+    chunk = 4 * 1024
+    mem = Mem(free = 4 * chunk, total = 4000 * chunk)
+    c = H.cache.ExpertCache(torch.device("cpu"), backend = "ref", mem_info = mem, tuning = tuning())
+    mem.cache = c
+    fl = FakeLayer(c, "a", E = 64)
+    c.begin_pass(1, 32)
+    cl = fl.layer.cls
+    assert cl.cap >= 3000 * 4                    # layout covers the device
+    assert class_range(c, cl) == (cl.lo, cl.lo + 4 * 4)
+    rng = np.random.default_rng(3)
+    for _ in range(300):
+        sel = rng.choice(64, size = 4, replace = False).tolist()
+        r = issue(c, fl, sel, rows = 1)
+        gpu_read_ok(c, fl, r)
+    assert c.stats()["no_victim"] == 0
+    # Shrink and regrow move the range with the prefix
+    mem.free -= 2 * chunk
+    c.begin_pass(64, 32)
+    assert class_range(c, cl) == (cl.lo, cl.lo + 2 * 4)
+    mem.free += 2 * chunk
+    c.idle_maintenance()
+    assert class_range(c, cl) == (cl.lo, cl.lo + 4 * 4)
+    check_invariants(c, [fl])
+
+
+def test_interleaved_admission_eviction_shrink_regrow_mixed_sizes():
+    # Three expert sizes (three classes), four layers from three components on one owner;
+    # routing calls interleaved with shrink / regrow / release_all / unregister, as the host
+    # thread would issue them between passes. After every step: invariants, and the data each
+    # GPU lane would read is correct
+    chunk = 4 * 1024
+    mem = Mem(free = 40 * chunk)
+    c = H.cache.ExpertCache(torch.device("cpu"), backend = "ref", mem_info = mem, tuning = tuning())
+    mem.cache = c
+    layers = [FakeLayer(c, "text:l0", E = 32, eb = 1024), FakeLayer(c, "text:l1", E = 32, eb = 1024),
+              FakeLayer(c, "mtp:l0", E = 24, eb = 2048), FakeLayer(c, "text#1:l0", E = 16, eb = 512)]
+    c.begin_pass(1, 32)
+    rng = np.random.default_rng(11)
+    live = list(layers)
+    for step in range(400):
+        op = rng.integers(0, 20)
+        if op == 0:
+            mem.free -= int(rng.integers(1, 6)) * chunk
+            c.begin_pass(64, 32)
+        elif op == 1:
+            mem.free = 40 * chunk
+            c.idle_maintenance()
+        elif op == 2 and step % 7 == 0:
+            c.release_all()
+            c.begin_pass(1, 32)
+        elif op == 3 and step == 200:
+            gone = live.pop(3)                 # the draft's only layer: its class dies
+            c.unregister_layer(gone.layer)
+            assert not any(x is not None for x in gone.layer.cls.chunks)
+        else:
+            fl = live[int(rng.integers(0, len(live)))]
+            rows = int(rng.integers(1, 5))
+            sel = np.concatenate([rng.choice(fl.E, size = 4, replace = False) for _ in range(rows)])
+            r = issue(c, fl, sel.tolist(), rows = rows)
+            gpu_read_ok(c, fl, r)
+        check_invariants(c, live)
+        assert c.cache_bytes() <= max(0, mem.free)
+    st = c.stats()
+    assert st["admits"] > 0 and st["evictions"] > 0 and st["no_lane"] == 0
+    assert st["admit_bytes"] > 0
+
+
+def test_speculative_verify_rows_and_admission_cap():
+    # A verify forward is rows = jobs * (1 + window): same decode path, more picks. Above
+    # EXL3_EXPERT_CACHE_ADMIT_MAX picks nothing is admitted (hits still count)
+    c, _ = make_cache(admit_max = 64)
+    fl = FakeLayer(c, "a", E = 64)
+    c.begin_pass(1, 32)
+    rng = np.random.default_rng(5)
+    for jobs, window in [(1, 3), (2, 4), (4, 7), (8, 7)]:
+        rows = jobs * (1 + window)
+        sel = np.concatenate([rng.choice(64, size = 8, replace = False) for _ in range(rows)])
+        before = c.stats()["admits"]
+        admit = int(sel.size <= c.T.admit_max)
+        r = issue(c, fl, sel.tolist(), rows = rows, admit = admit)
+        gpu_read_ok(c, fl, r)
+        if not admit:
+            assert c.stats()["admits"] == before
+        check_invariants(c, [fl])
+
+
+def test_capacity_guard_rejects_oversized_decode_jobs():
+    # Regression for the earlier segfault: a decode call with more rows than the node slot
+    # holds wrote past the worker buffer. The reference (like the binding) now refuses it
+    c, _ = make_cache()
+    fl = FakeLayer(c, "a")
+    c.set_layer_cpuloc(fl.layer, np.arange(fl.E, dtype = np.int32)[None])
+    c.begin_pass(1, 32)
+    nodes = Nodes(1, 4, 1, 8)                   # one row, four picks
+    with pytest.raises(ValueError, match = "capacity"):
+        issue(c, fl, [1, 2, 3, 4, 5, 6, 7, 8], rows = 2, nodes = nodes, admit = 0)
+    # A partly filled node column is refused, an all-zero one is an absent node
+    bad = Nodes(2, 4, 1, 8)
+    bad.t[ref.ND_X, 1] = 0
+    with pytest.raises(ValueError, match = "complete"):
+        issue(c, fl, [1, 2, 3, 4], rows = 1, nodes = bad, admit = 0)
+    absent = Nodes(2, 4, 1, 8)
+    absent.t[:, 1] = 0
+    r = issue(c, fl, [1, 2, 3, 4], rows = 1, nodes = absent, admit = 0, cpu_frac = 1.0)
+    assert all(int(r["lane"][e]) == 0 for e in (1, 2, 3, 4))
+
+
+def test_pick_node_float32_tie_matches_kernel():
+    # Reviewer's numbers: float32 products tie (kernel keeps node 0), float64 would not
+    c, _ = make_cache()
+    fl = FakeLayer(c, "a")
+    c.set_layer_cpuloc(fl.layer, np.tile(np.arange(fl.E, dtype = np.int32), (2, 1)))
+    load = [19, 10] + [0] * 6
+    cost = [np.float32(1.4554425), np.float32(2.646259)]
+    assert np.float32(np.float32(20) * cost[0]) == np.float32(np.float32(11) * cost[1])
+    assert ref.pick_node(c.ref_state, fl.layer.L, 3, 1, 2, 2, -1, load, cost) == 0
+
+
+def lane_makespan(lane, sel_experts, hits, lc, nodes_of):
+    """GPU time vs every CPU node's time for the lanes a call got (the cost model's own terms)"""
+    t_gpu = hits * lc[0]
+    t_node = {}
+    for e in sel_experts:
+        ln = lane[e]
+        if ln in (ref.LANE_ZC, ref.LANE_GPU):
+            t_gpu += lc[1]
+        elif ln >= 0:
+            t_node[ln] = t_node.get(ln, lc[2]) + lc[3]
+    return max([t_gpu] + list(t_node.values()))
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_cost_model_cpu_never_lengthens_the_slowest_lane(seed):
+    rng = np.random.default_rng(seed)
+    c, _ = make_cache()
+    E = 48
+    fl = FakeLayer(c, "a", E = E, mapped = [e % 11 != 0 for e in range(E)])
+    loc = np.full((2, E), -1, dtype = np.int32)
+    for e in range(E):
+        if e % 7 != 0:                          # some experts have no CPU copy
+            loc[e % 2, e] = e // 2
+    c.set_layer_cpuloc(fl.layer, loc)
+    c.begin_pass(1, 32)
+    nodes = Nodes(2, 16, 2, 8)
+    for _ in range(25):
+        lc = [float(np.float32(rng.uniform(1, 20))) for _ in range(4)]
+        lc[2] = float(np.float32(rng.uniform(0, 60)))
+        rows = int(rng.integers(1, 3))
+        sel = np.concatenate([rng.choice(E, size = 8, replace = False) for _ in range(rows)]).tolist()
+        resident = {e for e in set(sel) if int(c.ref_state.slotof[fl.layer.L * EMAX + e]) >= 0}
+        r = issue(c, fl, sel, rows = rows, nodes = nodes, admit = 0, lane_cost = lc)
+        lane = {e: int(r["lane"][e]) for e in set(sel)}
+        misses = [e for e in set(sel) if e not in resident]
+        got = lane_makespan(lane, misses, len(resident), lc, None)
+        # Baseline: every flexible miss (GPU-readable home and a CPU copy) on the GPU
+        base = dict(lane)
+        for e in misses:
+            if fl.homes[e] and (loc[:, e] >= 0).any():
+                base[e] = ref.LANE_ZC
+        want = lane_makespan(base, misses, len(resident), lc, None)
+        assert got <= want * (1 + 1e-6), "a CPU lane lengthened the call's slowest lane"
+        for e in misses:
+            if not fl.homes[e]:
+                assert lane[e] >= 0 or not (loc[:, e] >= 0).any()     # unmapped: CPU or no lane
+            elif not (loc[:, e] >= 0).any():
+                assert lane[e] == ref.LANE_ZC                        # no CPU copy: GPU
+
+
+def test_cost_model_ties_stay_on_gpu():
+    c, _ = make_cache()
+    fl = FakeLayer(c, "a")
+    c.set_layer_cpuloc(fl.layer, np.arange(fl.E, dtype = np.int32)[None])
+    c.begin_pass(1, 32)
+    nodes = Nodes(1, 2, 1, 8)
+    # Two misses, zc = 10, cpu = 10, no fixed cost. All-GPU: 20. One on CPU: max(10, 10) = 10 <
+    # 20, so exactly one goes to the CPU; the second would tie (max(10, 20) vs max(20, 10))
+    r = issue(c, fl, [3, 4], rows = 1, nodes = nodes, admit = 0, lane_cost = [0.0, 10.0, 0.0, 10.0])
+    lanes = sorted(int(r["lane"][e]) for e in (3, 4))
+    assert lanes == [ref.LANE_ZC, 0]
+    # A fixed CPU cost that makes the CPU no better: everything stays on the GPU
+    r = issue(c, fl, [5, 6], rows = 1, nodes = nodes, admit = 0, lane_cost = [0.0, 10.0, 10.0, 10.0])
+    assert all(int(r["lane"][e]) == ref.LANE_ZC for e in (5, 6))
+    st = c.stats()
+    assert st["zero_copy_bytes"] == st["zero_copy"] * fl.eb
+
+
+def test_per_node_cpu_counters():
+    c, _ = make_cache()
+    fl = FakeLayer(c, "a")
+    shard = np.full((2, fl.E), -1, dtype = np.int32)
+    for e in range(fl.E):
+        shard[e % 2, e] = e // 2
+    c.set_layer_cpuloc(fl.layer, shard)
+    c.begin_pass(1, 32)
+    issue(c, fl, [1, 2, 3, 5], rows = 1, nodes = Nodes(2, 4, 1, 8), admit = 0, cpu_frac = 1.0)
+    st = c.stats()
+    assert st["cpu_by_node"][:2] == [1, 3] and st["cpu"] == 4
+    s = c.summary()
+    assert "vram_limit_mib" in s and "slot_utilization" in s
+
+
+def test_headroom_extra_is_not_double_counted_and_no_churn():
+    chunk = 4 * 1024
+    c, mem = make_cache(free = 10 * chunk, min_free_bytes = 0, grow_hysteresis = 0)
+    fl = FakeLayer(c, "a", E = 64)
+    c.note_transient(3 * chunk)                 # measured transient already holds the MoE bound
+    c.begin_pass(1, 32)
+    assert c.cache_bytes() == 7 * chunk
+    assert c.ensure_headroom(2 * chunk) == 0    # extra below the transient: nothing to give back
+    freed = c.ensure_headroom(5 * chunk)        # larger than the transient: shrink to it
+    assert freed == 2 * chunk and c.cache_bytes() == 5 * chunk
+    for _ in range(3):                          # idle regrow stops short of it: no churn
+        c.idle_maintenance()
+        assert c.ensure_headroom(5 * chunk) == 0
+    assert c.cache_bytes() == 5 * chunk
+
+
+def test_device_transient_from_any_component_raises_the_floor():
+    chunk = 4 * 1024
+    H.cache.ExpertCache._drop_registry()
+    c, mem = make_cache(free = 10 * chunk)
+    FakeLayer(c, "a")
+    H.cache.note_device_transient(0, 6 * chunk, device_type = "cpu")
+    H.cache.note_device_transient(0, 2 * chunk, device_type = "cpu")      # smaller: ignored
+    c.begin_pass(1, 32)
+    assert c.cache_bytes() == 4 * chunk
+    H.cache.ExpertCache._drop_registry()
+
+
+def test_stats_saved_when_each_component_leaves(tmp_path):
+    out = tmp_path / "stats.json"
+    c, _ = make_cache(save_stats = str(out))
+    a = FakeLayer(c, "text:l0")
+    d = FakeLayer(c, "text#1:l0")
+    c.begin_pass(1, 32)
+    issue(c, a, [1, 2])
+    issue(c, d, [3])
+    c.unregister_layer(d.layer)                  # draft leaves first: snapshot
+    assert set(json.loads(out.read_text())) >= {"text#1:l0"}
+    issue(c, a, [1])
+    c.unregister_layer(a.layer)                  # main leaves: saved again, current history
+    saved = json.loads(out.read_text())
+    assert saved["text:l0"][1] >= 2.0
+    # A second model in the same process saves too
+    b = FakeLayer(c, "text:l0")
+    c.begin_pass(1, 32)
+    issue(c, b, [7, 7])
+    c.unregister_layer(b.layer)
+    assert json.loads(out.read_text())["text:l0"][7] >= 2.0
+
+
+def test_dead_class_is_reused_and_classes_reset_when_empty():
+    c, _ = make_cache(lcap = 16)
+    live = [FakeLayer(c, f"l{i}", E = 4, eb = 256 * (i + 1)) for i in range(ref.MAX_CLASSES)]
+    c.begin_pass(1, 32)
+    with pytest.raises(RuntimeError, match = "distinct expert sizes"):
+        FakeLayer(c, "x", E = 4, eb = 256 * 20)
+    c.unregister_layer(live[2].layer)
+    nl = FakeLayer(c, "x", E = 4, eb = 256 * 20)
+    assert nl.layer.cls.id == 2
+    c.begin_pass(1, 32)
+    check_invariants(c, live[:2] + live[3:] + [nl])
+    for fl in live[:2] + live[3:] + [nl]:
+        c.unregister_layer(fl.layer)
+    assert c.classes == [] and c.cache_bytes() == 0
+
+
+def test_limit_below_one_chunk_gets_a_notice(capsys):
+    c, _ = make_cache(limit_bytes = 2 * 1024)    # chunk = 4 slots x 1 KiB
+    FakeLayer(c, "a")
+    c.begin_pass(1, 32)
+    assert c.cache_bytes() == 0
+    assert "fits EXL3_EXPERT_CACHE_LIMIT_GB" in capsys.readouterr().out
+    # Two classes under a modest limit: the small one still gets a chunk
+    c2, _ = make_cache(limit_bytes = 5 * 4 * 1024)
+    FakeLayer(c2, "big", E = 64, eb = 4096)
+    small = FakeLayer(c2, "small", E = 4, eb = 256)
+    c2.begin_pass(1, 32)
+    assert small.layer.cls.allocated_bytes() > 0
+
+
+def test_grow_skips_a_class_whose_chunk_does_not_fit():
+    # Room for small chunks only: the big class must not starve the small one
+    c, _ = make_cache(free = 3 * 4 * 256 + 100)
+    big = FakeLayer(c, "big", E = 64, eb = 4096)
+    small = FakeLayer(c, "small", E = 8, eb = 256)
+    c.begin_pass(1, 32)
+    assert big.layer.cls.allocated_bytes() == 0 and small.layer.cls.allocated_bytes() > 0
+
+
+def test_warm_start_runs_once_per_owner_generation(tmp_path):
+    p = tmp_path / "warm.json"
+    p.write_text(json.dumps({"a": [0.0] * 5 + [10.0] + [0.0] * 10}))
+    c, _ = make_cache(warm = str(p))
+    fl = FakeLayer(c, "a")
+    c.begin_pass(1, 32)
+    for _ in range(3):
+        issue(c, fl, [2])
+    h2 = float(c.ref_state.hist[fl.layer.L * EMAX + 2])
+    FakeLayer(c, "b", eb = 2048)                 # new class: re-layout
+    c.begin_pass(1, 32)
+    assert float(c.ref_state.hist[fl.layer.L * EMAX + 2]) == h2   # live history kept

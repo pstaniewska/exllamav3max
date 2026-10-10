@@ -124,7 +124,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         py::arg("state"), py::arg("layer"), py::arg("num_experts"), py::arg("sel"), py::arg("y"), py::arg("w"),
         py::arg("sel_gpu"), py::arg("lane_out"), py::arg("cpu_sel"), py::arg("nodes"), py::arg("node_cost"),
         py::arg("hi"), py::arg("prefill"), py::arg("admit"), py::arg("gpu_max"), py::arg("cpu_frac"),
-        py::arg("prefill_gpu_min"), py::arg("node_policy"), py::arg("pref_node"));
+        py::arg("lane_cost"), py::arg("prefill_gpu_min"), py::arg("node_policy"), py::arg("pref_node"));
     m.def("moe_hybrid_gather", &moe_hybrid_gather, "moe_hybrid_gather",
         py::arg("state"), py::arg("like"), py::arg("blocks_per_job"));
     m.def("moe_hybrid_host_ops", &moe_hybrid_host_ops, "moe_hybrid_host_ops",

@@ -309,8 +309,18 @@ class Model_LSMixin(ABC):
 
             dummy_state = None
             unset_memory_fraction(touched_devices)
-            # Largest measured transient per device: the floor the hybrid expert cache keeps free
-            config.autosplit_transient = dict(max_transient)
+            # Largest measured transient per device: the floor the hybrid expert caches keep
+            # free. Max-merged per device across every component loaded in this process (main
+            # model, MTP head, vision tower, draft model with its own config), whatever API
+            # loaded it (load or load_gen)
+            prev = getattr(config, "autosplit_transient", None) or {}
+            config.autosplit_transient = {i: max(prev.get(i, 0), max_transient.get(i, 0))
+                                          for i in set(prev) | set(max_transient)}
+            from .moe_expert_cache import note_device_transient
+            margin = int(os.environ.get("EXL3_AUTOSPLIT_MARGIN_MB", 256)) << 20
+            for i, v in max_transient.items():
+                if v:
+                    note_device_transient(i, v + margin)
             if verbose:
                 for i in touched_devices:
                     print(f" -- autosplit: cuda:{i} largest measured transient {max_transient.get(i, 0) >> 20} MiB, "
@@ -337,7 +347,7 @@ class Model_LSMixin(ABC):
             h.begin_pass()
         if getattr(self.config, "moe_hybrid_dispatchers", None):
             from .moe_hybrid_dispatch import begin_pass_all
-            begin_pass_all(self.config, x)
+            begin_pass_all(self.config, x, getattr(self, "component", "text"))
         for module, instance, idx in self.fwd_modules:
             params["layer_instance"] = instance
             pf = (idx, instance) == self.last_kv_module_idx_instance
@@ -359,7 +369,7 @@ class Model_LSMixin(ABC):
             h.begin_pass()
         if getattr(self.config, "moe_hybrid_dispatchers", None):
             from .moe_hybrid_dispatch import begin_pass_all
-            begin_pass_all(self.config, x)
+            begin_pass_all(self.config, x, getattr(self, "component", "text"))
         for module, instance, idx in self.fwd_modules:
             params["layer_instance"] = instance
             if module.caps.get("logits_output") and (num := params.get("last_tokens_only")):

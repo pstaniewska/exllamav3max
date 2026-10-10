@@ -571,6 +571,12 @@ class Generator:
         else:
             self.iterate_gen(results)
 
+        # CPU MoE workers: a worker lost mid-pass means CPU expert outputs were not computed
+        if getattr(self.model.config, "moe_cpu_hosts", None) or \
+                (self.draft_model is not None and getattr(self.draft_model.config, "moe_cpu_hosts", None)):
+            from ..model.moe_cpu_host import check_workers
+            check_workers(self.model.config, self.draft_model.config if self.draft_model is not None else None)
+
         # Visualization
         if self.visualizer:
             self.update_visualizer()

@@ -1,4 +1,5 @@
 #include "moe_hybrid.cuh"
+#include <cmath>
 #include <cuda_fp16.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -63,6 +64,11 @@ struct HyNodes
     int slot[HY_MAX_NODES];
     float cost[HY_MAX_NODES];
     int n;
+};
+
+struct HyLaneCost
+{
+    float hit, zc, cpu_fixed, cpu;   // HY_LC_* (microseconds); zc <= 0 or cpu <= 0 = not measured
 };
 
 static HyState hy_state(const at::Tensor& t)
@@ -163,7 +169,8 @@ __device__ int hy_pick_node(const HyState& st, int L, int e, int cnt, int nn, in
             if (best < 0) best = nd;
             continue;
         }
-        const float c = policy == 1 ? (float) load[nd] : (float) (load[nd] + cnt) * cost[nd];
+        // Explicit round-to-nearest multiply (no contraction), so the reference reproduces it
+        const float c = policy == 1 ? (float) load[nd] : __fmul_rn((float) (load[nd] + cnt), cost[nd]);
         if (best < 0 || c < best_c) { best = nd; best_c = c; }
     }
     return best;
@@ -191,6 +198,7 @@ void moe_hybrid_issue_kernel
     const int admit,
     const int gpu_max,
     const float cpu_frac,
+    const HyLaneCost lc,
     const int prefill_gpu_min,
     const int node_policy,
     const int pref_node
@@ -295,8 +303,10 @@ void moe_hybrid_issue_kernel
             s_key[j + 1] = k;
         }
 
-        // Flexible misses: GPU-readable home and a CPU copy, so either lane can take them
+        // Flexible misses: GPU-readable home and a CPU copy, so either lane can take them.
+        // Forced GPU: GPU-readable home, no CPU copy
         int nflex = 0;
+        int nforced_gpu = 0;
         for (int j = 0; j < m; ++j)
         {
             const int e = s_miss[j];
@@ -304,12 +314,24 @@ void moe_hybrid_issue_kernel
             bool has_cpu = false;
             for (int q = 0; q < nd.n && !has_cpu; ++q) has_cpu = hy_cpuloc(st, L, q, e) >= 0;
             nflex += has_cpu;
+            nforced_gpu += !has_cpu;
         }
+        // Decode lane split for the flexible misses:
+        // - gpu_max >= 0: the first gpu_max (hottest first) stay on the GPU
+        // - cost model measured: greedy min-max. Each flexible miss goes to its CPU node only if
+        //   that makes the call's slowest lane (GPU work vs every CPU node's round trip plus
+        //   compute) strictly shorter than keeping it on the GPU; ties stay on the GPU. So the
+        //   CPU never lengthens the layer's critical path under the measured costs
+        // - otherwise: share cpu_frac of the flexible misses to the CPU (bootstrap until measured)
+        const bool use_cost = gpu_max < 0 && lc.zc > 0.0f && lc.cpu > 0.0f;
         int quota = gpu_max >= 0 ? min(gpu_max, nflex) : nflex - (int) rintf((float) nflex * cpu_frac);
         if (quota < 0) quota = 0;
 
         int load[HY_MAX_NODES];
-        for (int q = 0; q < HY_MAX_NODES; ++q) load[q] = 0;
+        float t_node[HY_MAX_NODES];
+        for (int q = 0; q < HY_MAX_NODES; ++q) { load[q] = 0; t_node[q] = 0.0f; }
+        float t_gpu = __fadd_rn(__fmul_rn((float) s_hits, lc.hit), __fmul_rn((float) nforced_gpu, lc.zc));
+        float t_cpu_max = 0.0f;
 
         const int cls = st.reg_class[L];
         const int lo = cls >= 0 ? st.ctl[HY_CTL_CLASS_LO + 2 * cls] : 0;
@@ -318,18 +340,33 @@ void moe_hybrid_issue_kernel
         if (range > 0 && (hand < 0 || hand >= range)) hand = 0;
         int gcount = 0;
         int flex_gpu = 0;
+        const int64_t ebytes = st.reg_bytes[L];
 
+        // Two passes in miss order: experts with one possible lane first (their load is fixed),
+        // then the flexible ones, decided against that load
+        for (int pass = 0; pass < 2; ++pass)
         for (int j = 0; j < m; ++j)
         {
             const int e = s_miss[j];
             const int c = s_cnt[e];
             const bool mapped = st.reg_home[hbase + e] != 0;
+            bool has_cpu = false;
+            for (int q = 0; q < nd.n && !has_cpu; ++q) has_cpu = hy_cpuloc(st, L, q, e) >= 0;
+            const bool flex = mapped && has_cpu;
+            if ((int) flex != pass) continue;
             const int node = hy_pick_node(st, L, e, c, nd.n, node_policy, pref_node, load, nd.cost);
 
             bool to_gpu;
             if (!mapped) to_gpu = false;
             else if (node < 0) to_gpu = true;
             else if (prefill) to_gpu = c >= prefill_gpu_min;
+            else if (use_cost)
+            {
+                const float add_cpu = __fadd_rn(t_node[node] > 0.0f ? 0.0f : lc.cpu_fixed, lc.cpu);
+                const float m_gpu = fmaxf(__fadd_rn(t_gpu, lc.zc), t_cpu_max);
+                const float m_cpu = fmaxf(t_gpu, fmaxf(t_cpu_max, __fadd_rn(t_node[node], add_cpu)));
+                to_gpu = !(m_cpu < m_gpu);
+            }
             else
             {
                 to_gpu = flex_gpu < quota;
@@ -340,6 +377,7 @@ void moe_hybrid_issue_kernel
             if (to_gpu)
             {
                 lane = HY_LANE_ZC;
+                if (pass == 1) t_gpu = __fadd_rn(t_gpu, lc.zc);
                 if (admit && !prefill && range > 0 && gcount < st.gmax)
                 {
                     int victim = -1;
@@ -362,20 +400,28 @@ void moe_hybrid_issue_kernel
                         int64_t* job = st.gjobs + 3 * gcount;
                         job[0] = st.slot_base[victim];
                         job[1] = st.reg_home[hbase + e];
-                        job[2] = st.reg_bytes[L];
+                        job[2] = ebytes;
                         gcount++;
                         lane = HY_LANE_GPU;
                         st.stats[HY_ST_ADMITS] += 1;
+                        st.stats[HY_ST_ADMIT_BYTES] += (unsigned long long) ebytes;
                     }
                     else st.stats[HY_ST_NO_VICTIM] += 1;
                 }
-                if (lane == HY_LANE_ZC) st.stats[HY_ST_ZC] += 1;
+                if (lane == HY_LANE_ZC)
+                {
+                    st.stats[HY_ST_ZC] += 1;
+                    st.stats[HY_ST_ZC_BYTES] += (unsigned long long) ebytes;
+                }
             }
             else if (node >= 0)
             {
                 lane = node;
                 load[node] += c;
+                t_node[node] = __fadd_rn(t_node[node], __fadd_rn(t_node[node] > 0.0f ? 0.0f : lc.cpu_fixed, lc.cpu));
+                t_cpu_max = fmaxf(t_cpu_max, t_node[node]);
                 st.stats[HY_ST_CPU] += 1;
+                st.stats[HY_ST_CPU_NODE + node] += 1;
             }
             else st.stats[HY_ST_NO_LANE] += 1;
             s_lane[e] = lane;
@@ -421,6 +467,7 @@ void moe_hybrid_issue_kernel
     // staged by moe_hybrid_stage_x_kernel, launched right after on the same stream
     for (int q = 0; q < nd.n; ++q)
     {
+        if (!nd.dev_count[q]) continue;     // absent node (no experts of this layer)
         const int active = s_any[q];
         if (t == 0) reinterpret_cast<int32_t*>(nd.dev_count[q])[nd.slot[q]] = active;
         if (!active) continue;
@@ -445,7 +492,7 @@ __global__ void moe_hybrid_stage_x_kernel
 {
     for (int q = 0; q < nd.n; ++q)
     {
-        if (!reinterpret_cast<const int32_t*>(nd.dev_count[q])[nd.slot[q]]) continue;
+        if (!nd.dev_count[q] || !reinterpret_cast<const int32_t*>(nd.dev_count[q])[nd.slot[q]]) continue;
         half* hx = reinterpret_cast<half*>(nd.h_x[q]);
         const int total = rows * hi;
         if ((h_ & 7) == 0 && (hi & 7) == 0)
@@ -492,6 +539,7 @@ void moe_hybrid_issue
     int64_t admit,
     int64_t gpu_max,
     double cpu_frac,
+    const at::Tensor& lane_cost,
     int64_t prefill_gpu_min,
     int64_t node_policy,
     int64_t pref_node
@@ -522,8 +570,18 @@ void moe_hybrid_issue
     TORCH_CHECK(hi >= h_, "moe_hybrid_issue: worker width below the row width");
     if (lane_out) TORCH_CHECK(lane_out.value().numel() >= num_experts && lane_out.value().is_contiguous(), "moe_hybrid_issue: lane_out too small");
 
-    TORCH_CHECK(nodes.device().is_cpu() && nodes.dtype() == at::kLong && nodes.is_contiguous() && nodes.dim() == 2 && nodes.size(0) == 5,
-                "moe_hybrid_issue: nodes must be an int64 CPU tensor (5, num_nodes)");
+    TORCH_CHECK(nodes.device().is_cpu() && nodes.dtype() == at::kLong && nodes.is_contiguous() && nodes.dim() == 2 && nodes.size(0) == HY_ND_ROWS,
+                "moe_hybrid_issue: nodes must be an int64 CPU tensor (HY_ND_ROWS, num_nodes)");
+    TORCH_CHECK(lane_cost.device().is_cpu() && lane_cost.dtype() == at::kFloat && lane_cost.is_contiguous() && lane_cost.numel() >= 4,
+                "moe_hybrid_issue: lane_cost must be a float CPU tensor of 4 entries");
+    HyLaneCost lc;
+    {
+        const float* l = lane_cost.data_ptr<float>();
+        lc.hit = l[HY_LC_HIT]; lc.zc = l[HY_LC_ZC]; lc.cpu_fixed = l[HY_LC_CPU_FIXED]; lc.cpu = l[HY_LC_CPU];
+        TORCH_CHECK(std::isfinite(lc.hit) && std::isfinite(lc.zc) && std::isfinite(lc.cpu_fixed) && std::isfinite(lc.cpu) &&
+                    lc.hit >= 0.0f && lc.zc >= 0.0f && lc.cpu_fixed >= 0.0f && lc.cpu >= 0.0f,
+                    "moe_hybrid_issue: lane costs must be finite and non-negative");
+    }
     TORCH_CHECK(node_cost.device().is_cpu() && node_cost.dtype() == at::kFloat && node_cost.numel() >= nodes.size(1),
                 "moe_hybrid_issue: node_cost must be a float CPU tensor (num_nodes)");
     HyNodes nd {};
@@ -533,15 +591,23 @@ void moe_hybrid_issue
     const float* costp = node_cost.data_ptr<float>();
     for (int q = 0; q < nd.n; ++q)
     {
-        nd.h_sel[q] = ndp[0 * nd.n + q];
-        nd.h_x[q] = ndp[1 * nd.n + q];
-        nd.h_w[q] = ndp[2 * nd.n + q];
-        nd.dev_count[q] = ndp[3 * nd.n + q];
-        nd.slot[q] = (int) ndp[4 * nd.n + q];
+        nd.h_sel[q] = ndp[HY_ND_SEL * nd.n + q];
+        nd.h_x[q] = ndp[HY_ND_X * nd.n + q];
+        nd.h_w[q] = ndp[HY_ND_W * nd.n + q];
+        nd.dev_count[q] = ndp[HY_ND_COUNT * nd.n + q];
+        nd.slot[q] = (int) ndp[HY_ND_SLOT * nd.n + q];
         nd.cost[q] = costp[q] > 0.0f ? costp[q] : 1.0f;
         if (!prefill)
-            TORCH_CHECK(nd.h_sel[q] && nd.h_x[q] && nd.h_w[q] && nd.dev_count[q],
-                        "moe_hybrid_issue: decode mode needs every node's slot addresses");
+        {
+            const bool any = nd.h_sel[q] || nd.h_x[q] || nd.h_w[q] || nd.dev_count[q];
+            const bool all = nd.h_sel[q] && nd.h_x[q] && nd.h_w[q] && nd.dev_count[q];
+            TORCH_CHECK(any == all, "moe_hybrid_issue: a decode node column must be complete or all zero");
+            // The kernels write rows * hi activations and rows * topk selections / weights into
+            // the slot: a call larger than the slot would corrupt the pinned job ring
+            if (all)
+                TORCH_CHECK((int64_t) rows * hi <= ndp[HY_ND_XCAP * nd.n + q] && (int64_t) n <= ndp[HY_ND_SELCAP * nd.n + q],
+                            "moe_hybrid_issue: decode job exceeds the CPU slot capacity");
+        }
     }
     if (prefill && cpu_sel)
     {
@@ -560,7 +626,7 @@ void moe_hybrid_issue
         (int64_t*) sel_gpu.data_ptr(),
         lane_out ? (int32_t*) lane_out.value().data_ptr() : nullptr,
         (prefill && cpu_sel) ? (int32_t*) cpu_sel.value().data_ptr() : nullptr,
-        (int) prefill, (int) admit, (int) gpu_max, (float) cpu_frac, (int) prefill_gpu_min,
+        (int) prefill, (int) admit, (int) gpu_max, (float) cpu_frac, lc, (int) prefill_gpu_min,
         (int) node_policy, (int) pref_node
     );
     cuda_check(cudaPeekAtLastError());

@@ -88,8 +88,21 @@ TUNING = CacheTuning()
 
 _OOM = getattr(torch, "OutOfMemoryError", None) or torch.cuda.OutOfMemoryError
 
+_NO_COST = torch.zeros((4,), dtype = torch.float)
+
 _CACHES: dict = {}
 _CACHES_LOCK = threading.Lock()
+
+# Worst-case forward transient per device index, noted by every component's autosplit load
+# (max-merged, so a later component with a smaller transient never lowers it); read by the
+# device's owner whenever it computes its floor, whether the owner exists yet or not
+_DEVICE_TRANSIENT: dict = {}
+
+
+def note_device_transient(device_index: int, nbytes: int, device_type: str = "cuda"):
+    key = (device_type, device_index)
+    with _CACHES_LOCK:
+        _DEVICE_TRANSIENT[key] = max(_DEVICE_TRANSIENT.get(key, 0), int(nbytes))
 
 
 def _round_up(x, m):
@@ -149,9 +162,10 @@ class ExpertCache:
 
     @staticmethod
     def _drop_registry():
-        """Tests: forget every owner"""
+        """Tests: forget every owner and every noted transient"""
         with _CACHES_LOCK:
             _CACHES.clear()
+            _DEVICE_TRANSIENT.clear()
 
     def __init__(self, device, backend: str = "cuda", mem_info = None, tuning: CacheTuning | None = None):
         self.device = torch.device(device)
@@ -168,9 +182,10 @@ class ExpertCache:
         self.grow_pending = False
         self.streams: dict[int, object] = {}
         self.transient_hint = 0
+        self.extra_seen = 0                 # largest prefill extra requested via ensure_headroom
+        self.warmed = False
         self.scap = 0
         self.notices = set()
-        self._stats_saved = False
 
         lcap, dev = self.T.lcap, self.device
         def full(n, v, dt):
@@ -236,29 +251,33 @@ class ExpertCache:
             ext.moe_hybrid_host_ops(self.state, td, len(ops))
 
     def issue(self, layer: CacheLayer, sel, y, w, sel_gpu, lane_out, cpu_sel, nodes, node_cost, hi,
-              prefill, admit, gpu_max, cpu_frac, prefill_gpu_min, node_policy, pref_node):
-        """One layer call's lane assignment (see moe_hybrid_issue). nodes: int64 CPU (5, n),
-        node_cost: float CPU (n)"""
+              prefill, admit, gpu_max, cpu_frac, prefill_gpu_min, node_policy, pref_node, lane_cost = None):
+        """One layer call's lane assignment (see moe_hybrid_issue). nodes: int64 CPU (ND_ROWS, n),
+        node_cost: float CPU (n), lane_cost: float CPU (4) or None (cost model off)"""
         if self.policy_none():
             admit = 0
+        if lane_cost is None:
+            lane_cost = _NO_COST
         with self.lock:
             if self.backend == "ref":
-                nd = dict(n = nodes.shape[1], h_sel = nodes[0].tolist(), h_x = nodes[1].tolist(),
-                          h_w = nodes[2].tolist(), dev_count = nodes[3].tolist(), slot = nodes[4].tolist(),
-                          cost = node_cost.tolist())
+                nd = dict(n = nodes.shape[1], h_sel = nodes[ref.ND_SEL].tolist(), h_x = nodes[ref.ND_X].tolist(),
+                          h_w = nodes[ref.ND_W].tolist(), dev_count = nodes[ref.ND_COUNT].tolist(),
+                          slot = nodes[ref.ND_SLOT].tolist(), xcap = nodes[ref.ND_XCAP].tolist(),
+                          selcap = nodes[ref.ND_SELCAP].tolist(), cost = node_cost.tolist())
                 ref.issue(
                     self.ref_state, nd, layer.L, layer.num_experts, sel.view(-1).numpy(),
                     y.numpy() if y is not None else None, hi, w.view(-1).numpy(), sel_gpu.view(-1).numpy(),
                     lane_out.numpy() if lane_out is not None else None,
                     cpu_sel.view(-1).numpy() if cpu_sel is not None else None,
-                    prefill, admit, gpu_max, cpu_frac, prefill_gpu_min, node_policy, pref_node)
+                    prefill, admit, gpu_max, cpu_frac, prefill_gpu_min, node_policy, pref_node,
+                    lane_cost.tolist())
                 if admit and not prefill:
                     ref.gather(self.ref_state)
                 return
             from ..ext import exllamav3_ext as ext
             ext.moe_hybrid_issue(
                 self.state, layer.L, layer.num_experts, sel.view(-1), y, w.view(-1), sel_gpu,
-                lane_out, cpu_sel, nodes, node_cost, hi, prefill, admit, gpu_max, cpu_frac,
+                lane_out, cpu_sel, nodes, node_cost, hi, prefill, admit, gpu_max, cpu_frac, lane_cost,
                 prefill_gpu_min, node_policy, pref_node)
             if admit and not prefill:
                 ext.moe_hybrid_gather(self.state, sel_gpu, self.T.gather_blocks)
@@ -280,7 +299,20 @@ class ExpertCache:
             if c.slot_bytes == slot_bytes:
                 return c
         if len(self.classes) >= MAX_CLASSES:
-            raise RuntimeError(f"Expert cache on {self.device}: more than {MAX_CLASSES} distinct expert sizes")
+            # Reuse the id of a class no layer uses any more (its chunks were dropped when its
+            # last layer left); the slot layout changes either way, handled below
+            dead = next((c for c in self.classes if not c.layers), None)
+            if dead is None:
+                raise RuntimeError(f"Expert cache on {self.device}: more than {MAX_CLASSES} distinct expert sizes "
+                                   f"in use at once")
+            cid = dead.id
+            bounce = torch.zeros((slot_bytes,), dtype = torch.uint8, device = self.device)
+            c = SizeClass(cid, slot_bytes, bounce)
+            if self.sized:
+                self.release_all()
+                self.sized = False
+            self.classes[cid] = c
+            return c
         bounce = torch.zeros((slot_bytes,), dtype = torch.uint8, device = self.device)
         c = SizeClass(len(self.classes), slot_bytes, bounce)
         self.classes.append(c)
@@ -364,7 +396,11 @@ class ExpertCache:
         with self.lock:
             if self.by_uid.get(layer.uid) is not layer:
                 return
-            self._save_stats_once_if_last()
+            # Stats: snapshot (merged into the file) when the last layer of a component leaves
+            tag = layer.uid.split(":", 1)[0]
+            if self.T.save_stats and not any(l is not layer and l.uid.split(":", 1)[0] == tag
+                                             for l in self.layers.values()):
+                self.save_stats(self.T.save_stats)
             self.quiesce()
             ops = []
             if self.scap:
@@ -388,6 +424,17 @@ class ExpertCache:
                 self.release_all()
                 self.sized = False
                 self.grow_pending = False
+                # Nothing references the bounce blocks any more (the layers' Linears are gone).
+                # Per-load hints go too: the next model is measured again when it loads
+                self.classes = []
+                self.transient_hint = 0
+                self.extra_seen = 0
+                self.warmed = False
+            elif not layer.cls.layers:
+                # The class is dead: its chunks would stay allocated and count against the limit
+                # while no layer can use them
+                self._drop_class_chunks(layer.cls)
+                self.grow_pending = True
 
     # ---- memory and budget ---------------------------------------------------------------------
 
@@ -405,7 +452,12 @@ class ExpertCache:
         return free + max(0, pool), total
 
     def floor_bytes(self) -> int:
-        return max(self.T.reserve_bytes, self.transient_hint + self.T.min_free_bytes)
+        """Free VRAM the cache always leaves: the reserve, or the largest known transient (this
+        device's autosplit measurements of every component, the hints noted here, the largest
+        prefill extra seen) plus EXL3_EXPERT_CACHE_MIN_FREE_MB, whichever is larger"""
+        dev_t = _DEVICE_TRANSIENT.get((self.device.type, self.device.index or 0), 0)
+        t = max(self.transient_hint, dev_t, self.extra_seen)
+        return max(self.T.reserve_bytes, t + self.T.min_free_bytes)
 
     def note_transient(self, nbytes: int):
         """Worst-case transient of a forward on this device (autosplit measurement, MoE prefill
@@ -443,7 +495,10 @@ class ExpertCache:
 
     def _layout(self):
         """Slot index layout per class, sized for the whole device (metadata only: a few bytes
-        per potential slot), so chunks can come and go without moving any slot index"""
+        per potential slot), so chunks can come and go without moving any slot index. The CLOCK
+        range of a class (CTL_CLASS_HI) covers only its enabled prefix (see _sync_range).
+        Replaces the slot arrays: in-flight kernels may still read the old ones, so quiesce"""
+        self.quiesce()
         _, total = self.mem_info()
         cap_total = total if self.T.limit_bytes is None else min(total, self.T.limit_bytes)
         wsum = sum(c.weight for c in self.classes) or 1
@@ -451,6 +506,10 @@ class ExpertCache:
         for c in self.classes:
             share = cap_total * c.weight // wsum
             nchunks = max(0, share // self.chunk_bytes(c)) if c.weight else 0
+            if c.weight and nchunks == 0 and self.chunk_bytes(c) <= cap_total:
+                # A small class's share rounds down to nothing: give it one chunk (the limit
+                # still caps what grow allocates)
+                nchunks = 1
             c.lo = lo
             c.cap = nchunks * self.T.chunk_slots
             c.chunks = [None] * nchunks
@@ -459,11 +518,27 @@ class ExpertCache:
         ctl = [0] * CTL_SIZE
         for c in self.classes:
             ctl[CTL_CLASS_LO + 2 * c.id] = c.lo
-            ctl[CTL_CLASS_HI + 2 * c.id] = c.lo + c.cap
+            ctl[CTL_CLASS_HI + 2 * c.id] = c.lo     # nothing enabled yet
             ctl[CTL_HAND + c.id] = 0
         epoch = int(self.arrays["ctl"][0].item())
         ctl[0] = epoch
         self._write(self.arrays["ctl"], 0, ctl)
+
+    def enabled_chunks(self, c: SizeClass) -> int:
+        """Enabled chunks of a class form a prefix: grow takes the lowest free index, shrink
+        gives back the highest enabled one"""
+        n = 0
+        while n < len(c.chunks) and c.chunks[n] is not None:
+            n += 1
+        assert all(x is None for x in c.chunks[n:]), "expert cache: enabled chunks are not a prefix"
+        return n
+
+    def _sync_range(self, c: SizeClass):
+        """Bound the class's CLOCK scan to its enabled slots (stream-ordered with the kernels):
+        a scan over a long disabled tail would end in no_victim for every admission while the
+        hand crosses it. The kernel resets a hand that falls outside the range"""
+        hi = c.lo + self.enabled_chunks(c) * self.T.chunk_slots
+        self._write(self.arrays["ctl"], CTL_CLASS_HI + 2 * c.id, [hi])
 
     def ensure_sized(self):
         """First sizing (lazy, at the first pass) or regrowth after release_all / new layers"""
@@ -474,8 +549,20 @@ class ExpertCache:
                 self._layout()
                 self.sized = True
                 self.grow(regrow = False)
-                self.warm_start()
+                if not self.warmed:
+                    # Once per owner generation: a later re-layout (new size class) keeps the
+                    # live pick history instead of reloading the file's counts
+                    self.warm_start()
+                    self.warmed = True
                 self.grow_pending = False
+                if self.T.limit_bytes is not None:
+                    for c in self.classes:
+                        if c.weight and not any(x is not None for x in c.chunks):
+                            self._notice(f"nochunk{c.slot_bytes}",
+                                         f" !! expert cache {self.device}: no slot chunk of {self.chunk_bytes(c) >> 20} MiB "
+                                         f"({self.T.chunk_slots} x {c.slot_bytes >> 10} KiB experts) fits "
+                                         f"EXL3_EXPERT_CACHE_LIMIT_GB; this expert size is not cached (lower "
+                                         f"EXL3_EXPERT_CACHE_CHUNK_SLOTS or raise the limit)")
             elif self.grow_pending:
                 self.grow(regrow = False)
                 self.grow_pending = False
@@ -490,14 +577,17 @@ class ExpertCache:
             room = avail - self.floor_bytes() - (self.T.grow_hysteresis if regrow else 0)
             limit = self.T.limit_bytes
             cur = self.cache_bytes()
+            skip = set()
             while True:
-                cands = [c for c in self.classes if c.weight and None in c.chunks]
+                cands = [c for c in self.classes if c.weight and None in c.chunks and c.id not in skip]
                 if not cands:
                     break
                 c = min(cands, key = lambda c: c.allocated_bytes() / c.weight)
                 b = self.chunk_bytes(c)
                 if b > room or (limit is not None and cur + b > limit):
-                    break
+                    # This class's chunk does not fit; a class with smaller chunks still may
+                    skip.add(c.id)
+                    continue
                 ci = c.chunks.index(None)
                 try:
                     t = torch.empty((b,), dtype = torch.uint8, device = self.device)
@@ -509,6 +599,7 @@ class ExpertCache:
                 bases = [t.data_ptr() + i * c.slot_bytes for i in range(self.T.chunk_slots)]
                 self._write(self.arrays["slot_base"], s0, bases)
                 self.run_host_ops([(OP_ENABLE, 0, 0, s0 + i) for i in range(self.T.chunk_slots)])
+                self._sync_range(c)
                 room -= b
                 cur += b
                 added += b
@@ -540,10 +631,17 @@ class ExpertCache:
             for c, ci in victims:
                 s0 = c.lo + ci * self.T.chunk_slots
                 ops += [(OP_DISABLE, 0, 0, s0 + i) for i in range(self.T.chunk_slots)]
+            hold = []
+            for c, ci in victims:
+                hold.append(c.chunks[ci])
+                c.chunks[ci] = None
+            # Range first (stream-ordered before the disable ops), so no later scan visits a
+            # disabled slot of a freed chunk; the ops then evict and disable
+            for c in {c.id: c for c, _ in victims}.values():
+                self._sync_range(c)
             self.run_host_ops(ops)
             self._sync_current()
-            for c, ci in victims:
-                c.chunks[ci] = None
+            del hold
             if self.backend == "cuda":
                 torch.cuda.empty_cache()
             if self.T.debug:
@@ -551,13 +649,34 @@ class ExpertCache:
                       flush = True)
         return freed
 
+    def _drop_class_chunks(self, c: SizeClass):
+        idx = [i for i, x in enumerate(c.chunks) if x is not None]
+        if not idx:
+            return
+        self.quiesce()
+        hold = [c.chunks[i] for i in idx]
+        for i in idx:
+            c.chunks[i] = None
+        self._sync_range(c)
+        ops = [(OP_DISABLE, 0, 0, c.lo + i * self.T.chunk_slots + k) for i in idx for k in range(self.T.chunk_slots)]
+        self.run_host_ops(ops)
+        self._sync_current()
+        del hold
+        if self.backend == "cuda":
+            torch.cuda.empty_cache()
+
     def ensure_headroom(self, extra: int = 0) -> int:
-        """Shrink until the floor (plus `extra`) is free again; returns bytes freed"""
+        """Shrink until the floor is free again; `extra` is the MoE transient of the coming pass.
+        The floor already holds the device's measured forward transient (which includes the
+        hybrid layers' bound at the load's chunk size), so `extra` raises the requirement only
+        where it exceeds that transient, and it is remembered so idle regrowth stops short of
+        it (no shrink / regrow churn per request). Returns bytes freed"""
         with self.lock:
             if not self.sized:
                 return 0
+            self.extra_seen = max(self.extra_seen, int(extra))
             avail, _ = self.mem_info()
-            deficit = self.floor_bytes() + extra - avail
+            deficit = self.floor_bytes() - avail
             return self.shrink(deficit) if deficit > 0 else 0
 
     def release_all(self):
@@ -595,17 +714,29 @@ class ExpertCache:
                 self.grow(regrow = True)
 
     def stats(self) -> dict:
+        """Device counters (one D2H read: call between passes, never per token)"""
         v = self.arrays["stats"].cpu().tolist()
-        return {k: v[i] for i, k in enumerate(STAT_NAMES)}
+        out = {k: v[i] for i, k in enumerate(STAT_NAMES)}
+        out["cpu_by_node"] = v[ref.ST_CPU_NODE: ref.ST_CPU_NODE + MAX_NODES]
+        return out
 
     def summary(self) -> dict:
         with self.lock:
             s = self.stats()
             occupied = int((self.arrays["owner"] >= 0).sum().item()) if self.scap else 0
             enabled = int((self.arrays["pin"] >= 0).sum().item()) if self.scap else 0
-            s.update(dict(device = str(self.device), layers = len(self.layers), cache_mib = self.cache_bytes() >> 20,
-                          slots_enabled = enabled, slots_occupied = occupied, floor_mib = self.floor_bytes() >> 20,
-                          classes = [(c.slot_bytes, c.cap, sum(1 for x in c.chunks if x is not None)) for c in self.classes]))
+            avail, total = self.mem_info()
+            s.update(dict(
+                device = str(self.device), layers = len(self.layers), cache_mib = self.cache_bytes() >> 20,
+                slots_enabled = enabled, slots_occupied = occupied,
+                slot_utilization = round(occupied / enabled, 4) if enabled else 0.0,
+                floor_mib = self.floor_bytes() >> 20,
+                vram_limit_mib = (self.T.limit_bytes >> 20) if self.T.limit_bytes is not None else None,
+                vram_available_mib = avail >> 20, vram_total_mib = total >> 20,
+                hit_rate = round(s["hits"] / (s["hits"] + s["misses"]), 4) if s["hits"] + s["misses"] else None,
+                classes = [dict(slot_bytes = c.slot_bytes, layout_slots = c.cap,
+                                chunks = sum(1 for x in c.chunks if x is not None), layers = len(c.layers))
+                           for c in self.classes]))
             return s
 
     # ---- warm start and stats -------------------------------------------------------------------
@@ -671,11 +802,6 @@ class ExpertCache:
                 json.dump(prev, f)
         except (OSError, ValueError) as e:
             print(f" !! expert cache: could not save stats to {path} ({e})", flush = True)
-
-    def _save_stats_once_if_last(self):
-        if self.T.save_stats and self.layers and not self._stats_saved:
-            self.save_stats(self.T.save_stats)
-            self._stats_saved = True
 
     def _save_stats_atexit(self):
         try:

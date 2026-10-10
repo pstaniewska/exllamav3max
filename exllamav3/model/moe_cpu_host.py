@@ -476,7 +476,10 @@ class _HugeArena:
                     f"CPU MoE pinned arena: chunk {index} needs {size >> 20} MiB, but only "
                     f"{avail_phys >> 20} MiB of physical RAM and {avail_commit >> 20} MiB of commit "
                     f"are available. Free RAM, offload fewer experts, or unset EXL3_MOE_PINNED_ARENA.")
-            name = f"exl3_moe_arena_{os.getpid()}_{index}"
+            # Unique per arena kind: CreateFileMapping opens an existing section of the same
+            # name instead of failing, so a shared name would alias the home copy and the
+            # worker arena of one process
+            name = f"exl3_moe_{self.kind}_{os.getpid()}_{index}"
             try:
                 m = mmap.mmap(-1, size, tagname = name)
             except OSError as e:
@@ -625,7 +628,10 @@ class _HugeArena:
         if self.lazy:
             if self.written + aligned > self.checked:
                 step = max(aligned, self.CHECK_STEP)
-                check_host_memory(step, f"CPU MoE expert arena ({(self.written + step) >> 20} MiB in total)")
+                # Lazy chunks are still mbind-ed to the worker's node (MPOL_BIND, strict), so
+                # the node itself must hold them, not just the system
+                numa_mem.check_node_memory(
+                    step, self.node, f"CPU MoE expert arena ({(self.written + step) >> 20} MiB in total)")
                 self.checked = self.written + step
             self.written += aligned
         if self.cur is None or self.cur_off + aligned > len(self.cur):
@@ -975,6 +981,7 @@ class MoeCpuHost:
         self.shm = None
         self.proc = None
         self.conn = None
+        self.v_abort = None
         self.seq = 0
         self.next_slot = 0
         self.slot_last_seq = [0] * MOE_MAX_SLOTS
@@ -1310,6 +1317,8 @@ class MoeCpuHost:
                 sel_dev = gpu_data + off_sel,
                 w_dev = gpu_data + off_w,
                 out_dev = gpu_data + off_out,
+                x_cap = self.cap_rows * max_hi,         # halves (hybrid issue capacity check)
+                sel_cap = self.cap_rows * max_topk,     # selection / weight entries
                 data_ready = self.gpu_base_ptr + MOE_SLOT_FLAGS_OFFSET + s * 64,
                 done = self.gpu_base_ptr + MOE_SLOT_FLAGS_OFFSET + 64 * MOE_MAX_SLOTS + s * 64,
                 consumed = self.gpu_base_ptr + MOE_SLOT_FLAGS_OFFSET + 2 * 64 * MOE_MAX_SLOTS + s * 64,
@@ -1364,7 +1373,9 @@ class MoeCpuHost:
         print(f" -- CPU MoE worker started: {len(self.specs)} layers, {kern}, {self.threads} threads{where}")
         # The worker was spawned before this and pins its own threads; keep the host off them.
         # Per-node hosts (moe_numa_hosts) plan the host placement for the whole group instead
-        if not self.numa:
+        if not self.numa or self.numa.get("node") is None:
+            # Classic single worker, or a group whose plan has one unconfined worker (single
+            # node, NUMA off): the classic host placement applies unchanged
             _apply_host_affinity(self.threads, TUNING.host_cores)
 
     def _start_watchdog(self):
@@ -1382,6 +1393,10 @@ class MoeCpuHost:
                     return
                 if not self.proc.is_alive():
                     try:
+                        # Abort first, then release the waits: any forward that gets past a
+                        # released wait (stale CPU partials) is guaranteed to see the abort flag
+                        # once the host has synchronized with it (check_workers)
+                        self.v_abort[0] = 1
                         u32 = self._flags_u32
                         seq, wseq = self.seq + 1, self.wseq + 1
                         done0 = MOE_SLOT_FLAGS_OFFSET + 64 * MOE_MAX_SLOTS
@@ -1400,6 +1415,9 @@ class MoeCpuHost:
                 time.sleep(0.5)
 
         threading.Thread(target = wd, daemon = True).start()
+
+    def aborted(self) -> bool:
+        return bool(self.started and self.v_abort is not None and self.v_abort[0])
 
     def begin_pass(self):
         if not self.started:
@@ -1537,7 +1555,10 @@ class MoeCpuHost:
         fused_publish releases the job, fused_collect folds the result in. Same protocol as
         submit_issue_fused, split so one kernel can serve several hosts (NUMA nodes)"""
         spec = self.specs[layer_idx]
-        assert rows <= self.cap_rows
+        if rows > self.cap_rows:
+            raise ValueError(f"CPU MoE job of {rows} rows exceeds the slot capacity ({self.cap_rows})")
+        if self.v_abort[0]:
+            raise RuntimeError("CPU MoE worker died or timed out (abort flag set)")
         with torch.cuda.device(device):
             counts = self.dev_count.get(device)
             if counts is None:
@@ -2360,3 +2381,19 @@ class MoeCpuHost:
             self.shm = None
         self.started = False
         self.by_key = {}
+
+
+def check_workers(*configs):
+    """Host-side check after the host has synchronized with a forward pass (the generator calls
+    it once per iteration, after sampling): a worker that died while jobs were in flight had its
+    flag waits released by the watchdog, so that forward folded in stale CPU partials. The
+    watchdog sets the abort flag before releasing anything, hence this check sees it for every
+    such forward, and the iteration's results are discarded with an error instead of returned"""
+    for config in configs:
+        if config is None:
+            continue
+        for name, h in getattr(config, "moe_cpu_hosts", {}).items():
+            if h.aborted():
+                raise RuntimeError(
+                    f"CPU MoE worker {name} died or timed out during the last forward pass; its "
+                    f"CPU expert outputs are invalid and the iteration's results were discarded")

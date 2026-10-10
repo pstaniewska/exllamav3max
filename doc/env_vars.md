@@ -775,19 +775,22 @@ its default. In short:
   `_GROW_HYST_MB`, `_ADMIT_MAX`, `_GATHER_MAX`, `_GATHER_BLOCKS`, `_CHUNK_SLOTS`, `_MAX_LAYERS`,
   `_DECAY`, `_WARM`, `_SAVE_STATS`, `_ZC_FUSED_ROWS`, `_DEBUG`. The cache is sized at the first
   forward to the free VRAM minus a floor: the larger of the reserve and the autosplit loader's
-  measured transient plus margins. It shrinks before prefill passes that need more, and regrows
-  when idle.
+  measured transients of every component plus margins. It shrinks before prefill passes that
+  need more, and regrows when idle without reaching back into the largest prefill bound seen.
 - **Homes:** `EXL3_EXPERT_HOME` (`native_copy` or `worker_arena`) and
   `EXL3_EXPERT_HOME_PIN_LIMIT_GB`. A home chunk whose page-locked registration fails stays pageable
   and its experts take CPU lanes.
-- **Lanes:** `EXL3_MOE_ZC_MAX` (`auto` uses the measured PCIe rate and worker telemetry),
-  `EXL3_MOE_ZC_CPU_FRAC_INIT`, `EXL3_EXPERT_PREFILL_GPU_MIN`, `EXL3_MOE_ADAPTIVE_EMA`,
-  `EXL3_HYBRID_MOE_DEBUG`.
+- **Lanes:** `EXL3_MOE_ZC_MAX`. `auto` uses a measured cost model: a miss goes to a CPU node only
+  if that shortens the call's slowest lane. Also `EXL3_MOE_ZC_CPU_FRAC_INIT` (the share used
+  until the costs are measured), `EXL3_EXPERT_PREFILL_GPU_MIN`, `EXL3_MOE_ADAPTIVE_EMA`,
+  `EXL3_HYBRID_MOE_DEBUG`, and `EXL3_HYBRID_MOE_PROFILE` (CPU-lane wait measured with CUDA events,
+  no host sync).
 - **NUMA:** `EXL3_NUMA_ENABLE` (one CPU worker per node; also applies to `-mcl` / `-mcs`, whose
   layers then go round-robin over the nodes), `EXL3_NUMA_POLICY`, `EXL3_NUMA_MEMORY_POLICY`
   (`shard` or `replicate`), `EXL3_NUMA_SHARD` (`mod` or `blocked`), `EXL3_NUMA_CPU_MAP`,
   `EXL3_NUMA_GPU_NODE` and `EXL3_NUMA_DEBUG`. An undeterminable GPU node stays unknown and is
-  never assumed.
+  never assumed. Hybrid mode supports at most 8 worker nodes and stops with an error before
+  starting workers on a host with more.
 
 ## Model loading
 

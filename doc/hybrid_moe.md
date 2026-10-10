@@ -11,9 +11,16 @@ one of four lanes, chosen per layer call:
 | Zero-copy | the pinned, mapped host home, read over PCIe by the GPU kernels | the unmodified GPU MoE kernels |
 | CPU | the CPU worker of one NUMA node (its own copy of the expert) | the existing int8-activation CPU kernels |
 
-The first three lanes are numerically identical to the all-VRAM model. The CPU lane is the same
-approximation the existing `-mcl` / `-mcs` offload uses. `EXL3_EXPERT_DISPATCH_POLICY=gpu_exact`
-keeps every expert on the first three lanes.
+The first three lanes run the unmodified GPU kernels on the original EXL3 weights. The CPU lane is
+the same approximation the existing `-mcl` / `-mcs` offload uses.
+`EXL3_EXPERT_DISPATCH_POLICY=gpu_exact` keeps every expert with a GPU-readable home on the first
+three lanes. Under `gpu_exact` a layer call is bit-identical to the all-VRAM model in these cases:
+
+- decode-size calls, which use the coop and fused kernels;
+- prefill calls in which no expert exceeds the batched tier's per-expert row cap.
+
+Above that cap the all-VRAM model uses its per-expert dequant path. Hybrid mode uses single-expert
+batched groups instead, which round differently in fp16 (see [Prefill](#prefill)).
 
 Base: `turboderp-org/exllamav3` branch `dev` at `6cd89a908d957afba1cd1659fcf7d99a9e56d776`
 (2026-10-09, version string 1.6.0; tag `v1.6.0` is `151539c`). Work branch:
@@ -33,6 +40,8 @@ Xeon host; see [Verification status](#verification-status).
 - [Prefill](#prefill)
 - [Speculative decoding](#speculative-decoding)
 - [Configuration](#configuration)
+- [Telemetry](#telemetry)
+- [Failure handling](#failure-handling)
 - [Mechanism map](#mechanism-map)
 - [Limitations](#limitations)
 - [Verification status](#verification-status)
@@ -122,30 +131,58 @@ the memory actually available (`cudaMemGetInfo` free plus the caching allocator'
 reserved-but-unallocated pool) minus a floor. The floor is the larger of:
 
 - `EXL3_EXPERT_CACHE_RESERVE_MB`;
-- the largest transient the autosplit loader measured on the device, plus
-  `EXL3_AUTOSPLIT_MARGIN_MB`, plus `EXL3_EXPERT_CACHE_MIN_FREE_MB`.
+- the largest known transient plus `EXL3_EXPERT_CACHE_MIN_FREE_MB`. The transient comes from three
+  places:
+  - every autosplit load of any component on the device (main model, MTP head, vision tower,
+    draft model), plus `EXL3_AUTOSPLIT_MARGIN_MB`. These are max-merged per device, so a later
+    component never lowers them, whichever loading API it used.
+  - transients noted on the owner;
+  - the largest prefill MoE bound seen so far.
 
 `EXL3_EXPERT_CACHE_LIMIT_GB` caps the size. Nothing is hard-coded to a card size.
 
-The fixed reserve is a floor, not the safety mechanism. Before every prefill-size pass the owner
-re-checks the floor plus that pass's worst-case MoE transient, and gives back whole chunks while it
-is short. When the generator goes idle it regrows one chunk at a time, keeping
-`EXL3_EXPERT_CACHE_GROW_HYST_MB` of hysteresis. A failed chunk allocation ends growth; it is never
-fatal. Loading another model component first releases every chunk on every device
-(`release_all_caches`), so that load sees the device as it would without the cache.
+The fixed reserve is a floor, not the safety mechanism:
+
+- **Before every prefill-size pass** of a hybrid component, the owner checks the floor again,
+  including that pass's worst-case MoE transient, and gives back whole chunks while it is short.
+  The measured transient already contains the MoE bound at the load's chunk size. The pass's bound
+  therefore raises the requirement only where it is larger, so nothing is counted twice. A vision
+  encode or any other component's forward does not trigger this check.
+- **When the generator goes idle,** the owner regrows in whole chunks while the floor plus
+  `EXL3_EXPERT_CACHE_GROW_HYST_MB` stays free. Because the floor includes the largest prefill bound
+  seen, regrowth stops short of it, and requests do not shrink and regrow the cache each time.
+- **A failed chunk allocation** ends growth; it is never fatal.
+- **Loading another model component** first releases every chunk on every device
+  (`release_all_caches`), so that load sees the device as it would without the cache.
+
+**CLOCK range.** The slot index layout covers the whole device or the limit, so that chunks can
+come and go without moving a slot. The victim scan, though, covers only the enabled prefix of each
+class. Growth enables the lowest free chunk and shrinking disables the highest one, so the enabled
+chunks always form a prefix. Each grow and shrink writes that prefix's end into the class range,
+stream-ordered.
 
 **Size classes.** Experts of different byte sizes (another model, another quantization) get
 separate slot classes. Each class has its own chunks and CLOCK hand. All classes share the one
-device budget in proportion to the expert bytes registered in each.
+device budget in proportion to the expert bytes registered in each:
+
+- A weighted class whose share rounds down below one chunk still gets one chunk in the layout.
+  If the limit cannot hold even that, a notice names the class.
+- Growth skips a class whose next chunk does not fit and continues with the others.
+- When a class's last layer leaves, its chunks are freed and its id becomes reusable.
+- When the owner's last layer leaves, the classes, their bounce blocks and the per-load hints are
+  dropped.
 
 **Warm start and stats.**
 
-- `EXL3_EXPERT_CACHE_WARM=<json>` fills the first chunks with the hottest experts per class. The
-  file maps layer keys (or `component:key`) to per-expert counts, the same format as
-  `EXL3_MOE_CPU_SPLIT_STATS`.
-- `EXL3_EXPERT_CACHE_SAVE_STATS=<json>` writes the decayed pick history at unload and at exit.
-- `ExpertCache.summary()` reports hits, misses, admissions, evictions, zero-copy and CPU counts,
-  and the slots in use.
+- `EXL3_EXPERT_CACHE_WARM=<json>` fills the first chunks with the hottest experts per class. It
+  runs once per owner generation: a later re-layout keeps the live pick history. The file maps layer
+  keys (or `component:key`) to per-expert counts, the same format as `EXL3_MOE_CPU_SPLIT_STATS`.
+- `EXL3_EXPERT_CACHE_SAVE_STATS=<json>` writes the decayed pick history, merged into the file,
+  each time the last layer of a component unregisters, and at exit.
+- **Layer ids** are `component:key`. A second dispatcher with the same component name, such as a
+  draft model loaded as `text`, gets `text#1`, so its layers never collide with the main model's.
+
+See [Telemetry](#telemetry) for the counters.
 
 ## Host homes and zero-copy
 
@@ -210,8 +247,20 @@ and thread pool:
 - the node is the worker's preferred node for everything else.
 
 The host process keeps `EXL3_MOE_HOST_CORES` physical cores, both SMT siblings, on the GPU's node.
-It is confined to them only when `EXL3_MOE_CPU_PIN=1`, as upstream. Arena chunks are checked
-against the node's available memory, as well as the global and cgroup limits.
+It is confined to them only when the worker pools pin their threads. The rule is the pool's own:
+on Linux only with `EXL3_MOE_CPU_PIN=1`, elsewhere unless `EXL3_MOE_CPU_PIN=0`. A plan with one
+unconfined worker (single node, NUMA off) uses the classic host placement unchanged. The per-node
+groups of the classic `-mcl` / `-mcs` path are placed after their workers start.
+
+Memory checks and limits:
+
+- Arena chunks, lazy ones included, are checked against the node's available memory as well as the
+  global and cgroup limits. Lazy chunks are bound to the node too.
+- A CPU node without memory binds its worker's memory to the nearest node that has memory, by the
+  distance row.
+- Hybrid mode supports at most 8 worker nodes. A host with more CPU nodes gets an explicit error
+  before any worker starts. The fix is to restrict the CPUs with `EXL3_NUMA_CPU_MAP` or a cpuset,
+  or to set `EXL3_NUMA_ENABLE=0`. The classic per-layer path has no such limit.
 
 **Memory locality.**
 
@@ -223,7 +272,8 @@ against the node's available memory, as well as the global and cgroup limits.
 **Expert placement.**
 
 - `EXL3_NUMA_MEMORY_POLICY=shard` (default): each expert lives on exactly one node. With
-  `EXL3_NUMA_SHARD=mod` that is node `e mod N`; with `blocked`, contiguous halves.
+  `EXL3_NUMA_SHARD=mod` that is node `e mod N`. With `blocked` it is contiguous ranges whose sizes
+  differ by at most one, so no node is left empty while there are at least as many experts as nodes.
 - `replicate`: every node holds every expert, so the CPU lane can pick a node per call. This costs
   N times the arena RAM and is checked against each node's memory.
 
@@ -241,14 +291,27 @@ nothing else changes.
 - `gpu_exact`: misses go zero-copy or are admitted. CPU lanes are used only for experts with no
   GPU-readable home.
 - `hybrid` (default): misses are ordered hottest first, by tokens in this call and then by decayed
-  pick history. The first ones up to the GPU quota go zero-copy or are admitted; the rest go to the
-  CPU lane of the node that holds them. The quota is `EXL3_MOE_ZC_MAX` misses per call, or with
-  `auto` a measured share. The share sent to the CPU is `t_zc / (t_zc + t_cpu)`:
-  - `t_zc` is one expert's bytes at the PCIe rate measured by a timed copy out of a registered home;
-  - `t_cpu` combines the nodes' rates, each node's cost per assignment coming from worker telemetry.
+  pick history.
+  - **Fixed quota.** With `EXL3_MOE_ZC_MAX=<n>`, the first `n` misses that could take either lane go
+    zero-copy or are admitted. The rest go to the CPU lane of the node that holds them.
+  - **Cost model** (`auto`, the default). Experts with only one possible lane are placed first.
+    Each remaining miss then goes to its CPU node only if that makes the call's slowest lane
+    strictly shorter than keeping the miss on the GPU; a tie stays on the GPU. Under the measured
+    costs, a CPU lane therefore never lengthens the layer's critical path. The slowest lane is
+    the larger of two times:
+    - GPU time: resident experts × `t_hit` plus GPU-lane misses × `t_zc`;
+    - each CPU node's time: `t_cpu_fixed` once the node is used, plus `t_cpu` per expert.
 
-  Until both are measured, `EXL3_MOE_ZC_CPU_FRAC_INIT` applies. No Xeon or PCIe latency is
-  assumed anywhere.
+    The kernel computes this in float32 with explicit round-to-nearest operations, and the
+    reference reproduces it exactly. Every input is measured:
+    - `t_zc`: one expert's bytes at the rate of a timed copy out of a registered home;
+    - `t_hit`: one expert's bytes at the rate of a timed device-to-device copy;
+    - `t_cpu_fixed`: the median round trip of an empty gated job to each node, worst node;
+    - `t_cpu`: worker telemetry, compute time per distinct expert of a job, EMA, slowest node.
+
+    Until `t_zc` and `t_cpu` are both measured, `EXL3_MOE_ZC_CPU_FRAC_INIT` sets the CPU share of
+    the misses that could take either lane. No Xeon or PCIe latency is assumed anywhere. The model
+    treats a GPU or CPU expert's cost as independent of its row count, which is accurate for decode.
 
 `EXL3_NUMA_POLICY` chooses the node when an expert is held by several nodes (`replicate`):
 
@@ -273,10 +336,11 @@ before the add. Tensors used on a side stream are `record_stream`ed.
 
 The GPU tiers are the upstream ones with two changes:
 
-- **Fused row cap.** When any expert is read over PCIe in a call, the fused tier's row cap drops to
-  `EXL3_EXPERT_CACHE_ZC_FUSED_ROWS` for that call. The fused kernel re-reads an expert's weights
-  once per row tile; the batched reconstruct tier reads them once per call. The slot-scratch
-  accounting uses the same cap.
+- **Fused row cap** (`hybrid` policy only). When any expert is read over PCIe in a call, the fused
+  tier's row cap drops to `EXL3_EXPERT_CACHE_ZC_FUSED_ROWS` for that call. The fused kernel re-reads
+  an expert's weights once per row tile; the batched reconstruct tier reads them once per call. The
+  slot-scratch accounting uses the same cap. The cap moves resident experts to another tier too, so
+  `gpu_exact` never applies it and keeps the all-VRAM tier plan at the cost of more PCIe reads.
 - **Leftover experts.** An expert neither tier takes (above the batched tier's per-expert row cap)
   runs as single-expert batched groups of at most that cap, accumulating weighted. Every group
   stays inside the batched tier's own buffer bound, and its weights come from the live tables.
@@ -321,10 +385,11 @@ classic paths, `EXL3_NUMA_ENABLE=1`) is set.
 | `EXL3_EXPERT_HOME_PIN_LIMIT_GB` | unset | registered-bytes cap for homes |
 | `EXL3_EXPERT_PREFILL_GPU_MIN` | `8` | prefill rows for a non-resident expert to go zero-copy |
 | `EXL3_MOE_ZC_MAX` | `auto` | GPU quota of misses per decode call |
-| `EXL3_MOE_ZC_CPU_FRAC_INIT` | `0.5` | CPU share of misses before measurements exist |
+| `EXL3_MOE_ZC_CPU_FRAC_INIT` | `0.5` | CPU share of flexible misses until the cost model is measured |
 | `EXL3_MOE_ADAPTIVE_EMA` | `0.1` | smoothing of measured CPU cost |
-| `EXL3_HYBRID_MOE_DEBUG` | `0` | print the PCIe probe |
-| `EXL3_NUMA_ENABLE` | `0` | one CPU worker per NUMA node |
+| `EXL3_HYBRID_MOE_DEBUG` | `0` | print the cost probes (PCIe, VRAM, CPU round trip) |
+| `EXL3_HYBRID_MOE_PROFILE` | `0` | GPU-side CPU-lane wait profile with CUDA events (see [Telemetry](#telemetry)) |
+| `EXL3_NUMA_ENABLE` | `0` | one CPU worker per NUMA node (hybrid: at most 8) |
 | `EXL3_NUMA_POLICY` | `numa_local` | `numa_local`, `numa_sharded`, `numa_balanced`, `numa_adaptive` |
 | `EXL3_NUMA_MEMORY_POLICY` | `shard` | `shard` or `replicate` |
 | `EXL3_NUMA_SHARD` | `mod` | `mod` or `blocked` |
@@ -355,6 +420,54 @@ qualifies when it has:
 - no tensor-parallel or latent-MoE structure;
 - the batched reconstruct tier available.
 
+## Telemetry
+
+Counters are kept on the device by the issue kernel, at the cost of a few integer adds per layer
+call. They are read only on request, by `ExpertCache.summary()` or `HybridDispatcher.summary()`.
+That read is one device-to-host copy, meant for use between passes and never per token.
+
+| Counter | Meaning |
+|---|---|
+| `hits`, `misses`, `hit_rate` | unique (layer call, expert) pairs found resident or not |
+| `admits`, `admit_bytes` | admissions and the bytes copied into slots over PCIe |
+| `evictions`, `no_victim` | tenants displaced; admissions that found no victim (expert stayed zero-copy) |
+| `zero_copy`, `zero_copy_bytes` | experts computed from host homes; their bytes, a lower bound on PCIe reads |
+| `cpu`, `cpu_by_node` | experts sent to CPU lanes, total and per worker node |
+| `no_lane` | picks with no lane at all: a configuration error, raised at the next idle point |
+| `calls`, `prefill_calls` | issue calls |
+| `slots_enabled`, `slots_occupied`, `slot_utilization` | slot usage |
+| `cache_mib`, `floor_mib`, `vram_limit_mib`, `vram_available_mib`, `vram_total_mib` | budget state |
+
+`HybridDispatcher.summary()` adds three things:
+
+- the measured lane costs and whether the cost model is active;
+- each node's CPU time per expert;
+- with `EXL3_HYBRID_MOE_PROFILE=1`, the exposed CPU-lane wait per node (total, mean, maximum).
+
+The wait is the GPU time from just before the done-flag wait to just after the partial is folded
+in (decode), or the wait for the node's side stream (prefill). It is measured with CUDA event
+pairs, which are harvested at the next pass start with `Event.query()` and never synchronized. At
+most 512 pairs are pending; further calls are counted as unsampled.
+
+## Failure handling
+
+| Failure | Behaviour |
+|---|---|
+| `cudaHostRegister` fails for a home chunk | non-fatal: the chunk stays mapped but pageable, and its experts get no GPU-readable home (CPU lane, or a slot through a warm install). A notice names the chunk; after two consecutive failures no further chunk is tried. |
+| No mapped memory (`worker_arena` with the packed CPU layout, or pin limit reached) | stated once; those experts take CPU lanes |
+| An expert with neither a GPU-readable home nor a CPU copy | load-time error naming the experts; at run time `no_lane` is counted and raised at the next idle point |
+| VRAM OOM while growing the cache | growth stops with a notice; never fatal. Prefill headroom is restored by shrinking before the pass |
+| OOM while loading a hybrid layer (autosplit retry) | the layer's worker registrations are undone before the error propagates, so the retry on the next device starts clean |
+| GPU NUMA node unknown | never guessed: GPU-adjacent buffers keep default placement, with a notice |
+| More than 8 CPU NUMA nodes (hybrid) | explicit error before any worker starts |
+| Memoryless CPU node | its worker's memory binds to the nearest node with memory |
+| Node memory short | explicit error before the chunk is allocated, with options that exist |
+| Worker process dies or times out | the watchdog sets the abort flag, then releases the GPU's flag waits so no stream hangs. The next layer call's reserve raises, and so does every later pass start. A forward already in flight may have folded in stale CPU partials; the generator checks the flag after each iteration's host synchronization and raises instead of returning that iteration's results. |
+| Job ring full | the existing throttle waits for the worker; it raises if the worker aborts or dies meanwhile |
+| A decode call larger than the CPU slot | explicit error from the binding (and the reference) before any write: rows × width and picks are checked against each node's slot capacity |
+| Generation cancelled | nothing to undo: no host-side state spans layer calls, and slots and tables stay consistent at every kernel boundary |
+| Reload after unload | the dispatcher's per-load state resets with its last layer; layers finalize only once their workers have started and acknowledged them |
+
 ## Mechanism map
 
 | Mechanism | Source | Licence | How it appears here |
@@ -374,10 +487,14 @@ codebase from the documented mechanisms.
 
 ## Limitations
 
-- **Not run on GPU hardware.** The CUDA kernels were compile-checked for sm_90 (clang CUDA,
-  host and device, with PTX generation) against CUDA 12.8 headers. They have not been executed.
+- **Not run on GPU hardware.** The CUDA kernels compile for sm_90 (see
+  [Verification status](#verification-status)) but have not been executed.
   `tests/kernels/moe/test_hybrid_kernels_parity.py` compares them against the reference on a GPU
-  host and has not run yet.
+  host, including the cost model and float32 node-cost ties, and has not run yet. Correct
+  behaviour on a GPU is therefore not established.
+- **Cost model inputs are probes.** `t_hit` and `t_zc` come from bulk copies and `t_cpu_fixed` from
+  an empty job. Real kernel timings can differ, for example through PCIe read efficiency of the
+  fused kernels or L2 effects. `EXL3_MOE_ZC_MAX=<n>` bypasses the model.
 - **Single-node CI only.** The NUMA code ran on a one-node VM: `mbind`, `set_mempolicy` and the
   page-placement query work there. Dual-socket behaviour is covered by synthetic sysfs trees only.
 - **CPU lanes are approximate.** They inherit the int8-activation error of the existing CPU
@@ -433,14 +550,29 @@ codebase from the documented mechanisms.
 | Check | Where | Result |
 |---|---|---|
 | Cache owner and policy (reference kernels, real memory): registration, CLOCK with pin epoch, gather bytes, lanes, node policies, prefill threshold, shrink/regrow, size classes, unregistration, warm start, registration fallback | `tests/moe_cpu/test_hybrid_cache.py` | passes on CPU |
-| Dispatcher decode path with fake workers: masking, slot staging, combine, measured CPU share | `tests/moe_cpu/test_hybrid_dispatch.py` | passes on CPU |
-| NUMA planning: reserved cores, cpuset, shard layouts, unknown GPU node | `tests/moe_cpu/test_hybrid_numa_plan.py` | passes on CPU |
+| Hardening: CLOCK range on the enabled prefix, 400-step interleaving of routing with shrink / regrow / release / unregister over three size classes and three components (every GPU lane reads its expert's correct bytes), speculative verify windows, slot-capacity guard (segfault regression), absent node columns, float32 tie parity, cost model never lengthening the slowest lane (randomized), ties to the GPU, per-node counters, headroom without churn, device transients, stats per component, class reuse, small limits, growth across classes, warm start once | `tests/moe_cpu/test_hybrid_cache.py` | passes on CPU |
+| Dispatcher with fake workers: rows 1/8/9/31/32/64/128/256/512 (path choice, admission cap, CPU partials folded in on both paths, prefill path on CPU), `gpu_exact` fused plan, absent node, component tags, reset on last detach, deferred finalize, load-failure cleanup, worst-case bound, measured cost inputs, telemetry harvest, worker death and oversized jobs | `tests/moe_cpu/test_hybrid_dispatch.py` | passes on CPU |
+| NUMA planning: reserved cores, cpuset, shard layouts (balanced blocked), unknown GPU node, more than 8 nodes, memoryless nodes, pin rule | `tests/moe_cpu/test_hybrid_numa_plan.py` | passes on CPU |
 | Topology discovery and memory policy | `tests/moe_cpu/test_numa_topology.py` | passes on CPU |
 | Worker loop with telemetry off (upstream layout) and on: outputs bit-identical to `exl3_moe_cpu_forward`, records correct; pool core order follows `taskset` | CPU build of `cpu/moe_mul1.cpp` + host side of `cpu/moe_handoff.cu`, driven through `tests/testlib/moe_handoff.Segment` (scratch harness, not committed) | passes on CPU |
 | CUDA sources compile for sm_90 (host + device, PTX generated for `moe_hybrid.cu`) | clang CUDA frontend, CUDA 12.8 headers, torch 2.14 headers | passes |
 | Kernel against reference, admitted slot bytes | `tests/kernels/moe/test_hybrid_kernels_parity.py` | GPU host only, not run |
 | End-to-end parity with the all-GPU load (`hybrid`, `hybrid_exact` placements) | `tests/e2e/test_moe_offload.py` | GPU host with models only, not run |
 | Speed | none | not measured; no claims |
+
+**Earlier segfault (test run of the first commit).** `test_cpu_lanes_quota_and_staging` crashed
+the interpreter.
+
+- **Cause:** a test bug. The helper defaulted the row count to the number of picks, so `y` had
+  four rows while the fake node slot held one. The reference then wrote four rows of
+  activations into a one-row buffer, which corrupted the heap.
+- **Underlying gap:** production had the same class of error. A decode call with more rows than
+  the worker slot holds was refused only by an `assert` in `fused_reserve`, and the kernel binding
+  could not check it at all.
+- **Fix:** the node descriptor now carries each slot's activation and selection capacity. The
+  binding and the reference both refuse an oversized call before writing anything.
+  `fused_reserve` raises a `ValueError` instead of asserting.
+- **Regression test:** `test_capacity_guard_rejects_oversized_decode_jobs`.
 
 ## Changed files
 

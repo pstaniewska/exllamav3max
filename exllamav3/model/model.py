@@ -745,6 +745,9 @@ class Model(Model_TPMixin, Model_LSMixin):
         # idempotent, so already-running workers of other components are unaffected
         for host in getattr(self.config, "moe_cpu_hosts", {}).values():
             host.ensure_started()
+        # Per-node workers of classic -mcl / -mcs (EXL3_NUMA_ENABLE): host placement once started
+        for group in getattr(self.config, "moe_numa_groups", {}).values():
+            group.after_start()
         # Hybrid MoE: homes mapped, layers handed to the device expert caches (sized lazily at
         # the first forward, after every component and cache has been allocated)
         from .moe_hybrid_dispatch import finalize_all

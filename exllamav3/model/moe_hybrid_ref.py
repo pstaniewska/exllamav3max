@@ -34,10 +34,18 @@ CTL_EPOCH, CTL_GCOUNT, CTL_HAND, CTL_CLASS_LO, CTL_CLASS_HI = 0, 1, 8, 16, 17
 CTL_SIZE = 32
 
 ST_HITS, ST_MISSES, ST_ADMITS, ST_EVICTS, ST_NO_VICTIM, ST_ZC, ST_CPU, ST_CALLS = range(8)
-ST_NO_LANE, ST_PREFILL = 8, 9
-STATS_SIZE = 16
+ST_NO_LANE, ST_PREFILL, ST_ADMIT_BYTES, ST_ZC_BYTES = 8, 9, 10, 11
+ST_CPU_NODE = 16
+STATS_SIZE = 32
 STAT_NAMES = ["hits", "misses", "admits", "evictions", "no_victim", "zero_copy", "cpu", "calls",
-              "no_lane", "prefill_calls"]
+              "no_lane", "prefill_calls", "admit_bytes", "zero_copy_bytes"]
+
+LC_HIT, LC_ZC, LC_CPU_FIXED, LC_CPU = 0, 1, 2, 3
+
+ND_SEL, ND_X, ND_W, ND_COUNT, ND_SLOT, ND_XCAP, ND_SELCAP = range(7)
+ND_ROWS = 7
+
+f32 = np.float32
 
 LANE_NONE, LANE_GPU, LANE_ZC = -2, -1, -3
 
@@ -119,7 +127,8 @@ def cpuloc(st: RefState, L: int, node: int, e: int) -> int:
 
 
 def pick_node(st, L, e, cnt, nn, policy, pref, load, cost) -> int:
-    best, best_c = -1, 0.0
+    """float32 throughout, as the kernel (one rounded multiply, strict < keeps the lower node)"""
+    best, best_c = -1, f32(0.0)
     for nd in range(nn):
         if cpuloc(st, L, nd, e) < 0:
             continue
@@ -129,7 +138,7 @@ def pick_node(st, L, e, cnt, nn, policy, pref, load, cost) -> int:
             if best < 0:
                 best = nd
             continue
-        c = float(load[nd]) if policy == 1 else float(load[nd] + cnt) * float(cost[nd])
+        c = f32(load[nd]) if policy == 1 else f32(f32(load[nd] + cnt) * f32(cost[nd]))
         if best < 0 or c < best_c:
             best, best_c = nd, c
     return best
@@ -138,10 +147,22 @@ def pick_node(st, L, e, cnt, nn, policy, pref, load, cost) -> int:
 def issue(st: RefState, nodes: dict, L: int, E: int, sel: np.ndarray, y: np.ndarray | None, hi: int,
           w: np.ndarray, sel_gpu: np.ndarray, lane_out: np.ndarray | None, cpu_sel: np.ndarray | None,
           prefill: int, admit: int, gpu_max: int, cpu_frac: float, prefill_gpu_min: int,
-          node_policy: int, pref_node: int):
-    """Mirror of moe_hybrid_issue_kernel (+ moe_hybrid_stage_x_kernel in decode mode).
-    nodes: {"n", "h_sel", "h_x", "h_w", "dev_count", "slot", "cost"} (lists of ints/floats)"""
+          node_policy: int, pref_node: int, lane_cost = None):
+    """Mirror of moe_hybrid_issue_kernel (+ moe_hybrid_stage_x_kernel in decode mode) and of the
+    binding's argument checks. nodes: {"n", "h_sel", "h_x", "h_w", "dev_count", "slot", "xcap",
+    "selcap", "cost"} (lists of ints/floats). lane_cost: 4 floats (LC_*) or None (= zeros)"""
     n = sel.size
+    rows = y.shape[0] if y is not None else 0
+    lc = [f32(v) for v in (lane_cost if lane_cost is not None else [0.0] * 4)]
+    if any(not (np.isfinite(v) and v >= 0) for v in lc):
+        raise ValueError("moe_hybrid_issue: lane costs must be finite and non-negative")
+    if not prefill:
+        for q in range(int(nodes["n"])):
+            ptrs = [int(nodes[k][q]) for k in ("h_sel", "h_x", "h_w", "dev_count")]
+            if any(ptrs) != all(ptrs):
+                raise ValueError("moe_hybrid_issue: a decode node column must be complete or all zero")
+            if all(ptrs) and (rows * hi > int(nodes["xcap"][q]) or n > int(nodes["selcap"][q])):
+                raise ValueError("moe_hybrid_issue: decode job exceeds the CPU slot capacity")
     sel = sel.reshape(-1)
     hbase = L * EMAX
     cnt = np.zeros(EMAX, dtype = np.int64)
@@ -187,17 +208,24 @@ def issue(st: RefState, nodes: dict, L: int, E: int, sel: np.ndarray, y: np.ndar
 
     nn = int(nodes["n"])
     nflex = 0
+    nforced_gpu = 0
     for e in miss:
         if not int(st.reg_home[hbase + e]):
             continue
-        nflex += any(cpuloc(st, L, q, e) >= 0 for q in range(nn))
+        has_cpu = any(cpuloc(st, L, q, e) >= 0 for q in range(nn))
+        nflex += has_cpu
+        nforced_gpu += not has_cpu
+    use_cost = gpu_max < 0 and lc[LC_ZC] > 0 and lc[LC_CPU] > 0
     if gpu_max >= 0:
         quota = min(gpu_max, nflex)
     else:
-        quota = nflex - int(np.rint(np.float32(nflex) * np.float32(cpu_frac)))
+        quota = nflex - int(np.rint(f32(nflex) * f32(cpu_frac)))
     quota = max(quota, 0)
 
     load = [0] * MAX_NODES
+    t_node = [f32(0.0)] * MAX_NODES
+    t_gpu = f32(f32(f32(hits) * lc[LC_HIT]) + f32(f32(nforced_gpu) * lc[LC_ZC]))
+    t_cpu_max = f32(0.0)
     cost = [c if c > 0 else 1.0 for c in nodes.get("cost", [1.0] * nn)]
     cls = int(st.reg_class[L])
     lo = int(st.ctl[CTL_CLASS_LO + 2 * cls]) if cls >= 0 else 0
@@ -207,57 +235,77 @@ def issue(st: RefState, nodes: dict, L: int, E: int, sel: np.ndarray, y: np.ndar
         hand = 0
     gcount = 0
     flex_gpu = 0
+    ebytes = int(st.reg_bytes[L])
 
-    for e in miss:
-        c = int(cnt[e])
-        mapped = int(st.reg_home[hbase + e]) != 0
-        node = pick_node(st, L, e, c, nn, node_policy, pref_node, load, cost)
-        if not mapped:
-            to_gpu = False
-        elif node < 0:
-            to_gpu = True
-        elif prefill:
-            to_gpu = c >= prefill_gpu_min
-        else:
-            to_gpu = flex_gpu < quota
-            flex_gpu += int(to_gpu)
+    def node_add(nd_, c):
+        return f32((f32(0.0) if t_node[nd_] > 0 else lc[LC_CPU_FIXED]) + lc[LC_CPU])
 
-        ln = LANE_NONE
-        if to_gpu:
-            ln = LANE_ZC
-            if admit and not prefill and rng > 0 and gcount < st.gmax:
-                victim = -1
-                for _ in range(min(2 * rng, SCAN_MAX)):
-                    s = lo + hand
-                    hand = 0 if hand + 1 == rng else hand + 1
-                    p = int(st.pin[s])
-                    if p < 0 or p == ep:
-                        continue
-                    if st.refb[s]:
-                        st.refb[s] = 0
-                        continue
-                    victim = s
-                    break
-                if victim >= 0:
-                    install(st, L, e, victim)
-                    st.refb[victim] = 1
-                    st.pin[victim] = ep
-                    st.gjobs[3 * gcount: 3 * gcount + 3] = (
-                        int(st.slot_base[victim]), int(st.reg_home[hbase + e]), int(st.reg_bytes[L]))
-                    gcount += 1
-                    ln = LANE_GPU
-                    st.stats[ST_ADMITS] += 1
-                else:
-                    st.stats[ST_NO_VICTIM] += 1
-            if ln == LANE_ZC:
-                st.stats[ST_ZC] += 1
-        elif node >= 0:
-            ln = node
-            load[node] += c
-            st.stats[ST_CPU] += 1
-        else:
-            st.stats[ST_NO_LANE] += 1
-        lane[e] = ln
+    for pas in (0, 1):
+        for e in miss:
+            c = int(cnt[e])
+            mapped = int(st.reg_home[hbase + e]) != 0
+            has_cpu = any(cpuloc(st, L, q, e) >= 0 for q in range(nn))
+            flex = mapped and has_cpu
+            if int(flex) != pas:
+                continue
+            node = pick_node(st, L, e, c, nn, node_policy, pref_node, load, cost)
+            if not mapped:
+                to_gpu = False
+            elif node < 0:
+                to_gpu = True
+            elif prefill:
+                to_gpu = c >= prefill_gpu_min
+            elif use_cost:
+                m_gpu = max(f32(t_gpu + lc[LC_ZC]), t_cpu_max)
+                m_cpu = max(t_gpu, max(t_cpu_max, f32(t_node[node] + node_add(node, c))))
+                to_gpu = not (m_cpu < m_gpu)
+            else:
+                to_gpu = flex_gpu < quota
+                flex_gpu += int(to_gpu)
+
+            ln = LANE_NONE
+            if to_gpu:
+                ln = LANE_ZC
+                if pas == 1:
+                    t_gpu = f32(t_gpu + lc[LC_ZC])
+                if admit and not prefill and rng > 0 and gcount < st.gmax:
+                    victim = -1
+                    for _ in range(min(2 * rng, SCAN_MAX)):
+                        s = lo + hand
+                        hand = 0 if hand + 1 == rng else hand + 1
+                        p = int(st.pin[s])
+                        if p < 0 or p == ep:
+                            continue
+                        if st.refb[s]:
+                            st.refb[s] = 0
+                            continue
+                        victim = s
+                        break
+                    if victim >= 0:
+                        install(st, L, e, victim)
+                        st.refb[victim] = 1
+                        st.pin[victim] = ep
+                        st.gjobs[3 * gcount: 3 * gcount + 3] = (
+                            int(st.slot_base[victim]), int(st.reg_home[hbase + e]), ebytes)
+                        gcount += 1
+                        ln = LANE_GPU
+                        st.stats[ST_ADMITS] += 1
+                        st.stats[ST_ADMIT_BYTES] += ebytes
+                    else:
+                        st.stats[ST_NO_VICTIM] += 1
+                if ln == LANE_ZC:
+                    st.stats[ST_ZC] += 1
+                    st.stats[ST_ZC_BYTES] += ebytes
+            elif node >= 0:
+                ln = node
+                load[node] += c
+                t_node[node] = f32(t_node[node] + node_add(node, c))
+                t_cpu_max = max(t_cpu_max, t_node[node])
+                st.stats[ST_CPU] += 1
+                st.stats[ST_CPU_NODE + node] += 1
+            else:
+                st.stats[ST_NO_LANE] += 1
+            lane[e] = ln
 
     if cls >= 0:
         st.ctl[CTL_HAND + cls] = hand
@@ -277,6 +325,8 @@ def issue(st: RefState, nodes: dict, L: int, E: int, sel: np.ndarray, y: np.ndar
                 continue
             hs = cpu_sel[q * n: (q + 1) * n]
         else:
+            if not int(nodes["h_sel"][q]):
+                continue                    # absent node
             hs = _arr(int(nodes["h_sel"][q]), ctypes.c_int32, n)
         v = np.array([cpuloc(st, L, q, int(e)) if lanes_per_pick[i] == q else -1
                       for i, e in enumerate(sel)], dtype = np.int32)
@@ -285,8 +335,9 @@ def issue(st: RefState, nodes: dict, L: int, E: int, sel: np.ndarray, y: np.ndar
     if prefill:
         return lane
 
-    rows = y.shape[0] if y is not None else 0
     for q in range(nn):
+        if not int(nodes["dev_count"][q]):
+            continue                        # absent node
         _arr(int(nodes["dev_count"][q]), ctypes.c_int32, int(nodes["slot"][q]) + 1)[int(nodes["slot"][q])] = int(any_node[q])
         if not any_node[q]:
             continue

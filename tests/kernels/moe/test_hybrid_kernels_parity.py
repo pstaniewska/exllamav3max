@@ -71,8 +71,10 @@ def _state(c):
     return {k: a[k].cpu().clone() for k in ("slotof", "owner", "refb", "pin", "ctl", "stats", "hist")}
 
 
-@pytest.mark.parametrize("cpu_frac", [0.0, 0.5])
-def test_issue_matches_reference(device, cpu_frac):
+@pytest.mark.parametrize("cpu_frac,lane_cost", [(0.0, None), (0.5, None), (0.5, [3.0, 20.0, 15.0, 9.0]),
+                                                (0.5, [0.0, 7.0, 0.0, 7.0])])
+@pytest.mark.parametrize("node_policy", [0, 2])
+def test_issue_matches_reference(device, cpu_frac, lane_cost, node_policy):
     mec.ExpertCache._drop_registry()
     E, eb = 24, 4096
     rng = np.random.default_rng(1)
@@ -93,19 +95,24 @@ def test_issue_matches_reference(device, cpu_frac):
         for c, layer in zip(caches, layers):
             dev = c.device
             n = sel.numel()
-            nodes = torch.zeros((5, 2), dtype = torch.long)
+            nodes = torch.zeros((ref.ND_ROWS, 2), dtype = torch.long)
             bufs = []
             for q in range(2):
                 hs = torch.zeros((n,), dtype = torch.int32, device = dev)
                 hx = torch.zeros((rows * 64,), dtype = torch.half, device = dev)
                 hw = torch.zeros((n,), dtype = torch.half, device = dev)
                 cnt = torch.zeros((8,), dtype = torch.int32, device = dev)
-                nodes[:, q] = torch.tensor([hs.data_ptr(), hx.data_ptr(), hw.data_ptr(), cnt.data_ptr(), 0])
+                nodes[:, q] = torch.tensor([hs.data_ptr(), hx.data_ptr(), hw.data_ptr(), cnt.data_ptr(), 0,
+                                            hx.numel(), hs.numel()])
                 bufs.append((hs, hx, hw, cnt))
             sel_gpu = torch.empty((n,), dtype = torch.long, device = dev)
             lane = torch.empty((ref.EMAX,), dtype = torch.int32, device = dev)
+            # Node costs with float32 near-ties (adaptive policy) and the lane cost model: the
+            # reference must reproduce the kernel's float32 arithmetic exactly
+            node_cost = torch.tensor([1.4554425, 2.646259], dtype = torch.float)
+            lc = torch.tensor(lane_cost, dtype = torch.float) if lane_cost is not None else None
             c.issue(layer, sel.to(dev), y.to(dev), w.to(dev), sel_gpu, lane, None, nodes,
-                    torch.ones(2), 64, 0, 1, -1, cpu_frac, 0, 0, -1)
+                    node_cost, 64, 0, 1, -1, cpu_frac, 0, node_policy, -1, lc)
             if dev.type == "cuda":
                 torch.cuda.synchronize(dev)
             outs.append((sel_gpu.cpu(), lane.cpu()[:E], [tuple(b.cpu() for b in bb) for bb in bufs], _state(c)))

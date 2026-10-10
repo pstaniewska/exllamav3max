@@ -275,9 +275,9 @@ def check_node_memory(nbytes: int, node: int | None, what: str, topo = None) -> 
         raise RuntimeError(
             f"{what} needs {nbytes >> 20} MiB of memory on NUMA node {node}, but only {free >> 20} MiB is "
             f"available there (MemFree + Inactive(file)) and EXL3_HOST_MEM_RESERVE_MB = {reserve_mb} MiB is "
-            f"kept free. Offload fewer experts to the CPU, place this part on another node, relax the "
-            f"placement with EXL3_NUMA_MEMORY_POLICY (e.g. interleave or preferred, so allocations may spill "
-            f"to other nodes), or set EXL3_HOST_MEM_RESERVE_MB=0 to skip this check."
+            f"kept free. Offload fewer experts to the CPU, use EXL3_NUMA_MEMORY_POLICY=shard instead of "
+            f"replicate, give this worker other CPUs/nodes (EXL3_NUMA_CPU_MAP), run one unbound worker "
+            f"(EXL3_NUMA_ENABLE=0), or set EXL3_HOST_MEM_RESERVE_MB=0 to skip this check."
         )
     _global_check(nbytes, what)
 
