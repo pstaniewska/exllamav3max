@@ -568,6 +568,9 @@ codebase from the documented mechanisms.
 | Topology discovery and memory policy | `tests/moe_cpu/test_numa_topology.py` | passes on CPU |
 | Worker loop with telemetry off (upstream layout) and on: outputs bit-identical to `exl3_moe_cpu_forward`, records correct; pool core order follows `taskset` | CPU build of `cpu/moe_mul1.cpp` + host side of `cpu/moe_handoff.cu`, driven through `tests/testlib/moe_handoff.Segment` (scratch harness, not committed) | passes on CPU |
 | CUDA sources compile for sm_90 (host + device, PTX generated for `moe_hybrid.cu`) | clang CUDA frontend, CUDA 12.8 headers, torch 2.14 headers | passes |
+| Whole extension builds, links and imports for sm_90 (all 192 translation units, the repo's own JIT build in `exllamav3/ext.py`); new bindings present with the new signatures; no unresolved internal symbols | nvcc 13.0.88 (pip wheels), torch 2.14.1+cu130, gcc 13.3, no GPU | passes at the final commit |
+| Every no-GPU test of `tests/moe_cpu` and `tests/kernels/moe_cpu_host/test_moe_worker.py` against the real extension, upstream tests included | same build | 185 pass, 30 skipped (need a GPU, a model, Windows or the slow marker) |
+| CPU worker code under AddressSanitizer and UndefinedBehaviorSanitizer: worker loop with telemetry off and on, pool barrier stress, 40 random `exl3_moe_cpu_forward` shapes (rows 1 to 64, inactive picks) with outputs identical across thread counts | `cpu/moe_mul1.cpp` and the host side of `cpu/moe_handoff.cu` built with `-fsanitize=address,undefined -O1` | no reports |
 | Kernel against reference, admitted slot bytes | `tests/kernels/moe/test_hybrid_kernels_parity.py` | GPU host only, not run |
 | End-to-end parity with the all-GPU load (`hybrid`, `hybrid_exact` placements) | `tests/e2e/test_moe_offload.py` | GPU host with models only, not run |
 | Speed | none | not measured; no claims |
