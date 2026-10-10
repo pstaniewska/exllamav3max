@@ -219,6 +219,9 @@ def test_spawn_hands_pre_pin_mask_to_worker(monkeypatch):
     monkeypatch.setattr(mch, "_HOST_ORIG_CPUS", [0, 1, 2, 3])
     host = object.__new__(mch.MoeCpuHost)
     host.proc, host.model_dir, host.threads, host.stage_threads, host.pinned = None, "m", 3, 1, False
+    host.numa, host.home = {}, False            # classic single worker (no NUMA node, no home copy)
     host._spawn()
     assert captured["target"] is mch._moe_cpu_child_main
-    assert captured["args"][-1] == [0, 1, 2, 3]
+    # (conn, model_dir, threads, stage_threads, pinned, huge, cpus, mem_node, home, home_node)
+    assert captured["args"][6] == [0, 1, 2, 3]
+    assert captured["args"][7:] == (None, False, None)
