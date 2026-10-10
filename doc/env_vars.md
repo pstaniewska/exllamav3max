@@ -380,7 +380,7 @@ into the pinned staging ring, concurrently with the compute pool working the CPU
 threads saturate host memcpy bandwidth; raising this mainly helps wide streamed batches on
 models with many small experts (see issue trace on Qwen3.6-35B-A3B).
 
-### `EXL3_MOE_STREAM_T` (default: per-device, bandwidth-scaled from `16`)
+### `EXL3_MOE_STREAM_T` (default: per-device, bandwidth-scaled from `8`)
 
 Minimum per-expert token-assignment count (in a prefill chunk) for an expert's weights to be
 streamed to the GPU instead of computed on the CPU tail. Unset, the effective threshold scales
@@ -745,6 +745,49 @@ errors print a notice and leave the host unpinned.
 ### `EXL3_MOE_HANDOFF_PROF` (default: unset)
 
 Enable GPU/CPU handoff profiling, for debug purposes. 
+
+### `EXL3_MOE_CPU_SPLIT`, `EXL3_MOE_CPU_SPLIT_LAYERS`, `EXL3_MOE_CPU_SPLIT_STATS`
+
+`EXL3_MOE_CPU_SPLIT` is the default of `-mcs` (tail experts per layer on the CPU worker).
+`EXL3_MOE_CPU_SPLIT_LAYERS` limits how many layers are split. `EXL3_MOE_CPU_SPLIT_STATS` names a
+JSON file of per-layer selection counts for a static hot-to-cold placement (only with
+`EXL3_MOE_CPU_SWAP=0`).
+
+### `EXL3_MOE_CPU_SWAP` (default: `1`), `EXL3_MOE_CPU_SWAP_INTERVAL` (`128`), `EXL3_MOE_CPU_SWAP_MAX` (`64`), `EXL3_MOE_CPU_SWAP_HYST` (`2.0`), `EXL3_MOE_CPU_SWAP_FLOOR` (`8.0`), `EXL3_MOE_CPU_SWAP_DEBUG`, `EXL3_MOE_CPU_SWAP_VERIFY`
+
+Dynamic hot/cold placement of the `-mcs` split. Every `INTERVAL` forward passes a sweep is marked
+pending and runs when the generator's queue drains. The sweep moves up to `MAX` experts in total,
+swapping a CPU expert with a GPU expert while the CPU one's decayed hit count clears `HYST` times
+the GPU one's and `FLOOR` times the mean. Both sides of a swap are re-read from the checkpoint.
+`0` keeps the initial placement. The hybrid mode below replaces this mechanism and does not use it.
+
+## Hybrid MoE, expert cache and NUMA workers
+
+`-mh` / `--moe_hybrid` (or `EXL3_HYBRID_MOE=1`): every eligible MoE layer's experts live in host
+RAM. Each pick is computed from a shared per-device GPU expert cache, by zero-copy reads of a
+pinned host home, or on the CPU worker of a NUMA node. Off by default. The architecture,
+eligibility rules and limitations are in `doc/hybrid_moe.md`, which also lists every variable with
+its default. In short:
+
+- **Mode:** `EXL3_HYBRID_MOE` and `EXL3_EXPERT_DISPATCH_POLICY` (`legacy`, `gpu_exact` or
+  `hybrid`).
+- **Cache:** `EXL3_EXPERT_CACHE_POLICY`, `_LIMIT_GB`, `_RESERVE_MB`, `_MIN_FREE_MB`,
+  `_GROW_HYST_MB`, `_ADMIT_MAX`, `_GATHER_MAX`, `_GATHER_BLOCKS`, `_CHUNK_SLOTS`, `_MAX_LAYERS`,
+  `_DECAY`, `_WARM`, `_SAVE_STATS`, `_ZC_FUSED_ROWS`, `_DEBUG`. The cache is sized at the first
+  forward to the free VRAM minus a floor: the larger of the reserve and the autosplit loader's
+  measured transient plus margins. It shrinks before prefill passes that need more, and regrows
+  when idle.
+- **Homes:** `EXL3_EXPERT_HOME` (`native_copy` or `worker_arena`) and
+  `EXL3_EXPERT_HOME_PIN_LIMIT_GB`. A home chunk whose page-locked registration fails stays pageable
+  and its experts take CPU lanes.
+- **Lanes:** `EXL3_MOE_ZC_MAX` (`auto` uses the measured PCIe rate and worker telemetry),
+  `EXL3_MOE_ZC_CPU_FRAC_INIT`, `EXL3_EXPERT_PREFILL_GPU_MIN`, `EXL3_MOE_ADAPTIVE_EMA`,
+  `EXL3_HYBRID_MOE_DEBUG`.
+- **NUMA:** `EXL3_NUMA_ENABLE` (one CPU worker per node; also applies to `-mcl` / `-mcs`, whose
+  layers then go round-robin over the nodes), `EXL3_NUMA_POLICY`, `EXL3_NUMA_MEMORY_POLICY`
+  (`shard` or `replicate`), `EXL3_NUMA_SHARD` (`mod` or `blocked`), `EXL3_NUMA_CPU_MAP`,
+  `EXL3_NUMA_GPU_NODE` and `EXL3_NUMA_DEBUG`. An undeterminable GPU node stays unknown and is
+  never assumed.
 
 ## Model loading
 

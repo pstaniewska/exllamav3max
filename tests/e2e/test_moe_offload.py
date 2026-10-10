@@ -5,6 +5,9 @@ the all-GPU load, through both the prefill path and single-token / batched decod
 Placements:
     layer   --moe_cpu_offload: the routed experts of the first half of the MoE layers run on the CPU
     split   --moe_cpu_split: the tail quarter of every MoE layer's routed experts runs on the CPU
+    hybrid  --moe_hybrid: experts in host RAM, shared GPU expert cache, zero-copy and CPU lanes
+    hybrid_exact  --moe_hybrid with EXL3_EXPERT_DISPATCH_POLICY=gpu_exact (no CPU lanes): GPU kernels only,
+            so agreement is at the model's own noise floor (tier choices and accumulation order may differ)
 
 Reference: the same model loaded entirely on the GPU, teacher-forced over the same tokens. The CPU kernels
 quantize activations to int8 and accumulate differently, so agreement is statistical (testlib.e2e.
@@ -38,6 +41,8 @@ def placement_args(model_dir: str, placement: str) -> list[str]:
     if placement == "split":
         experts = tc.get("num_experts") or tc.get("n_routed_experts") or tc.get("num_local_experts")
         return ["-mcs", str(max(1, experts // 4))]
+    if placement in ("hybrid", "hybrid_exact"):
+        return ["-mh"]
     raise ValueError(placement)
 
 
@@ -72,9 +77,12 @@ def gpu_reference(model_registry, device):
     return get
 
 
-@pytest.mark.parametrize("placement", ["layer", "split"])
-def test_offload_matches_gpu(model_id, model_dir, placement, device, gpu_reference):
+@pytest.mark.parametrize("placement", ["layer", "split", "hybrid", "hybrid_exact"])
+def test_offload_matches_gpu(model_id, model_dir, placement, device, gpu_reference, monkeypatch):
     ref = gpu_reference(model_id)
+    if placement.startswith("hybrid"):
+        from exllamav3.model import moe_hybrid_dispatch as mhd
+        monkeypatch.setattr(mhd.HT, "dispatch", "gpu_exact" if placement == "hybrid_exact" else "hybrid")
     with load_model(model_dir, device, *placement_args(model_dir, placement)) as lm:
         got = _run(lm)
     floor = ref["floor"]
