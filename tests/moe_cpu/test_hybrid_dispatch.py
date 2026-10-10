@@ -535,3 +535,103 @@ def test_prefill_threshold_remeasures_when_the_cpu_stays_idle():
         d.combine(hl, torch.zeros((rows, 8)), pend)
         got.append(d.prefill_gpu_min_last)
     assert got[2] == D.PREFILL_GPU_MIN_BOOT and got[0] == got[1] == got[3] != D.PREFILL_GPU_MIN_BOOT
+
+
+def test_mixed_rate_gpu_mask_picks_the_most_common_signature():
+    # Uniform layer: no mask, the one signature
+    assert D.mixed_rate_gpu_mask([[96, 96], [96, 96], [64, 64]]) == (None, (96, 96, 64))
+    # Gate/up/down widths per expert: (96, 96, 64) x 3, (80, 80, 64) x 2, (96, 96, 80) x 1
+    g = [96, 80, 96, 96, 80, 96]
+    u = [96, 80, 96, 96, 80, 96]
+    d = [64, 64, 64, 64, 64, 80]
+    mask, sig = D.mixed_rate_gpu_mask([g, u, d])
+    assert sig == (96, 96, 64)
+    assert mask.tolist() == [True, False, True, True, False, False]
+    # Ties go to the signature seen first
+    mask, sig = D.mixed_rate_gpu_mask([[64, 80], [64, 80]])
+    assert sig == (64, 64) and mask.tolist() == [True, False]
+
+
+def test_eligible_accepts_mixed_rates_with_one_shape(monkeypatch):
+    import sys, types
+    stub = types.ModuleType(f"{H.dispatch.__package__.rsplit('.', 1)[0]}.modules.block_sparse_mlp")
+    stub.BATCH_RECON = True
+    monkeypatch.setitem(sys.modules, stub.__name__, stub)
+    d, hl, hosts, cache = make(dispatch = "hybrid", zc_max = None)
+    E, h, i = 6, 256, 128
+    gu_w = [96, 80, 96, 96, 80, 96]
+    d_w = [64, 64, 64, 64, 64, 80]
+    shapes = {}
+    for e in range(E):
+        shapes[f"g{e}"] = [h // 16, i // 16, gu_w[e]]
+        shapes[f"u{e}"] = [h // 16, i // 16, gu_w[e]]
+        shapes[f"d{e}"] = [i // 16, h // 16, d_w[e]]
+
+    class Stc:
+        def list_tensors(self, key):
+            return {key + ".trellis": dict(shape = shapes[key]), key + ".mul1": {}}
+
+    class L:
+        fkey = None
+        def __init__(self, key):
+            self.key = key
+        def is_exl3_storage(self, key):
+            return True
+
+    m = types.SimpleNamespace(
+        config = types.SimpleNamespace(stc = Stc(), infer_params = types.SimpleNamespace(no_reconstruct = False)),
+        num_local_experts = E, num_experts = E, routing_first = None, routing_device = None, latent_in = None,
+        activation_fn = "silu", gated = True, expert_size = h,
+        gates = [L(f"g{e}") for e in range(E)], ups = [L(f"u{e}") for e in range(E)], downs = [L(f"d{e}") for e in range(E)])
+    ok, why, dims = d.eligible(m)
+    assert ok, why
+    assert dims["g"] == (h, i, 6) and dims["u"] == (h, i, 6) and dims["d"] == (i, h, 4)
+    assert dims["gpu"].tolist() == [True, False, True, True, False, False]
+    # Uniform layer: no mask
+    for e in range(E):
+        shapes[f"g{e}"][2] = shapes[f"u{e}"][2] = 96
+        shapes[f"d{e}"][2] = 64
+    ok, why, dims = d.eligible(m)
+    assert ok and dims["gpu"] is None
+    # Different (k, n) within a projection stays ineligible
+    shapes["d5"] = [i // 16, 2 * h // 16, 64]
+    assert d.eligible(m)[:2] == (False, "experts of one projection differ in shape")
+
+
+@pytest.mark.parametrize("rows", [1, 64])
+def test_experts_without_a_home_always_take_cpu_lanes(rows):
+    """CPU-only experts of a mixed-rate layer (no home copy): never a GPU lane, decode or prefill,
+    and the warm start never installs them"""
+    topk, E, N = 4, 16, 2
+    d, hl, hosts, cache = make(E = E, N = N, rows = rows, topk = topk, dispatch = "hybrid", zc_max = 16,
+                               prefill_gpu_min = 0)
+    layer = hl.cache_layer
+    eb = 1024
+    home = torch.zeros((E * eb,), dtype = torch.uint8)
+    gpu = np.array([e % 4 != 3 for e in range(E)])
+    cache.set_layer_homes(layer, np.array([home.data_ptr() + e * eb if gpu[e] else 0 for e in range(E)]),
+                          lambda e: home[e * eb:(e + 1) * eb] if gpu[e] else None)
+    torch.manual_seed(3)
+    sel = torch.stack([torch.randperm(E)[:topk] for _ in range(rows)])
+    y, w = torch.randn((rows, 8)).half(), torch.rand((rows, topk)).half()
+    for _ in range(3):
+        pend, sel_gpu = d.submit(hl, y, sel, w)
+        d.combine(hl, torch.zeros((rows, 8)), pend)
+        on_gpu = sel_gpu[sel_gpu < E]
+        assert on_gpu.numel() > 0
+        assert bool(torch.from_numpy(gpu)[on_gpu].all())
+        assert int((sel_gpu == E).sum()) >= int((~torch.from_numpy(gpu))[sel].sum())
+
+
+def test_choose_prefill_gpu_min_counts_forced_cpu_work():
+    counts = np.array([1, 2, 2, 3, 5, 8, 13, 21, 34, 55])
+    kw = dict(t_gpu0 = 0.0, t_zc = 1000.0, t_fixed = 50.0, a = 100.0, b = 10.0, nodes = 2)
+    t0 = D.choose_prefill_gpu_min(counts, **kw)
+    # CPU already busy with experts it must take: fewer flexible experts go to it
+    t1 = D.choose_prefill_gpu_min(counts, cpu0 = (20, 400), **kw)
+    assert t1 <= t0
+    c = np.sort(counts)
+    base = 100.0 * 20 + 10.0 * 400
+    worst = lambda k: max(50.0 + (base + 100 * k + 10 * c[:k].sum()) / 2, (c.size - k) * 1000.0)
+    k = int((c < t1).sum())
+    assert worst(k) == min(worst(j) for j in range(c.size + 1) if j in (0, c.size) or c[j] != c[j - 1])

@@ -519,12 +519,24 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             print(f" !! Warning, partially quantized block-sparse MLP layer: {self.key}")
         self.is_quantized = (num_exl3_tensors > 0 and num_nonexl3_tensors == 0)
 
+        # Mixed-rate experts (one K or codebook per expert, e.g. MixedK checkpoints): every
+        # quantized fast path takes one K per projection through MultiLinear, so these layers run
+        # the dense per-expert path. Hybrid layers are uniform here: their CPU-only experts carry
+        # the GPU experts' shapes (moe_hybrid_dispatch.mixed_rate_gpu_mask)
+        def _uniform(ls):
+            q = [(l.inner.K, l.inner.mcg, l.inner.mul1) for l in ls]
+            return all(x == q[0] for x in q)
+        mixed_rate = self.is_quantized and not all(
+            _uniform(ls) for ls in ([self.gates] if self.gated else []) + [self.ups, self.downs])
+        if mixed_rate:
+            print(f" -- {self.key}: experts differ in bitrate, dense per-expert path")
+
         # The quantized fast paths (mgemm/BC/fused kernels) don't yet support per-expert biases,
         # activations other than silu/gelu (or gateless relu2), or trimmed (padded) down
         # projections; configurations with any of those run every batch size through the dense
         # per-expert path, which handles all of them (gpt-oss)
         self.support_quant_paths = (
-            self.is_quantized and
+            self.is_quantized and not mixed_rate and
             (self.activation_fn in ("silu", "gelu") if self.gated else self.activation_fn == "relu2") and
             all(l.inner.bias is None for l in self.gates + self.ups + self.downs) and
             all(not l.trim_padded_out or l.out_features == l.out_features_unpadded for l in self.downs)
@@ -538,7 +550,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             has = [l.inner.bias is not None for l in ls]
             return all(has) or not any(has)
         self.support_bc_bszn = (
-            self.is_quantized and
+            self.is_quantized and not mixed_rate and
             (self.activation_fn in ("silu", "gelu", "swiglu_oai") if self.gated else self.activation_fn == "relu2") and
             _uniform_bias(self.gates) and _uniform_bias(self.ups) and _uniform_bias(self.downs) and
             not self.config.infer_params.no_reconstruct

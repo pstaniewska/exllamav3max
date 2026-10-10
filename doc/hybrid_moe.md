@@ -453,12 +453,21 @@ Hybrid needs layer-split loading (no `-tp`) and excludes `-mcl` / `-mcs` for the
 **Eligibility** is checked per layer from headers only; ineligible layers load as usual. A layer
 qualifies when it has:
 
-- mul1-codebook experts stored as separate EXL3 tensors of one shape per projection, no
+- mul1-codebook experts stored as separate EXL3 tensors of one (k, n) shape per projection, no
   per-expert biases, and no padded hidden width;
 - a silu/gelu gated or relu2 gateless activation;
 - at most 512 experts, and at least as many experts as worker nodes;
 - no tensor-parallel or latent-MoE structure;
 - the batched reconstruct tier available.
+
+**Mixed-rate checkpoints** (MixedK quants, where each expert has its own bitrate) qualify too.
+The CPU kernels take any supported K per expert, while the GPU tiers take one K per projection.
+So only the experts of the layer's most common rate signature (gate, up, down widths) get GPU
+lanes: home copies, cache slots and zero-copy reads. The others have no home and always run on
+their CPU worker, under every dispatch policy including `gpu_exact`. The load log reports the
+split per layer, and the prefill cost model counts the forced-CPU work. Outside hybrid, mixed-rate
+layers run the dense per-expert GPU path, and `-mcl` / `-mcs` keep them off the streamed prefill
+and the dynamic split swap, both of which assume one expert size.
 
 ## Telemetry
 

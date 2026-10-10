@@ -155,20 +155,22 @@ class PrefillCostFit:
 
 
 def choose_prefill_gpu_min(counts: np.ndarray, t_gpu0: float, t_zc: float, t_fixed: float,
-                           a: float, b: float, nodes: int) -> int:
+                           a: float, b: float, nodes: int, cpu0: tuple[int, int] = (0, 0)) -> int:
     """Row threshold for one prefill call: non-resident experts with at least this many rows read
     over PCIe (t_zc each, after t_gpu0 of other GPU work), the rest go to the CPU nodes (t_fixed
-    once, then a + b * rows per expert, spread over `nodes`). The CPU side costs more per row and
-    the PCIe side does not, so the smallest experts are the CPU's. Minimizes the later of the two
-    finishing times; ties keep the experts on the GPU (exact numerics)"""
+    once, then a + b * rows per expert, spread over `nodes`). cpu0 = (experts, rows) the CPU
+    takes regardless (no GPU-readable home). The CPU side costs more per row and the PCIe side
+    does not, so the smallest experts are the CPU's. Minimizes the later of the two finishing
+    times; ties keep the experts on the GPU (exact numerics)"""
     c = np.sort(counts[counts > 0])
     m = c.size
     if not m:
         return PREFILL_GPU_MIN_BOOT
     nodes = max(nodes, 1)
-    cpu = np.concatenate(([0.0], np.cumsum(a + b * c.astype(np.float64)))) / nodes
+    base = a * cpu0[0] + b * cpu0[1]
+    cpu = (base + np.concatenate(([0.0], np.cumsum(a + b * c.astype(np.float64))))) / nodes
     k = np.arange(m + 1)
-    cpu = np.where(k > 0, cpu + t_fixed, 0.0)
+    cpu = np.where((k > 0) | (base > 0), cpu + t_fixed, 0.0)
     gpu = t_gpu0 + (m - k) * t_zc
     worst = np.maximum(cpu, gpu)
     # A threshold cannot split equal counts: only k at a change of count (or the ends)
@@ -177,6 +179,23 @@ def choose_prefill_gpu_min(counts: np.ndarray, t_gpu0: float, t_zc: float, t_fix
     worst = np.where(ok, worst, np.inf)
     best = int(np.argmin(worst))
     return int(c[best]) if best < m else int(c[-1]) + 1
+
+
+def mixed_rate_gpu_mask(widths: list[list[int]]) -> tuple[np.ndarray | None, tuple]:
+    """Mixed-rate ("MixedK") layers: widths holds, per projection (gate, up, down order), each
+    expert's trellis tile width. The GPU tiers take one K per projection, so only the experts of
+    the layer's most common rate signature get GPU lanes (cache slots, zero-copy homes); the rest
+    always run on their CPU workers, whose kernels take any K per expert. Returns (mask of
+    GPU-eligible experts, or None when every expert shares one signature; that signature's
+    widths per projection). Ties go to the signature seen first, so the choice is deterministic"""
+    sigs = list(zip(*widths))
+    counts = {}
+    for s in sigs:
+        counts[s] = counts.get(s, 0) + 1
+    sig = max(counts, key = counts.get)
+    if len(counts) == 1:
+        return None, sig
+    return np.array([s == sig for s in sigs], dtype = bool), sig
 
 
 class Telemetry:
@@ -248,6 +267,9 @@ class HybridLayer:
         self.num_experts = module.num_experts
         self.topk = module.num_experts_per_tok
         self.dims = dims                    # dict g/u/d: (k, n, K) ; g None when gateless
+        # Mixed-rate layer: bool (E,) of the experts with GPU lanes, whose K the dims carry; the
+        # others never get a home or a cache slot and always run on their CPU workers. None = all
+        self.gpu = dims.get("gpu")
         self.h = module.expert_size
         self.hi = dims["u"][0]
         self.ho = dims["d"][1]
@@ -372,26 +394,36 @@ class HybridDispatcher:
             return False, "fewer experts than worker nodes", None
         stc = module.config.stc
         projs = ([("g", module.gates)] if module.gated else []) + [("u", module.ups), ("d", module.downs)]
+        # Tile width (16 * K) of every expert's trellis per projection. Mixed-rate checkpoints
+        # (one K per expert) share the (k, n) dims; the CPU kernels take any supported K per
+        # expert, the GPU tiers one K per projection (see mixed_rate_gpu_mask)
+        widths = []
         dims = {"g": None}
         for name, ls in projs:
-            shape0 = None
+            kn = None
+            w = []
             for l in ls:
                 if getattr(l, "fkey", None) or not l.is_exl3_storage(l.key):
                     return False, "experts not stored as separate EXL3 tensors", None
                 t = stc.list_tensors(l.key)
                 if l.key + ".bias" in t:
                     return False, "per-expert biases", None
+                if l.key + ".mul1" not in t:
+                    return False, "experts are not mul1", None
                 shp = list(t[l.key + ".trellis"]["shape"])
-                if shape0 is None:
-                    shape0 = shp
-                    if l.key + ".mul1" not in t:
-                        return False, "experts are not mul1", None
-                elif shp != shape0:
+                if kn is None:
+                    kn = shp[:2]
+                elif shp[:2] != kn:
                     return False, "experts of one projection differ in shape", None
-            K = trellis_rate(shape0[2])
-            if K is None:
-                return False, "unsupported bitrate", None
-            dims[name] = (shape0[0] * 16, shape0[1] * 16, K)
+                if trellis_rate(shp[2]) is None:
+                    return False, "unsupported bitrate", None
+                w.append(shp[2])
+            widths.append(w)
+            dims[name] = (kn[0] * 16, kn[1] * 16, None)
+        gpu, sig = mixed_rate_gpu_mask(widths)
+        for (name, _), tw in zip(projs, sig):
+            dims[name] = dims[name][:2] + (trellis_rate(tw),)
+        dims["gpu"] = gpu
         h = module.expert_size
         if dims["u"][0] != h or dims["d"][1] != h:
             return False, "padded hidden width", None
@@ -417,6 +449,7 @@ class HybridDispatcher:
         act = {"silu": 0, "gelu": 1, "relu2": 2, "swiglu_oai": 3}[module.activation_fn]
         host_idx = []
         cpuloc = np.full((len(hosts), module.num_experts), -1, dtype = np.int32)
+        gpu = dims.get("gpu")
         for i, (h, sh) in enumerate(zip(hosts, shards)):
             if not sh:
                 host_idx.append(-1)
@@ -428,9 +461,12 @@ class HybridDispatcher:
                 [module.downs[e].key for e in sh],
                 act, float(module.act_limit or 0.0),
                 dims["u"][0], dims["d"][1], module.num_experts_per_tok,
-                proj_dims = dict(g = dims["g"], u = dims["u"], d = dims["d"]),
+                # The per-expert byte layout only holds for uniform-rate layers
+                proj_dims = dict(g = dims["g"], u = dims["u"], d = dims["d"]) if gpu is None else None,
                 aux = None,
                 interm_fp32 = module.interm_dtype == torch.float,
+                # CPU-only experts of a mixed-rate layer need no GPU-readable home copy
+                home_mask = None if gpu is None else [bool(gpu[e]) for e in sh],
             )
             host_idx.append(idx)
             for j, e in enumerate(sh):
@@ -451,8 +487,13 @@ class HybridDispatcher:
             projs = ([("g", module.gates)] if module.gated else []) + [("u", module.ups), ("d", module.downs)]
             offs = {"g": hl.proj_off[0], "u": hl.proj_off[1], "d": hl.proj_off[2]}
             for name, ls in projs:
-                for l in ls:
-                    _bounce_linear(l, bounce, offs[name], hl.proj_bytes[name], device)
+                # CPU-only experts of a mixed-rate layer get Linear objects shaped like the GPU
+                # experts: the uniform pointer tables need them, and no GPU lane reads them
+                k, n, K = dims[name]
+                shape = (k // 16, n // 16, int(16 * K))
+                for e, l in enumerate(ls):
+                    _bounce_linear(l, bounce, offs[name], hl.proj_bytes[name], device,
+                                   shape = None if gpu is None or gpu[e] else shape)
         except BaseException:
             # Typically an OOM under the autosplit budget: module.hybrid is not set yet, so the
             # loader's unload cannot reach detach. Undo the worker registrations here, or the
@@ -471,8 +512,11 @@ class HybridDispatcher:
         # masked picks) are dropped by the range test of the fused decode kernels
         module.routing_first = 0
         module.routing_last = module.num_experts
+        mixed = "" if gpu is None else \
+            f", mixed rates: {int(gpu.sum())} at K {'/'.join(str(dims[p][2]) for p in ('g', 'u', 'd') if dims[p])} " \
+            f"with GPU lanes, the rest CPU only"
         print(f" -- hybrid MoE experts: {module.key} ({module.num_experts} experts, "
-              f"{hl.expert_bytes / 2**20:.2f} MiB each, {len(hosts)} worker node(s))")
+              f"{hl.expert_bytes / 2**20:.2f} MiB each, {len(hosts)} worker node(s){mixed})")
         return True
 
     def attach(self, module):
@@ -566,7 +610,7 @@ class HybridDispatcher:
                 if idx < 0 or not (h.home or h.map_arena):
                     continue
                 for j, e in enumerate(sh):
-                    if src[e] is not None:
+                    if src[e] is not None or (hl.gpu is not None and not hl.gpu[e]):
                         continue
                     homes[e] = h.home_device_ptr(idx, j)
                     src[e] = (h, idx, j)
@@ -574,7 +618,8 @@ class HybridDispatcher:
         if missing:
             raise RuntimeError(f"hybrid MoE {hl.key}: experts {missing[:8]} have neither a GPU-readable home "
                                f"nor a CPU worker copy")
-        n_nozc = int((homes == 0).sum())
+        # Unmapped GPU-eligible experts (CPU-only experts of a mixed-rate layer have no home by design)
+        n_nozc = int(((homes == 0) & (hl.gpu if hl.gpu is not None else True)).sum())
         if n_nozc and native_ok and "nozc" not in self.notices:
             self.notices.add("nozc")
             print(f" -- hybrid MoE: {n_nozc} experts of {hl.key} have no GPU-readable home "
@@ -950,11 +995,13 @@ class HybridDispatcher:
         miss = used & ~resident
         flex = miss & mapped & has_cpu
         forced_gpu = int((miss & mapped & ~has_cpu).sum())
+        forced_cpu = miss & ~mapped & has_cpu
         t_gpu0 = float(self.hit_us or 0.0) * int((used & resident).sum()) + float(self.zc_us) * forced_gpu
         nodes = sum(1 for idx in hl.host_idx if idx >= 0)
         pa, pb = self.prefill_cost
         gpu_min = choose_prefill_gpu_min(counts[flex], t_gpu0, float(self.zc_us),
-                                         float(self.cpu_fixed_us or 0.0), pa, pb, nodes)
+                                         float(self.cpu_fixed_us or 0.0), pa, pb, nodes,
+                                         (int(forced_cpu.sum()), int(counts[forced_cpu].sum())))
         cpu_any = bool((counts[flex] < gpu_min).any()) if flex.any() else False
         self.prefill_stale = 0 if cpu_any else self.prefill_stale + 1
         return gpu_min
@@ -985,15 +1032,17 @@ class HybridDispatcher:
         return final_hidden_states
 
 
-def _bounce_linear(l, bounce: torch.Tensor, off: int, nbytes: int, device):
+def _bounce_linear(l, bounce: torch.Tensor, off: int, nbytes: int, device, shape = None):
     """Give a routed expert Linear an EXL3 inner module whose trellis is a view of the cache's
     bounce block (valid VRAM, never computed from: the cache owns the table rows) and whose
-    suh/svh are the checkpoint's own (VRAM). Mirrors Linear.load_exl3 without the trellis read"""
+    suh/svh are the checkpoint's own (VRAM). Mirrors Linear.load_exl3 without the trellis read.
+    shape overrides the checkpoint's trellis shape (CPU-only experts of a mixed-rate layer)"""
     from ..modules.quant.exl3 import LinearEXL3
     from ..modules.quant.exl3_lib.quantize import codebook_mul1_mult
     stc = l.config.stc
     key = l.key
-    shape = stc.list_tensors(key)[key + ".trellis"]["shape"]
+    if shape is None:
+        shape = stc.list_tensors(key)[key + ".trellis"]["shape"]
     numel = shape[0] * shape[1] * shape[2]
     assert numel * 2 == nbytes, f"{key}: trellis size mismatch"
     trellis = bounce[off: off + nbytes].view(torch.int16).view(*shape)

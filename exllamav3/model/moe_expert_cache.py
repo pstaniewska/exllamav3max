@@ -767,7 +767,10 @@ class ExpertCache:
                     continue
                 hist = self.arrays["hist"]
                 self._write(hist, L * EMAX, [float(x) for x in counts])
-                ranked += [(float(counts[e]), L, e) for e in range(layer.num_experts) if counts[e] > 0]
+                # Experts without a home copy (CPU-only experts of a mixed-rate layer) never
+                # take a slot
+                ranked += [(float(counts[e]), L, e) for e in range(layer.num_experts)
+                           if counts[e] > 0 and layer.host_view(e) is not None]
             ranked.sort(key = lambda r: (-r[0], r[1], r[2]))
             ops = []
             for (_, L, e), s in zip(ranked, free):

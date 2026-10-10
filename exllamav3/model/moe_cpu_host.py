@@ -728,22 +728,26 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
         def nbytes(t):
             return t.numel() * t.element_size()
 
-        def rehome_experts(g, u, d):
+        def rehome_experts(g, u, d, home_mask = None):
             """Per expert: the gate/up/down trellis tensors back to back (one contiguous
             expert block in (g, u, d) order, the layout the stager produces and the DMA unit
             of the pinned-arena streamed path), then the small aux tensors. Returns the
             per-projection lists, the per-expert (chunk, byte offset) of each block and, with a
-            home arena, the (chunk, byte offset) of each expert's native-layout home block."""
+            home arena, the (chunk, byte offset) of each expert's native-layout home block (None
+            for experts home_mask leaves out)."""
             gs, us, ds, blocks, homes = [], [], [], [], []
             for e in range(len(u)):
                 projs = ([g[e]] if g else []) + [u[e], d[e]]
                 total = sum(nbytes(t[0]) for t in projs)
                 assert all(nbytes(t[0]) % 64 == 0 for t in projs), "trellis size not 64-byte aligned"
                 if home_arena is not None:
-                    # Same bytes as the checkpoint (no CPU repack): the GPU kernels read this
-                    homes.append(home_arena.reserve(total))
-                    for t in projs:
-                        home_arena.rehome(t[0])
+                    if home_mask is None or home_mask[e]:
+                        # Same bytes as the checkpoint (no CPU repack): the GPU kernels read this
+                        homes.append(home_arena.reserve(total))
+                        for t in projs:
+                            home_arena.rehome(t[0])
+                    else:
+                        homes.append(None)
                 blocks.append(arena.reserve(total))
                 trellis = [rehome_trellis(t[0]) for t in projs]
                 aux = [(arena.rehome(t[1]), arena.rehome(t[2]), arena.rehome(t[3])) for t in projs]
@@ -779,7 +783,8 @@ def _moe_cpu_child_main(conn, model_dir, threads, stage_threads, pinned = False,
                     stc.end_deferred_load()
                     # Copy into the hugepage-backed arena now that the deferred reads have
                     # actually populated these tensors; the loader tensors die with this batch
-                    bg, bu, bd, bb, bh = rehome_experts(bg, bu, bd)
+                    hm = spec.get("home_mask")
+                    bg, bu, bd, bb, bh = rehome_experts(bg, bu, bd, hm[sl] if hm is not None else None)
                     g += bg
                     u += bu
                     d += bd
@@ -1176,7 +1181,7 @@ class MoeCpuHost:
         return v[off: off + nbytes]
 
     def register_layer(self, key, gate_keys, up_keys, down_keys, activation, act_limit, hi, ho, topk,
-                       proj_dims = None, aux = None, interm_fp32 = False):
+                       proj_dims = None, aux = None, interm_fp32 = False, home_mask = None):
         if key in self.by_key:
             # Autosplit rollback retry: the child keeps its copy, reuse the index, but take
             # the re-fetched aux tensors: the retry runs on a different device, and the stored
@@ -1198,6 +1203,7 @@ class MoeCpuHost:
             num_experts = len(up_keys),
             proj_dims = proj_dims,
             interm_fp32 = interm_fp32,      # resident experts' gate/up output dtype (BlockSparseMLP interm_dtype)
+            home_mask = home_mask,          # per expert: keep a home copy (None = all)
         )
         if proj_dims is not None:
             # Deterministic per-expert byte layout (gate, up, down), mirrored by the worker's
