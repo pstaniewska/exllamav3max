@@ -1041,6 +1041,30 @@ class Attention(Module):
                     bca._configure(1, q, True, 1)
 
 
+    def qc_staging_bytes(self) -> int:
+        """Bytes of the quantized-cache prefill staging scratch (fp16 K and V of the whole pool,
+        see autosplit_extra_measure) one prefill call of this layer may allocate, the largest over
+        its attached caches; 0 when no attached cache stages. Hybrid MoE keeps this free on loads
+        without an autosplit measurement"""
+        if self.device is None or self.qsa_indexer is not None:
+            return 0
+        from .attention_fn.triton_paged import _qc_staging
+        if _qc_staging != 1:
+            return 0
+        from ..cache import CacheLayer_quant
+        from ..cache.qsa import QSAPlanes
+        nbytes = 0
+        for layer in self.cache_layers:
+            if not isinstance(layer, CacheLayer_quant) or isinstance(layer, QSAPlanes):
+                continue
+            shape = layer.qk.shape if layer.qk is not None else layer.qshape_k
+            if shape is None:
+                continue
+            pages = shape[0]
+            nbytes = max(nbytes, 2 * pages * PAGE_SIZE * layer.token_dim * 2)
+        return nbytes
+
+
     def autosplit_extra_measure(self, params):
         found = self._autosplit_layer(params)
         if found is None:

@@ -346,7 +346,8 @@ class Model_LSMixin(ABC):
         for h in getattr(self.config, "moe_cpu_hosts", {}).values():
             h.begin_pass()
         if getattr(self.config, "moe_hybrid_dispatchers", None):
-            from .moe_hybrid_dispatch import begin_pass_all
+            from .moe_hybrid_dispatch import begin_pass_all, note_kv_staging
+            note_kv_staging(self)
             begin_pass_all(self.config, x, getattr(self, "component", "text"))
         for module, instance, idx in self.fwd_modules:
             params["layer_instance"] = instance
@@ -368,7 +369,8 @@ class Model_LSMixin(ABC):
         for h in getattr(self.config, "moe_cpu_hosts", {}).values():
             h.begin_pass()
         if getattr(self.config, "moe_hybrid_dispatchers", None):
-            from .moe_hybrid_dispatch import begin_pass_all
+            from .moe_hybrid_dispatch import begin_pass_all, note_kv_staging
+            note_kv_staging(self)
             begin_pass_all(self.config, x, getattr(self, "component", "text"))
         for module, instance, idx in self.fwd_modules:
             params["layer_instance"] = instance

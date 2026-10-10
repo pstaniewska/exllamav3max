@@ -25,6 +25,9 @@
 #ifdef __linux__
 #include <pthread.h>
 #include <sched.h>
+#include <cpuid.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #else
 // min/max macro suppression is handled globally (-DNOMINMAX in setup.py): this TU uses
 // std::min/max/clamp throughout
@@ -54,6 +57,14 @@
 // band of output tiles held in register accumulators per worker, so cold expert weights are read
 // near-sequentially from DRAM (measured 3.4x over per-output-column traversal on cold stacks).
 //
+// AMX (Sapphire Rapids and later): the same integer sum as a tile product. TDPBSUD takes signed
+// bytes from A and unsigned bytes from B, so A is the activation tile straight out of splat32
+// (16 k-rows of x8 replicated x4 = one 64-byte tile row per GEMV row) and B is the 16 product
+// rows the VNNI kernel feeds to vpdpbusd, stored to a 1 KB buffer. C[row][n] is then the VNNI
+// accumulator for that row, bit for bit, and the epilogue is shared. The gain is decoding each
+// weight tile once for up to 16 GEMV rows instead of once per MAX_M, so the tier takes chunks of
+// up to AMX_ROWS tokens and is used for passes of at least EXL3_MOE_CPU_AMX_MIN_ROWS rows.
+//
 // No generic lambdas inside target-attributed functions (GCC does not let lambdas inherit the
 // target), hence the recursive-template row unrolling.
 
@@ -68,15 +79,19 @@ namespace {
 
 constexpr uint32_t MUL1_MULT = 0x83DCD12Du;
 constexpr float HAD_SCALE = 0.088388347648f;
-constexpr int MAX_M = 4;
+constexpr int MAX_M = 4;            // GEMV rows per vector-kernel pass (register budget)
+constexpr int AMX_ROWS = 16;        // GEMV rows per AMX pass (A/C tile rows)
+// Tokens per chunk: MAX_M, or AMX_ROWS when the AMX tier is active (g_chunk_m)
+constexpr int MAX_CHUNK = AMX_ROWS;
 
 // int8 activations resolve a row in steps of 1/127 of its largest element. A row that is a few large
 // elements over many small ones (inputs with a dominant component shared by all tokens, which the
 // rotation confines to the blocks it lives in) loses the small ones altogether, and with them what
 // tells one token from the next. Such a row is carried as two int8 rows, the high and low part of a
-// 15-bit value, whose GEMV outputs add up (see prepare_rows, fold_rows). A chunk of MAX_M tokens
-// therefore takes up to MAX_SLOTS GEMV rows, the ones past MAX_M in a second pass over the weights
-constexpr int MAX_SLOTS = 2 * MAX_M;
+// 15-bit value, whose GEMV outputs add up (see prepare_rows, fold_rows). A chunk of tokens
+// therefore takes up to twice as many GEMV rows as tokens, the ones past a pass in further passes
+// over the weights
+constexpr int MAX_SLOTS = 2 * MAX_CHUNK;
 constexpr int WIDE_LEVELS = 127 * 128;
 // A row goes wide when more than 1 / WIDE_ZERO_DIV of its activations would round to zero
 constexpr int WIDE_ZERO_DIV = 16;
@@ -86,12 +101,15 @@ constexpr int WIDE_ZERO_DIV = 16;
 #define M1_TARGET_BW __attribute__((target("avx512f,avx512bw,avx512vl,fma,f16c")))
 #define M1_TARGET_VNNI __attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni,fma,f16c")))
 #define M1_TARGET_VBMI __attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi,fma,f16c")))
+#define M1_TARGET_AMX __attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni,fma,f16c,amx-tile,amx-int8")))
+#define M1_HAVE_AMX 1
 #define M1_ALWAYS_INLINE __attribute__((always_inline)) inline
 #else
 #define M1_TARGET_AVX2
 #define M1_TARGET_BW
 #define M1_TARGET_VNNI
 #define M1_TARGET_VBMI
+#define M1_HAVE_AMX 0
 #define M1_ALWAYS_INLINE __forceinline
 #endif
 
@@ -226,6 +244,11 @@ inline float decode_mul1_scalar(uint16_t state)
 // AVX-512F/BW/VL without VNNI (Skylake-SP/X): the dword kernel with the AVX2-style accumulate.
 enum class Isa { Scalar, Avx2, Bw, Vnni, Vbmi };
 extern const Isa g_isa;
+// AMX-INT8 usable (hardware, OS permission, not capped): an add-on to the Vnni/Vbmi tiers for
+// passes of at least g_amx_min_rows GEMV rows
+extern const bool g_amx;
+extern const int g_amx_min_rows;
+extern const int g_chunk_m;
 
 // -------------------------------------------------------------------------------------------
 //   Transforms
@@ -320,8 +343,8 @@ struct PreparedIn
     int32_t sum_x8[MAX_SLOTS];
     // GEMV rows in use, and where each token's row (or pair of rows) starts
     int rows;
-    uint8_t slot[MAX_M];
-    uint8_t wide[MAX_M];
+    uint8_t slot[MAX_CHUNK];
+    uint8_t wide[MAX_CHUNK];
 };
 
 // EXL3_MOE_CPU_WIDE=0: plain int8 activations for every row (testing)
@@ -839,6 +862,259 @@ void vnni_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int 
         n0 += band;
     }
 }
+
+// -------------------------------------------------------------------------------------------
+//   AMX tile kernel
+//
+//   Per 16x16 weight tile: decode the 16 product rows exactly as vnni_band_rows does, store them
+//   as the B tile, and one TDPBSUD adds the tile's contribution for every GEMV row of the pass
+//   (A = splat32, 16 dwords of row i at splat32 + i * k + tile_k * 16). Tile registers: tmm0 A,
+//   tmm1 / tmm6 B (alternating, so the next tile's load does not wait on the previous product),
+//   tmm2.. one C accumulator per band member. Bands of up to 4 tiles, which keeps the swizzled
+//   layout's divisor-of-8 band rule.
+// -------------------------------------------------------------------------------------------
+
+#if M1_HAVE_AMX
+
+constexpr int AMX_BAND = 4;
+
+struct alignas(64) AmxTileCfg
+{
+    uint8_t palette_id;
+    uint8_t start_row;
+    uint8_t reserved[14];
+    uint16_t colsb[16];
+    uint8_t rows[16];
+};
+
+M1_TARGET_AMX
+inline void amx_configure(int rows)
+{
+    AmxTileCfg cfg {};
+    cfg.palette_id = 1;
+    cfg.rows[0] = static_cast<uint8_t>(rows); cfg.colsb[0] = 64;      // A
+    cfg.rows[1] = 16; cfg.colsb[1] = 64;                              // B
+    cfg.rows[6] = 16; cfg.colsb[6] = 64;                              // B
+    for (int t = 2; t < 2 + AMX_BAND; ++t)
+    {
+        cfg.rows[t] = static_cast<uint8_t>(rows);                     // C
+        cfg.colsb[t] = 64;
+    }
+    _tile_loadconfig(&cfg);
+}
+
+template <int bits, bool hb, int R>
+M1_TARGET_AMX
+M1_ALWAYS_INLINE void amx_decode_rows(__m512i p0, __m512i p1, __m512i p2, __m512i p3, int32_t* buf)
+{
+    if constexpr (R < 16)
+    {
+        const __m512i mult = _mm512_set1_epi32(static_cast<int32_t>(MUL1_MULT));
+        if constexpr (dword_pair_wins<bits, hb>())
+        {
+            __m512i a, wb;
+            dword_gather<bits, hb, R>(p0, p1, p2, p3, a, wb);
+            const __m512i code0 = dword_codes<bits, hb, R, 0>(a, wb);
+            __m512i code1;
+            if constexpr (word_pair_ok<bits, hb, R>())
+            {
+                code1 = dword_codes<bits, hb, R, pair_delta(bits, hb)>(a, wb);
+            }
+            else
+            {
+                dword_gather<bits, hb, R + 1>(p0, p1, p2, p3, a, wb);
+                code1 = dword_codes<bits, hb, R + 1, 0>(a, wb);
+            }
+            _mm512_store_si512(buf + R * 16, _mm512_mullo_epi32(code0, mult));
+            _mm512_store_si512(buf + (R + 1) * 16, _mm512_mullo_epi32(code1, mult));
+            amx_decode_rows<bits, hb, R + 2>(p0, p1, p2, p3, buf);
+        }
+        else
+        {
+            const __m512i code = extract_row<bits, hb, R>(p0, p1, p2, p3);
+            _mm512_store_si512(buf + R * 16, _mm512_mullo_epi32(code, mult));
+            amx_decode_rows<bits, hb, R + 1>(p0, p1, p2, p3, buf);
+        }
+    }
+}
+
+// GCC's tile intrinsics paste the register number into inline asm text, so it must be a literal:
+// band member b maps to C register tmm(2 + b) here
+#define M1_AMX_C(b, OP) \
+    do { \
+        if constexpr ((b) == 0) OP(2); \
+        else if constexpr ((b) == 1) OP(3); \
+        else if constexpr ((b) == 2) OP(4); \
+        else OP(5); \
+    } while (0)
+
+template <int b, int band>
+M1_TARGET_AMX
+M1_ALWAYS_INLINE void amx_zero_c()
+{
+    if constexpr (b < band)
+    {
+        #define M1_OP(t) _tile_zero(t)
+        M1_AMX_C(b, M1_OP);
+        #undef M1_OP
+        amx_zero_c<b + 1, band>();
+    }
+}
+
+template <int b, int band>
+M1_TARGET_AMX
+M1_ALWAYS_INLINE void amx_store_c(int32_t* cbuf)
+{
+    if constexpr (b < band)
+    {
+        #define M1_OP(t) _tile_stored(t, cbuf + b * 256, 64)
+        M1_AMX_C(b, M1_OP);
+        #undef M1_OP
+        amx_store_c<b + 1, band>(cbuf);
+    }
+}
+
+// One band member at k-tile tile_k: load, prefetch and decode its packed tile, then accumulate
+template <int bits, bool hb, int band, int b>
+M1_TARGET_AMX
+M1_ALWAYS_INLINE void amx_band_step(const MoeCpuMatrix& mat, const uint16_t* packed_row, size_t pf_step,
+    int tile_k, int tiles_k, int n0, int32_t* bbuf)
+{
+    if constexpr (b < band)
+    {
+        constexpr int packed_size = tile_u16(bits, hb);
+        constexpr int words32 = tile_words32(bits, hb);
+        constexpr __mmask16 mask0 = words32 >= 16 ? 0xffffu : static_cast<__mmask16>((1u << words32) - 1u);
+        constexpr __mmask16 mask1 = words32 >= 32 ? 0xffffu : words32 <= 16 ? 0 : static_cast<__mmask16>((1u << (words32 - 16)) - 1u);
+        constexpr __mmask16 mask2 = words32 >= 48 ? 0xffffu : words32 <= 32 ? 0 : static_cast<__mmask16>((1u << (words32 - 32)) - 1u);
+        constexpr __mmask16 mask3 = words32 >= 64 ? 0xffffu : words32 <= 48 ? 0 : static_cast<__mmask16>((1u << (words32 - 48)) - 1u);
+
+        // Same addressing and prefetch as vnni_band (see there); bands here never span a whole
+        // swizzled group, so always the strided-stream prefetch
+        const uint16_t* packed = mat.swz
+            ? mat.trellis + (static_cast<size_t>(n0 / 8) * tiles_k * 8
+                             + static_cast<size_t>(tile_k) * 8 + (n0 % 8) + b) * packed_size
+            : packed_row + b * packed_size;
+        constexpr int pf_lines = (packed_size * 2 + 63) / 64;
+        constexpr int pf_dist = (bits == 6) ? 2 : 4;
+        const char* pf = reinterpret_cast<const char*>(packed + pf_step * pf_dist);
+        for (int l = 0; l < pf_lines; ++l)
+            _mm_prefetch(pf + l * 64, _MM_HINT_T0);
+
+        const uint32_t* pw = reinterpret_cast<const uint32_t*>(packed);
+        const __m512i p0 = _mm512_maskz_loadu_epi32(mask0, pw);
+        const __m512i p1 = mask1 ? _mm512_maskz_loadu_epi32(mask1, pw + 16) : _mm512_setzero_si512();
+        const __m512i p2 = mask2 ? _mm512_maskz_loadu_epi32(mask2, pw + 32) : _mm512_setzero_si512();
+        const __m512i p3 = mask3 ? _mm512_maskz_loadu_epi32(mask3, pw + 48) : _mm512_setzero_si512();
+
+        int32_t* buf = bbuf + (b & 1) * 256;
+        amx_decode_rows<bits, hb, 0>(p0, p1, p2, p3, buf);
+        if constexpr (b & 1)
+        {
+            _tile_loadd(6, buf, 64);
+            #define M1_OP(t) _tile_dpbsud(t, 0, 6)
+            M1_AMX_C(b, M1_OP);
+            #undef M1_OP
+        }
+        else
+        {
+            _tile_loadd(1, buf, 64);
+            #define M1_OP(t) _tile_dpbsud(t, 0, 1)
+            M1_AMX_C(b, M1_OP);
+            #undef M1_OP
+        }
+        amx_band_step<bits, hb, band, b + 1>(mat, packed_row, pf_step, tile_k, tiles_k, n0, bbuf);
+    }
+}
+
+template <int bits, bool hb, int band>
+M1_TARGET_AMX
+void amx_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int rows, int n0)
+{
+    const int tiles_k = mat.k / 16;
+    const int tiles_n = mat.n / 16;
+    constexpr int packed_size = tile_u16(bits, hb);
+    alignas(64) int32_t bbuf[2 * 256];
+    alignas(64) int32_t cbuf[band * 256];
+
+    amx_zero_c<0, band>();
+    const size_t row_stride = static_cast<size_t>(tiles_n) * packed_size;
+    const size_t pf_step = mat.swz ? static_cast<size_t>(8) * packed_size : row_stride;
+    const uint16_t* packed_row = mat.trellis + static_cast<size_t>(n0) * packed_size;
+    const size_t a_stride = static_cast<size_t>(mat.k) * sizeof(int32_t);
+    for (int tile_k = 0; tile_k < tiles_k; ++tile_k, packed_row += row_stride)
+    {
+        _tile_loadd(0, in.splat32 + tile_k * 16, a_stride);
+        amx_band_step<bits, hb, band, 0>(mat, packed_row, pf_step, tile_k, tiles_k, n0, bbuf);
+    }
+    amx_store_c<0, band>(cbuf);
+
+    // The VNNI epilogue, verbatim: C rows are its accumulators
+    for (int b = 0; b < band; ++b)
+        for (int i = 0; i < rows; ++i)
+        {
+            const __m512i acc = _mm512_load_si512(cbuf + b * 256 + i * 16);
+            const float scale = mul1_k_inv() * in.q[i];
+            const __m512 corr = _mm512_set1_ps(-510.0f * static_cast<float>(in.sum_x8[i]) * scale);
+            const __m512 out = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc), _mm512_set1_ps(scale), corr);
+            _mm512_storeu_ps(tout + static_cast<size_t>(i) * mat.n + (n0 + b) * 16, out);
+        }
+}
+
+template <int bits, bool hb>
+M1_TARGET_AMX
+void amx_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int rows, int tn0, int tn1)
+{
+    // Configured per call: the calling thread may be shared with other AMX users (oneDNN), and
+    // one ldtilecfg is noise against a GEMV's worth of tiles. Released after, so the thread's
+    // context switches go back to saving no tile data
+    amx_configure(rows);
+    int n0 = tn0;
+    while (n0 < tn1)
+    {
+        const int band = std::min(tn1 - n0, AMX_BAND);
+        switch (band)
+        {
+            case 1: amx_band<bits, hb, 1>(mat, in, tout, rows, n0); break;
+            case 2: amx_band<bits, hb, 2>(mat, in, tout, rows, n0); break;
+            case 3: amx_band<bits, hb, 3>(mat, in, tout, rows, n0); break;
+            default: amx_band<bits, hb, 4>(mat, in, tout, rows, n0); break;
+        }
+        n0 += band;
+    }
+    _tile_release();
+}
+
+void run_amx(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int rows, int tn0, int tn1)
+{
+    if (tn0 >= tn1) return;
+    if (mat.hb)
+    {
+        switch (mat.bits)
+        {
+            case 1: amx_tiles<1, true>(mat, in, tout, rows, tn0, tn1); return;
+            case 2: amx_tiles<2, true>(mat, in, tout, rows, tn0, tn1); return;
+            case 3: amx_tiles<3, true>(mat, in, tout, rows, tn0, tn1); return;
+        }
+    }
+    else
+    {
+        switch (mat.bits)
+        {
+            case 1: amx_tiles<1, false>(mat, in, tout, rows, tn0, tn1); return;
+            case 2: amx_tiles<2, false>(mat, in, tout, rows, tn0, tn1); return;
+            case 3: amx_tiles<3, false>(mat, in, tout, rows, tn0, tn1); return;
+            case 4: amx_tiles<4, false>(mat, in, tout, rows, tn0, tn1); return;
+            case 5: amx_tiles<5, false>(mat, in, tout, rows, tn0, tn1); return;
+            case 6: amx_tiles<6, false>(mat, in, tout, rows, tn0, tn1); return;
+            case 7: amx_tiles<7, false>(mat, in, tout, rows, tn0, tn1); return;
+            case 8: amx_tiles<8, false>(mat, in, tout, rows, tn0, tn1); return;
+        }
+    }
+    TORCH_CHECK(false, "moe_mul1 AMX: unsupported rate ", mat.bits, mat.hb ? ".5" : "", " bpw");
+}
+
+#endif  // M1_HAVE_AMX
 
 // -------------------------------------------------------------------------------------------
 //   AVX-512 BW banded kernel
@@ -1847,7 +2123,7 @@ Isa detect_isa()
     }
 #endif
 
-    // EXL3_MOE_CPU_MAX_ISA=scalar|avx2|bw|vnni|vbmi: cap detection at a lower tier for testing
+    // EXL3_MOE_CPU_MAX_ISA=scalar|avx2|bw|vnni|vbmi|amx: cap detection at a lower tier for testing
     // (e.g. exercising the AVX2 path on AVX512-VNNI hardware, or the dword scheme on VBMI
     // hardware). Never upgrades past what the CPU actually supports; an unrecognized value is
     // ignored.
@@ -1861,6 +2137,7 @@ Isa detect_isa()
         else if (s == "bw" || s == "avx512bw") cap = Isa::Bw;
         else if (s == "vnni" || s == "avx512") cap = Isa::Vnni;
         else if (s == "vbmi") cap = Isa::Vbmi;
+        else if (s == "amx") cap = Isa::Vbmi;    // AMX is decided by detect_amx; no cap here
         else return hw;
         if (cap < hw) hw = cap;
     }
@@ -1868,6 +2145,44 @@ Isa detect_isa()
 }
 
 const Isa g_isa = []{ return detect_isa(); }();
+
+// AMX-INT8 needs the CPU feature, the AVX-512 tiers it builds on, and Linux's per-process
+// permission for the tile data state (arch_prctl ARCH_REQ_XCOMP_PERM, kernel 5.16+; without it
+// the first tile instruction faults). EXL3_MOE_CPU_MAX_ISA set to anything but "amx" disables
+// it, so the tiers below stay testable on AMX hardware
+bool detect_amx()
+{
+#if M1_HAVE_AMX
+    if (g_isa < Isa::Vnni) return false;
+    if (const char* e = std::getenv("EXL3_MOE_CPU_MAX_ISA"))
+    {
+        std::string s(e);
+        for (char& c : s) c = (char) std::tolower((unsigned char) c);
+        if (s != "amx") return false;
+    }
+    unsigned a, b, c, d;
+    if (!__get_cpuid_count(7, 0, &a, &b, &c, &d)) return false;
+    const bool amx_tile = (d >> 24) & 1, amx_int8 = (d >> 25) & 1;
+    if (!amx_tile || !amx_int8) return false;
+    constexpr long ARCH_REQ_XCOMP_PERM = 0x1023;
+    constexpr long XFEATURE_XTILEDATA = 18;
+    return syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA) == 0;
+#else
+    return false;
+#endif
+}
+
+const bool g_amx = []{ return detect_amx(); }();
+
+// EXL3_MOE_CPU_AMX_MIN_ROWS: fewest GEMV rows a pass must have to take the AMX kernel; smaller
+// passes (decode, chunk remainders) stay on the vector kernel, MAX_M rows at a time
+const int g_amx_min_rows = []{
+    const char* e = std::getenv("EXL3_MOE_CPU_AMX_MIN_ROWS");
+    const int v = e ? std::atoi(e) : 4;
+    return std::clamp(v, 1, AMX_ROWS);
+}();
+
+const int g_chunk_m = g_amx ? AMX_ROWS : MAX_M;
 
 void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
 {
@@ -2413,8 +2728,8 @@ struct Chunk
 {
     int expert;
     int m;
-    int token[MAX_M];
-    float weight[MAX_M];
+    int token[MAX_CHUNK];
+    float weight[MAX_CHUNK];
 };
 
 struct ForwardCtx
@@ -2427,7 +2742,8 @@ struct ForwardCtx
 
     // workspace, per chunk (pointers into the persistent per-thread arena below: fresh
     // allocations per call cost more in first-touch page faults than the small phases do work)
-    float* tout_g;       // chunks x MAX_SLOTS x I (quant space, then folded and transformed in place)
+    int slots;           // GEMV rows reserved per chunk: 2 * g_chunk_m
+    float* tout_g;       // chunks x slots x I (quant space, then folded and transformed in place)
     float* tout_u;
     float* tout_d;       // chunks x m x H
     std::vector<PreparedIn> prep_g, prep_u, prep_d;
@@ -2493,21 +2809,38 @@ void transform_out(const MoeCpuMatrix& mat, float* tout, int m)
 }
 
 
-// The GEMV over every row of a chunk, MAX_M at a time
+// The GEMV over every row of a chunk: AMX_ROWS at a time while at least g_amx_min_rows remain
+// (AMX tier), otherwise MAX_M at a time
 inline void run_rows(const MoeCpuMatrix& mat, const PreparedIn& p, float* tout, int tn0, int tn1)
 {
-    run_tiles(mat, p, tout, std::min(p.rows, MAX_M), tn0, tn1);
-    if (p.rows <= MAX_M) return;
-    PreparedIn rest = p;
-    rest.tin += static_cast<size_t>(MAX_M) * mat.k;
-    rest.splat32 += static_cast<size_t>(MAX_M) * mat.k;
-    if (rest.splat_dup) rest.splat_dup += static_cast<size_t>(MAX_M) * mat.k;
-    for (int i = 0; i < MAX_M; ++i)
+    if (p.rows <= MAX_M && !(g_amx && p.rows >= g_amx_min_rows))
     {
-        rest.q[i] = p.q[MAX_M + i];
-        rest.sum_x8[i] = p.sum_x8[MAX_M + i];
+        run_tiles(mat, p, tout, p.rows, tn0, tn1);
+        return;
     }
-    run_tiles(mat, rest, tout + static_cast<size_t>(MAX_M) * mat.n, p.rows - MAX_M, tn0, tn1);
+    int r0 = 0;
+    while (r0 < p.rows)
+    {
+        const int left = p.rows - r0;
+        const bool amx = g_amx && left >= g_amx_min_rows;
+        const int take = std::min(left, amx ? AMX_ROWS : MAX_M);
+        PreparedIn part = p;
+        part.tin += static_cast<size_t>(r0) * mat.k;
+        part.splat32 += static_cast<size_t>(r0) * mat.k;
+        if (part.splat_dup) part.splat_dup += static_cast<size_t>(r0) * mat.k;
+        for (int i = 0; i < take; ++i)
+        {
+            part.q[i] = p.q[r0 + i];
+            part.sum_x8[i] = p.sum_x8[r0 + i];
+        }
+        float* out = tout + static_cast<size_t>(r0) * mat.n;
+#if M1_HAVE_AMX
+        if (amx) run_amx(mat, part, out, take, tn0, tn1);
+        else
+#endif
+        run_tiles(mat, part, out, take, tn0, tn1);
+        r0 += take;
+    }
 }
 
 // GEMV rows back to token rows, columns [c0, c1) of n: the two rows of a wide token add up
@@ -2590,7 +2923,7 @@ void forward_phase(void* vctx, int worker, int num_workers)
                 const bool up = gu == 1 || (j % gu);
                 const MoeCpuMatrix& mat = up ? L.ups[ch.expert] : L.gates[ch.expert];
                 const PreparedIn& p = (up ? c.prep_u : c.prep_g)[j / gu];
-                float* tout = (up ? c.tout_u : c.tout_g) + static_cast<size_t>(j / gu) * MAX_SLOTS * I;
+                float* tout = (up ? c.tout_u : c.tout_g) + static_cast<size_t>(j / gu) * c.slots * I;
                 run_rows(mat, p, tout, t0, t1);
             });
             break;
@@ -2603,8 +2936,8 @@ void forward_phase(void* vctx, int worker, int num_workers)
             const bool gated = !L.gates.empty();
             for (int j = worker; j < nc; j += num_workers) {
                 const Chunk& ch = c.chunks[j];
-                float* g = c.tout_g + static_cast<size_t>(j) * MAX_SLOTS * I;
-                float* u = c.tout_u + static_cast<size_t>(j) * MAX_SLOTS * I;
+                float* g = c.tout_g + static_cast<size_t>(j) * c.slots * I;
+                float* u = c.tout_u + static_cast<size_t>(j) * c.slots * I;
                 if (gated)
                 {
                     fold_rows(g, c.prep_g[j], ch.m, I, 0, I);
@@ -2659,8 +2992,8 @@ void forward_phase(void* vctx, int worker, int num_workers)
                         }
                         break;
                 }
-                static const int idx4[MAX_M] = {0, 1, 2, 3};   // (token rows, after the fold)
-                prepare_rows(L.downs[ch.expert], nullptr, a, I, idx4, ch.m, c.prep_d[j]);
+                static const int idx[MAX_CHUNK] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+                prepare_rows(L.downs[ch.expert], nullptr, a, I, idx, ch.m, c.prep_d[j]);   // (token rows, after the fold)
             }
             break;
         }
@@ -2671,7 +3004,7 @@ void forward_phase(void* vctx, int worker, int num_workers)
             assign_gemvs(worker, num_workers, nc, H / 16, [&](int j, int t0, int t1)
             {
                 const Chunk& ch = c.chunks[j];
-                float* tout = c.tout_d + static_cast<size_t>(j) * MAX_SLOTS * H;
+                float* tout = c.tout_d + static_cast<size_t>(j) * c.slots * H;
                 run_rows(L.downs[ch.expert], c.prep_d[j], tout, t0, t1);
             });
             break;
@@ -2690,14 +3023,14 @@ void forward_phase(void* vctx, int worker, int num_workers)
                 {
                     const Chunk& ch = c.chunks[j];
                     const MoeCpuMatrix& mat = L.downs[ch.expert];
-                    fold_rows(c.tout_d + static_cast<size_t>(j) * MAX_SLOTS * H, c.prep_d[j], ch.m, H,
+                    fold_rows(c.tout_d + static_cast<size_t>(j) * c.slots * H, c.prep_d[j], ch.m, H,
                               b0 * 128, b1 * 128);
                     // Normally m == 1 here; retain repeated selections of the same expert
                     // too, which the raw API groups into a multi-row chunk.
                     for (int r = 0; r < ch.m; ++r)
                         for (int block = b0 * 128; block < b1 * 128; block += 128)
                         {
-                            float* v = c.tout_d + static_cast<size_t>(j) * MAX_SLOTS * H + r * H + block;
+                            float* v = c.tout_d + static_cast<size_t>(j) * c.slots * H + r * H + block;
                             MoeCpuMatrix part = mat;
                             part.n = 128;
                             part.svh += block;
@@ -2713,7 +3046,7 @@ void forward_phase(void* vctx, int worker, int num_workers)
             // over hidden columns so overlapping token rows are race-free
             for (int j = worker; j < nc; j += num_workers) {
                 const Chunk& ch = c.chunks[j];
-                float* d = c.tout_d + static_cast<size_t>(j) * MAX_SLOTS * H;
+                float* d = c.tout_d + static_cast<size_t>(j) * c.slots * H;
                 fold_rows(d, c.prep_d[j], ch.m, H, 0, H);
                 transform_out(L.downs[ch.expert], d, ch.m);
             }
@@ -2726,7 +3059,7 @@ void forward_phase(void* vctx, int worker, int num_workers)
             const int c1 = H * (worker + 1) / num_workers;
             for (int j = 0; j < nc; ++j) {
                 const Chunk& ch = c.chunks[j];
-                const float* d = c.tout_d + static_cast<size_t>(j) * MAX_SLOTS * H;
+                const float* d = c.tout_d + static_cast<size_t>(j) * c.slots * H;
                 for (int r = 0; r < ch.m; ++r) {
                     float* dst = c.out + static_cast<size_t>(ch.token[r]) * H;
                     const float* src = d + static_cast<size_t>(r) * H;
@@ -2825,6 +3158,7 @@ bool exl3_moe_cpu_has_avx2() { return g_isa != Isa::Scalar; }
 bool exl3_moe_cpu_has_avx512_bw() { return g_isa >= Isa::Bw; }
 bool exl3_moe_cpu_has_avx512_vnni() { return g_isa >= Isa::Vnni; }
 bool exl3_moe_cpu_has_avx512_vbmi() { return g_isa == Isa::Vbmi; }
+bool exl3_moe_cpu_has_amx() { return g_amx; }
 
 // Packed-layout rules (see moe_mul1.h). Band-8 feeds the AVX-512 band kernels (bw/vnni/vbmi
 // share the structure); K8 is exempt (it routes to the dword kernel, which gains nothing);
@@ -3020,7 +3354,7 @@ void exl3_moe_cpu_forward_raw(
     ctx.m_total = m_total;
     std::memset(ctx.out, 0, static_cast<size_t>(m_total) * layer->hidden_size * sizeof(float));
 
-    // Group token assignments by expert, then split into chunks of MAX_M rows
+    // Group token assignments by expert, then split into chunks of g_chunk_m rows
     std::vector<std::vector<std::pair<int, float>>> per_expert(layer->num_experts);
     for (int t = 0; t < m_total; ++t)
         for (int j = 0; j < top_k; ++j)
@@ -3032,11 +3366,11 @@ void exl3_moe_cpu_forward_raw(
     for (int e = 0; e < layer->num_experts; ++e)
     {
         auto& lst = per_expert[e];
-        for (size_t i = 0; i < lst.size(); i += MAX_M)
+        for (size_t i = 0; i < lst.size(); i += g_chunk_m)
         {
             Chunk ch;
             ch.expert = e;
-            ch.m = static_cast<int>(std::min<size_t>(MAX_M, lst.size() - i));
+            ch.m = static_cast<int>(std::min<size_t>(g_chunk_m, lst.size() - i));
             for (int r = 0; r < ch.m; ++r)
             {
                 ch.token[r] = lst[i + r].first;
@@ -3052,19 +3386,20 @@ void exl3_moe_cpu_forward_raw(
     const int H = layer->hidden_size;
     const int I = layer->interm_size;
     ForwardArena& ar = ForwardArena::get();
+    ctx.slots = 2 * g_chunk_m;
     auto grow = [](auto& v, size_t n) { if (v.size() < n) v.resize(n); };
-    grow(ar.tin_g, static_cast<size_t>(nc) * MAX_SLOTS * H);
-    grow(ar.tin_u, static_cast<size_t>(nc) * MAX_SLOTS * H);
-    grow(ar.tin_d, static_cast<size_t>(nc) * MAX_SLOTS * I);
-    grow(ar.splat_g, static_cast<size_t>(nc) * MAX_SLOTS * H);
-    grow(ar.splat_u, static_cast<size_t>(nc) * MAX_SLOTS * H);
-    grow(ar.splat_d, static_cast<size_t>(nc) * MAX_SLOTS * I);
-    grow(ar.splat_dup_g, static_cast<size_t>(nc) * MAX_SLOTS * H);
-    grow(ar.splat_dup_u, static_cast<size_t>(nc) * MAX_SLOTS * H);
-    grow(ar.splat_dup_d, static_cast<size_t>(nc) * MAX_SLOTS * I);
-    grow(ar.tout_g, static_cast<size_t>(nc) * MAX_SLOTS * I);
-    grow(ar.tout_u, static_cast<size_t>(nc) * MAX_SLOTS * I);
-    grow(ar.tout_d, static_cast<size_t>(nc) * MAX_SLOTS * H);
+    grow(ar.tin_g, static_cast<size_t>(nc) * ctx.slots * H);
+    grow(ar.tin_u, static_cast<size_t>(nc) * ctx.slots * H);
+    grow(ar.tin_d, static_cast<size_t>(nc) * ctx.slots * I);
+    grow(ar.splat_g, static_cast<size_t>(nc) * ctx.slots * H);
+    grow(ar.splat_u, static_cast<size_t>(nc) * ctx.slots * H);
+    grow(ar.splat_d, static_cast<size_t>(nc) * ctx.slots * I);
+    grow(ar.splat_dup_g, static_cast<size_t>(nc) * ctx.slots * H);
+    grow(ar.splat_dup_u, static_cast<size_t>(nc) * ctx.slots * H);
+    grow(ar.splat_dup_d, static_cast<size_t>(nc) * ctx.slots * I);
+    grow(ar.tout_g, static_cast<size_t>(nc) * ctx.slots * I);
+    grow(ar.tout_u, static_cast<size_t>(nc) * ctx.slots * I);
+    grow(ar.tout_d, static_cast<size_t>(nc) * ctx.slots * H);
     grow(ar.prep_g, nc); grow(ar.prep_u, nc); grow(ar.prep_d, nc);
     ctx.tout_g = ar.tout_g.data();
     ctx.tout_u = ar.tout_u.data();
@@ -3072,15 +3407,15 @@ void exl3_moe_cpu_forward_raw(
     ctx.prep_g = ar.prep_g; ctx.prep_u = ar.prep_u; ctx.prep_d = ar.prep_d;
     for (int j = 0; j < nc; ++j)
     {
-        ctx.prep_g[j] = { ar.tin_g.data() + static_cast<size_t>(j) * MAX_SLOTS * H,
-                          ar.splat_g.data() + static_cast<size_t>(j) * MAX_SLOTS * H,
-                          ar.splat_dup_g.data() + static_cast<size_t>(j) * MAX_SLOTS * H, {}, {} };
-        ctx.prep_u[j] = { ar.tin_u.data() + static_cast<size_t>(j) * MAX_SLOTS * H,
-                          ar.splat_u.data() + static_cast<size_t>(j) * MAX_SLOTS * H,
-                          ar.splat_dup_u.data() + static_cast<size_t>(j) * MAX_SLOTS * H, {}, {} };
-        ctx.prep_d[j] = { ar.tin_d.data() + static_cast<size_t>(j) * MAX_SLOTS * I,
-                          ar.splat_d.data() + static_cast<size_t>(j) * MAX_SLOTS * I,
-                          ar.splat_dup_d.data() + static_cast<size_t>(j) * MAX_SLOTS * I, {}, {} };
+        ctx.prep_g[j] = { ar.tin_g.data() + static_cast<size_t>(j) * ctx.slots * H,
+                          ar.splat_g.data() + static_cast<size_t>(j) * ctx.slots * H,
+                          ar.splat_dup_g.data() + static_cast<size_t>(j) * ctx.slots * H, {}, {} };
+        ctx.prep_u[j] = { ar.tin_u.data() + static_cast<size_t>(j) * ctx.slots * H,
+                          ar.splat_u.data() + static_cast<size_t>(j) * ctx.slots * H,
+                          ar.splat_dup_u.data() + static_cast<size_t>(j) * ctx.slots * H, {}, {} };
+        ctx.prep_d[j] = { ar.tin_d.data() + static_cast<size_t>(j) * ctx.slots * I,
+                          ar.splat_d.data() + static_cast<size_t>(j) * ctx.slots * I,
+                          ar.splat_dup_d.data() + static_cast<size_t>(j) * ctx.slots * I, {}, {} };
     }
 
     std::lock_guard<std::mutex> lock(g_pool_mutex);
@@ -3201,6 +3536,7 @@ bool exl3_moe_cpu_has_avx2() { return false; }
 bool exl3_moe_cpu_has_avx512_bw() { return false; }
 bool exl3_moe_cpu_has_avx512_vnni() { return false; }
 bool exl3_moe_cpu_has_avx512_vbmi() { return false; }
+bool exl3_moe_cpu_has_amx() { return false; }
 int exl3_moe_cpu_swizzle_group(double) { return 0; }
 int exl3_moe_cpu_planar_layout(double) { return 0; }
 int64_t exl3_moe_cpu_make_layer(

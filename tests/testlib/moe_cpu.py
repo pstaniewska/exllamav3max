@@ -6,7 +6,7 @@ which is read once per process. Comparing tiers therefore means one child proces
 
     outs = run_per_tier(worker, *args)           # {tier: worker(*args) as run under that cap}
 
-Every tier this CPU can run is covered ("scalar" always; the int8 tiers "avx2", "bw", "vnni", "vbmi" when the
+Every tier this CPU can run is covered ("scalar" always; the int8 tiers "avx2", "bw", "vnni", "vbmi", "amx" when the
 CPU has them), and each child's tier is checked against the cap it ran under. `worker` follows the rules of
 testlib.isolated.run_isolated (module-level function, picklable arguments, torch.save-able result).
 
@@ -29,13 +29,14 @@ import torch
 from testlib.isolated import run_isolated
 from testlib.moe import repack_trellis
 
-INT8_TIERS = ("avx2", "bw", "vnni", "vbmi")
+INT8_TIERS = ("avx2", "bw", "vnni", "vbmi", "amx")
 TIERS = ("scalar",) + INT8_TIERS
 
 
 def active_tier() -> str:
     """The tier the kernels run at in this process"""
     from exllamav3.ext import exllamav3_ext as ext
+    if ext.exl3_moe_cpu_has_amx(): return "amx"
     if ext.exl3_moe_cpu_has_avx512_vbmi(): return "vbmi"
     if ext.exl3_moe_cpu_has_avx512_vnni(): return "vnni"
     if ext.exl3_moe_cpu_has_avx512_bw(): return "bw"

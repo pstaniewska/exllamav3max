@@ -131,13 +131,17 @@ the memory actually available (`cudaMemGetInfo` free plus the caching allocator'
 reserved-but-unallocated pool) minus a floor. The floor is the larger of:
 
 - `EXL3_EXPERT_CACHE_RESERVE_MB`;
-- the largest known transient plus `EXL3_EXPERT_CACHE_MIN_FREE_MB`. The transient comes from three
+- the largest known transient plus `EXL3_EXPERT_CACHE_MIN_FREE_MB`. The transient comes from four
   places:
   - every autosplit load of any component on the device (main model, MTP head, vision tower,
     draft model), plus `EXL3_AUTOSPLIT_MARGIN_MB`. These are max-merged per device, so a later
     component never lowers them, whichever loading API it used. They are cleared when the device's
     last hybrid layer unloads, so a smaller model loaded next is measured afresh.
   - transients noted on the owner;
+  - the quantized KV cache's prefill staging scratch (fp16 K and V of the whole cache pool, plus
+    `EXL3_AUTOSPLIT_MARGIN_MB`), noted at each load's first forward. Autosplit loads already measure
+    it; loads with an explicit `--gpu_split` would otherwise keep only the fixed reserve free for a
+    scratch that every long prefill chunk allocates at full size;
   - the largest prefill MoE bound seen so far.
 
 `EXL3_EXPERT_CACHE_LIMIT_GB` caps the size. Nothing is hard-coded to a card size.
@@ -337,7 +341,8 @@ the end of each slot before publishing `done`.
 
 ## Prefill
 
-Calls of at least `EXL3_MOE_STREAM_MIN_ROWS` rows mark hits only. A non-resident expert with a
+Calls wider than the decode boundary (`EXL3_EXPERT_DECODE_MAX_ROWS`, default and maximum the CPU
+slot capacity `EXL3_MOE_CPU_SLOT_ROWS`) take the prefill path and mark hits only. A non-resident expert with a
 GPU-readable home runs zero-copy when it has at least `EXL3_EXPERT_PREFILL_GPU_MIN` rows in the
 chunk; otherwise it goes to its node's CPU lane. `gpu_exact` sends every readable expert to the GPU.
 
@@ -360,9 +365,16 @@ The GPU tiers are the upstream ones with two changes:
 ## Speculative decoding
 
 Verify forwards from MTP heads, draft models, DFlash2 and n-gram drafting are forwards with
-`jobs × (1 + window)` rows. They take the decode path (fewer rows than the streaming threshold, up
-to `EXL3_MOE_CPU_SLOT_ROWS`) or the prefill path. Nothing in the dispatcher, cache or workers
-assumes one row.
+`jobs × (1 + window)` rows. They take the decode path up to `EXL3_EXPERT_DECODE_MAX_ROWS` rows
+(default `EXL3_MOE_CPU_SLOT_ROWS`, 64) and the prefill path above it. Nothing in the dispatcher,
+cache or workers assumes one row.
+
+The boundary sits at the slot capacity rather than at `EXL3_MOE_STREAM_MIN_ROWS` (32) so that
+hybrid suffix-match drafting (`-hdt`), whose rounds verify `jobs × (1 + hybrid_draft_tokens)` rows,
+and batched speculative decoding keep the decode lane policy (measured cost model, no host sync per
+layer) instead of the prefill rule that sends every non-resident expert with fewer than
+`EXL3_EXPERT_PREFILL_GPU_MIN` rows to a CPU lane. Set `EXL3_EXPERT_DECODE_MAX_ROWS=31` for the former
+boundary.
 
 Each component (main, `mtp`, a draft model) gets its own dispatcher and worker group, and they
 share each device's cache owner. DFlash2's drafter has no MoE. Drafters and acceptance rules are
@@ -394,6 +406,7 @@ classic paths, `EXL3_NUMA_ENABLE=1`) is set.
 | `EXL3_EXPERT_CACHE_DEBUG` | `0` | print growth / shrink / warm start |
 | `EXL3_EXPERT_HOME` | `native_copy` | `native_copy` or `worker_arena` |
 | `EXL3_EXPERT_HOME_PIN_LIMIT_GB` | unset | registered-bytes cap for homes |
+| `EXL3_EXPERT_DECODE_MAX_ROWS` | slot rows (`64`) | widest call on the decode path; wider calls take the prefill path |
 | `EXL3_EXPERT_PREFILL_GPU_MIN` | `8` | prefill rows for a non-resident expert to go zero-copy |
 | `EXL3_MOE_ZC_MAX` | `auto` | GPU quota of misses per decode call |
 | `EXL3_MOE_ZC_CPU_FRAC_INIT` | `0.5` | CPU share of flexible misses until the cost model is measured |
@@ -491,7 +504,7 @@ most 512 pairs are pending; further calls are counted as unsampled.
 | Device-side wait on a mapped flag, no host sync per layer | glm53-flash-offload and upstream ExLlamaV3 | MIT | Upstream's memop handoff, unchanged. |
 | Per-NUMA worker pools, thread pinning inside the node, node-bound memory via first touch | KTransformers kt-kernel `cpu_backend/worker_pool.*` (KVCache.AI) | Apache-2.0 | One existing ExLlamaV3 worker process per node. No code copied. |
 | Expert sharding across NUMA nodes | KTransformers `operators/moe-tp.hpp` (splits the intermediate dim) | Apache-2.0 | Whole experts are sharded instead. EXL3 tiles and 128-point Hadamard blocks make an intermediate split invasive. |
-| AMX int8/int4 MoE kernels | KTransformers `operators/amx/*` | Apache-2.0 | Not ported (see Limitations). |
+| AMX int8/int4 MoE kernels | KTransformers `operators/amx/*` | Apache-2.0 | Not ported. An exact AMX tier over the EXL3 trellis was written instead (see Limitations). |
 | Worker job ring, pinned arena, CPU kernels, prefill tiers, pointer tables | ExLlamaV3 | MIT | Reused unchanged except as listed in [Changed files](#changed-files). |
 
 No source file was copied from either reference project. Everything above was written for this
@@ -523,31 +536,25 @@ codebase from the documented mechanisms.
   3.05 bpw), and `replicate` adds N × arena.
 - **Eligibility.** Layers with per-expert biases, padded widths, fused expert tensors, latent MoE
   or tensor parallelism stay on the regular path.
-- **AMX not implemented (Stage 2).** Stage 2 was deferred so it could not delay the cache,
-  zero-copy, NUMA and dispatcher work. No AMX code or switch is included, and `EXL3_KT_AMX_ENABLE`
-  does not exist yet. The analysis so far:
-  - **Formats.** KTransformers' AMX kernels consume its own requantized int8/int4 layouts (per-row
-    scales, VNNI-packed B tiles); they cannot read EXL3 trellis tensors. Using them would mean
-    re-quantizing the model, which changes numerics and costs about 1 byte per weight of extra RAM.
-    That option was rejected.
-  - **Exact tier.** The existing VNNI kernel computes `bytesum(state * 0x83DCD12D) * x8` as
-    `vpdpbusd`: the four product bytes are the unsigned operand, the int8 activation replicated ×4
-    the signed one. `TDPBUSD` computes the same u8 × s8 dot products into int32 without
-    saturation. A tier could therefore decode one 16×16 trellis tile into a 16-row × 64-byte A tile
-    of product bytes, use the int8 activations of up to 16 token rows as the B tile, and accumulate
-    the same exact integer sums. With the shared fp32 epilogue it would then match the VNNI tier
-    bit for bit.
-  - **Conditions for that claim**, which must be shown, not assumed:
-    - no i32 overflow, with the existing bound of k ≤ 8192;
-    - identical activation quantization, including wide rows (one row becomes two int8 rows);
-    - the identical epilogue order.
-
-    The AVX2/BW tiers emulate the byte-sum with saturating `vpmaddubsw` in a form documented as
-    exact, so they are equal too.
-  - **Value is low in this dispatch design.** AMX only pays at many token rows per expert. The
-    hybrid dispatcher sends experts with at least `EXL3_EXPERT_PREFILL_GPU_MIN` rows to the GPU
-    and keeps the CPU lanes for cold, few-row experts. A future AMX tier needs AMX hardware to
-    validate against an emulated `TDPBUSD`.
+- **AMX tier: exact, CPU-validated, not run on the target host.** On CPUs with AMX-INT8 (Sapphire
+  Rapids and later; Linux 5.16+ for the tile-state permission) the CPU expert kernel adds an AMX
+  pass to the `vnni`/`vbmi` tier (`amx_tiles` in `cpu/moe_mul1.cpp`):
+  - **Exact.** `TDPBSUD` with the activations as A (signed; `splat32` is already 16 k-rows of x8
+    replicated ×4 per GEMV row) and the 16 decoded product rows of one trellis tile as B
+    (unsigned) gives C[row][n] = the VNNI accumulator. The fp32 epilogue is shared, so outputs are
+    bit-identical to the vector tier at every rate, layout, chunk size and thread count
+    (`tests/moe_cpu/test_amx.py`, wide rows included).
+  - **Where it pays.** Each weight tile is decoded once per 16 GEMV rows instead of once per 4, so
+    the tier takes chunks of up to 16 tokens per expert and uses the tile kernel for passes of at
+    least `EXL3_MOE_CPU_AMX_MIN_ROWS` (default 4) rows. Decode (one row per expert) is unchanged.
+    On a 4-vCPU Sapphire Rapids VM, GLM-5.3-Flash-sized experts (4096 → 2048, 8 experts × 64
+    tokens, 4 threads) ran 3.4–4.8× faster per token than the `vbmi` tier at K2–K4.
+  - **Dispatch.** Prefill still sends non-resident experts with at least
+    `EXL3_EXPERT_PREFILL_GPU_MIN` rows to zero-copy reads, so the CPU lanes see few-row experts
+    unless that threshold is raised. Choosing the lane per expert from measured costs in prefill,
+    as decode does, is the follow-up.
+  - **Not used:** KTransformers' AMX kernels, which consume their own requantized int8/int4
+    layouts and cannot read EXL3 trellis tensors.
 - **Audit notes (upstream, unchanged here).**
   - The docstring of `_split_sweep_layer` says demotion is a map update, but it re-reads the
     checkpoint.
