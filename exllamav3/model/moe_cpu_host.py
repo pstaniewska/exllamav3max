@@ -1369,6 +1369,8 @@ class MoeCpuHost:
                ("avx512-vnni" if ext.exl3_moe_cpu_has_avx512_vnni() else \
                ("avx512-bw" if ext.exl3_moe_cpu_has_avx512_bw() else \
                ("avx2" if ext.exl3_moe_cpu_has_avx2() else "scalar")))
+        if ext.exl3_moe_cpu_has_amx():
+            kern += " + amx"
         where = f", node {self.numa['node']}" if self.numa.get("node") is not None else ""
         print(f" -- CPU MoE worker started: {len(self.specs)} layers, {kern}, {self.threads} threads{where}")
         # The worker was spawned before this and pins its own threads; keep the host off them.

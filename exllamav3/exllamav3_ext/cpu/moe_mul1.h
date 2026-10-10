@@ -130,6 +130,7 @@ bool exl3_moe_cpu_has_avx2();
 bool exl3_moe_cpu_has_avx512_bw();
 bool exl3_moe_cpu_has_avx512_vnni();
 bool exl3_moe_cpu_has_avx512_vbmi();
+bool exl3_moe_cpu_has_amx();
 
 // Packed-layout rules for one trellis rate K (possibly half-integer) under the runtime ISA
 // tier. swizzle_group: 0 = native tile order, 8 = band-8 (AVX-512 banded kernels, K8 excepted),

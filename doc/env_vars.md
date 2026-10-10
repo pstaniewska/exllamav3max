@@ -439,7 +439,7 @@ only a small amount of shared-memory overprovisioning, not runtime.
 ### `EXL3_MOE_CPU_MAX_ISA` (default: unset, auto-detect)
 
 Caps the CPU kernel's runtime ISA detection at `scalar`, `avx2`, `bw`/`avx512bw`,
-`vnni`/`avx512`, or `vbmi`, for testing a lower-tier kernel path on hardware that supports
+`vnni`/`avx512`, `vbmi`, or `amx`, for testing a lower-tier kernel path on hardware that supports
 better. The `bw` tier covers AVX-512F/BW/VL hardware without VNNI (Skylake-SP/X: 1st-gen Xeon
 Scalable, Core-X), which previously fell through to `avx2`: the `vnni` dword kernel with the
 AVX2 tier's vpmaddubsw/vpmaddwd accumulate, ~1.5x the `avx2` tier's cold-expert decode
@@ -449,7 +449,16 @@ without VBMI and stay on the `vnni` tier) is 15-70% faster than the dword scheme
 bitrate. Never upgrades past what the CPU actually supports; unrecognized values are ignored.
 Read once per process (parent and worker independently), so it must be set before either is
 started. Note that capping below `bw` also disables the swizzled weight layout (see
-`EXL3_MOE_CPU_SWIZZLE`).
+`EXL3_MOE_CPU_SWIZZLE`). Any value other than `amx` also disables the AMX tier (see
+`EXL3_MOE_CPU_AMX_MIN_ROWS`).
+
+### `EXL3_MOE_CPU_AMX_MIN_ROWS` (default: `4`)
+
+On CPUs with AMX-INT8 (Sapphire Rapids and later, Linux 5.16+), the CPU expert kernel groups up
+to 16 tokens per expert and runs passes of at least this many GEMV rows (1-16) as AMX tile
+products, which decode each weight tile once for the whole pass. Smaller passes, including
+single-token decode, stay on the AVX-512 kernel four rows at a time. Outputs are bit-identical
+either way; this only moves the crossover. Read once per process.
 
 ### `EXL3_MOE_CPU_WIDE` (default: `1`)
 

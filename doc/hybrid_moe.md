@@ -504,7 +504,7 @@ most 512 pairs are pending; further calls are counted as unsampled.
 | Device-side wait on a mapped flag, no host sync per layer | glm53-flash-offload and upstream ExLlamaV3 | MIT | Upstream's memop handoff, unchanged. |
 | Per-NUMA worker pools, thread pinning inside the node, node-bound memory via first touch | KTransformers kt-kernel `cpu_backend/worker_pool.*` (KVCache.AI) | Apache-2.0 | One existing ExLlamaV3 worker process per node. No code copied. |
 | Expert sharding across NUMA nodes | KTransformers `operators/moe-tp.hpp` (splits the intermediate dim) | Apache-2.0 | Whole experts are sharded instead. EXL3 tiles and 128-point Hadamard blocks make an intermediate split invasive. |
-| AMX int8/int4 MoE kernels | KTransformers `operators/amx/*` | Apache-2.0 | Not ported (see Limitations). |
+| AMX int8/int4 MoE kernels | KTransformers `operators/amx/*` | Apache-2.0 | Not ported. An exact AMX tier over the EXL3 trellis was written instead (see Limitations). |
 | Worker job ring, pinned arena, CPU kernels, prefill tiers, pointer tables | ExLlamaV3 | MIT | Reused unchanged except as listed in [Changed files](#changed-files). |
 
 No source file was copied from either reference project. Everything above was written for this
@@ -536,31 +536,25 @@ codebase from the documented mechanisms.
   3.05 bpw), and `replicate` adds N × arena.
 - **Eligibility.** Layers with per-expert biases, padded widths, fused expert tensors, latent MoE
   or tensor parallelism stay on the regular path.
-- **AMX not implemented (Stage 2).** Stage 2 was deferred so it could not delay the cache,
-  zero-copy, NUMA and dispatcher work. No AMX code or switch is included, and `EXL3_KT_AMX_ENABLE`
-  does not exist yet. The analysis so far:
-  - **Formats.** KTransformers' AMX kernels consume its own requantized int8/int4 layouts (per-row
-    scales, VNNI-packed B tiles); they cannot read EXL3 trellis tensors. Using them would mean
-    re-quantizing the model, which changes numerics and costs about 1 byte per weight of extra RAM.
-    That option was rejected.
-  - **Exact tier.** The existing VNNI kernel computes `bytesum(state * 0x83DCD12D) * x8` as
-    `vpdpbusd`: the four product bytes are the unsigned operand, the int8 activation replicated ×4
-    the signed one. `TDPBUSD` computes the same u8 × s8 dot products into int32 without
-    saturation. A tier could therefore decode one 16×16 trellis tile into a 16-row × 64-byte A tile
-    of product bytes, use the int8 activations of up to 16 token rows as the B tile, and accumulate
-    the same exact integer sums. With the shared fp32 epilogue it would then match the VNNI tier
-    bit for bit.
-  - **Conditions for that claim**, which must be shown, not assumed:
-    - no i32 overflow, with the existing bound of k ≤ 8192;
-    - identical activation quantization, including wide rows (one row becomes two int8 rows);
-    - the identical epilogue order.
-
-    The AVX2/BW tiers emulate the byte-sum with saturating `vpmaddubsw` in a form documented as
-    exact, so they are equal too.
-  - **Value is low in this dispatch design.** AMX only pays at many token rows per expert. The
-    hybrid dispatcher sends experts with at least `EXL3_EXPERT_PREFILL_GPU_MIN` rows to the GPU
-    and keeps the CPU lanes for cold, few-row experts. A future AMX tier needs AMX hardware to
-    validate against an emulated `TDPBUSD`.
+- **AMX tier: exact, CPU-validated, not run on the target host.** On CPUs with AMX-INT8 (Sapphire
+  Rapids and later; Linux 5.16+ for the tile-state permission) the CPU expert kernel adds an AMX
+  pass to the `vnni`/`vbmi` tier (`amx_tiles` in `cpu/moe_mul1.cpp`):
+  - **Exact.** `TDPBSUD` with the activations as A (signed; `splat32` is already 16 k-rows of x8
+    replicated ×4 per GEMV row) and the 16 decoded product rows of one trellis tile as B
+    (unsigned) gives C[row][n] = the VNNI accumulator. The fp32 epilogue is shared, so outputs are
+    bit-identical to the vector tier at every rate, layout, chunk size and thread count
+    (`tests/moe_cpu/test_amx.py`, wide rows included).
+  - **Where it pays.** Each weight tile is decoded once per 16 GEMV rows instead of once per 4, so
+    the tier takes chunks of up to 16 tokens per expert and uses the tile kernel for passes of at
+    least `EXL3_MOE_CPU_AMX_MIN_ROWS` (default 4) rows. Decode (one row per expert) is unchanged.
+    On a 4-vCPU Sapphire Rapids VM, GLM-5.3-Flash-sized experts (4096 → 2048, 8 experts × 64
+    tokens, 4 threads) ran 3.4–4.8× faster per token than the `vbmi` tier at K2–K4.
+  - **Dispatch.** Prefill still sends non-resident experts with at least
+    `EXL3_EXPERT_PREFILL_GPU_MIN` rows to zero-copy reads, so the CPU lanes see few-row experts
+    unless that threshold is raised. Choosing the lane per expert from measured costs in prefill,
+    as decode does, is the follow-up.
+  - **Not used:** KTransformers' AMX kernels, which consume their own requantized int8/int4
+    layouts and cannot read EXL3 trellis tensors.
 - **Audit notes (upstream, unchanged here).**
   - The docstring of `_split_sweep_layer` says demotion is a map update, but it re-reads the
     checkpoint.

@@ -217,6 +217,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe_cpu_has_avx512_bw", &exl3_moe_cpu_has_avx512_bw, "exl3_moe_cpu_has_avx512_bw");
     m.def("exl3_moe_cpu_has_avx512_vnni", &exl3_moe_cpu_has_avx512_vnni, "exl3_moe_cpu_has_avx512_vnni");
     m.def("exl3_moe_cpu_has_avx512_vbmi", &exl3_moe_cpu_has_avx512_vbmi, "exl3_moe_cpu_has_avx512_vbmi");
+    m.def("exl3_moe_cpu_has_amx", &exl3_moe_cpu_has_amx, "exl3_moe_cpu_has_amx");
     m.def("exl3_moe_cpu_swizzle_group", &exl3_moe_cpu_swizzle_group, "exl3_moe_cpu_swizzle_group");
     m.def("exl3_moe_cpu_planar_layout", &exl3_moe_cpu_planar_layout, "exl3_moe_cpu_planar_layout");
     m.def("exl3_mgemm", &exl3_mgemm, "exl3_mgemm",
