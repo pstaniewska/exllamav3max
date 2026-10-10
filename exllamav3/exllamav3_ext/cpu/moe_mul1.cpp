@@ -2147,9 +2147,16 @@ inline CoreOrder physical_core_order()
     std::vector<int> order;
     std::map<std::pair<int, int>, int> seen;
     std::vector<int> smt_siblings;
-    const int ncpu = static_cast<int>(std::thread::hardware_concurrency());
+    // Only the logical CPUs this process may run on: a worker spawned for one NUMA node (or
+    // inside a cpuset-restricted container) is confined to a subset, and pinning a thread to a
+    // CPU outside the mask fails. With an unrestricted mask this is every online CPU, as before
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    const bool have_mask = sched_getaffinity(0, sizeof(allowed), &allowed) == 0;
+    const int ncpu = have_mask ? CPU_SETSIZE : static_cast<int>(std::thread::hardware_concurrency());
     for (int cpu = 0; cpu < ncpu; ++cpu)
     {
+        if (have_mask && !CPU_ISSET(cpu, &allowed)) continue;
         auto read_int = [&](const char* file) -> int {
             std::ifstream f("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/" + file);
             int v = -1;

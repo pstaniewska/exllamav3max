@@ -584,6 +584,13 @@ class Model(Model_TPMixin, Model_LSMixin):
             # shares the config but loads after the main model's worker has already started)
             self.config.infer_params.moe_cpu_component = getattr(self, "component", "text")
 
+            # Hybrid MoE: cached experts are copies (the host homes keep the data), so every
+            # device's expert cache gives its chunks back before another component loads; the
+            # load then sees the device as it would without the cache, and the cache regrows
+            # into what is left at the next forward pass
+            from .moe_hybrid_dispatch import release_all_caches
+            release_all_caches()
+
             assert not (bool(reserve_per_device) and bool(use_per_device)), \
                 "Cannot specify both memory usage and memory reserve."
 
@@ -738,6 +745,13 @@ class Model(Model_TPMixin, Model_LSMixin):
         # idempotent, so already-running workers of other components are unaffected
         for host in getattr(self.config, "moe_cpu_hosts", {}).values():
             host.ensure_started()
+        # Per-node workers of classic -mcl / -mcs (EXL3_NUMA_ENABLE): host placement once started
+        for group in getattr(self.config, "moe_numa_groups", {}).values():
+            group.after_start()
+        # Hybrid MoE: homes mapped, layers handed to the device expert caches (sized lazily at
+        # the first forward, after every component and cache has been allocated)
+        from .moe_hybrid_dispatch import finalize_all
+        finalize_all(self.config)
 
 
     def get_layout_tree(self, pre_indent: int) -> str:

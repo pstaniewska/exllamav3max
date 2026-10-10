@@ -88,7 +88,7 @@ struct MoeJob
 #define MOE_CTRL_JOBS_OFFSET 384
 #define MOE_SLOT_FLAGS_OFFSET (MOE_CTRL_JOBS_OFFSET + MOE_JOB_RING * sizeof(MoeJob))
 
-// Flag order: data_ready[MAX_SLOTS], done[MAX_SLOTS], stage_done[MAX_WSLOTS],
+// Flag order: data_ready[MAX_SLOTS], done[MAX_SLOTS], consumed[MAX_SLOTS], stage_done[MAX_WSLOTS],
 // pinned_free[MAX_WSLOTS], each entry 64-byte strided
 #define MOE_FLAGS_SIZE (3 * 64 * MOE_MAX_SLOTS + 2 * 64 * MOE_MAX_WSLOTS)
 
@@ -124,5 +124,22 @@ void exl3_moe_cpu_worker_run
     int64_t num_wslots,
     int64_t wslot_size,
     int64_t threads,
-    int64_t stage_threads
+    int64_t stage_threads,
+    int64_t telemetry_offset = -1  // >= 0: byte offset inside each compute slot where the worker
+                                   // publishes per-job telemetry (MoeJobTelemetry, 64 bytes the
+                                   // parent reserves at the end of the slot); -1: off (default)
 );
+
+// Per-job telemetry (opt-in, see telemetry_offset): written after the output and before the
+// done flag is published, so a reader that observes done >= seq sees the matching record. The
+// hybrid dispatcher's adaptive node policy reads it to estimate each worker node's cost per
+// assignment from measured compute times, instead of assumed latencies
+struct MoeJobTelemetry
+{
+    uint32_t seq;           // low half of the job's sequence number
+    uint32_t compute_us;    // wall time of exl3_moe_cpu_forward_raw (0 for a skipped job)
+    uint32_t assignments;   // (token, expert) pairs computed
+    uint32_t rows;
+    uint32_t experts;       // distinct experts computed
+    uint32_t pad[11];
+};

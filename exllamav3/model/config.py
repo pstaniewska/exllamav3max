@@ -47,6 +47,11 @@ class InferParams:
         # CPU GEMMs overlap each layer's own GPU expert compute. Mutually exclusive with
         # moe_cpu_offload. Layer-split mode only; requires mul1-codebook experts
         self.moe_cpu_split = int(os.environ.get("EXL3_MOE_CPU_SPLIT", 0))
+        # Hybrid MoE (model/moe_hybrid_dispatch.py): every eligible MoE layer's experts held by
+        # CPU workers (one per NUMA node with EXL3_NUMA_ENABLE), computed through one shared GPU
+        # expert cache per device, zero-copy reads of the pinned host homes, or CPU lanes.
+        # Mutually exclusive with moe_cpu_offload / moe_cpu_split
+        self.moe_hybrid = os.environ.get("EXL3_HYBRID_MOE", "0") not in ("", "0")
         self.moe_cpu_component = "text"
         # Worker thread count per component; None defers to EXL3_MOE_CPU_THREADS, then MoeCpuTuning
         # (see moe_cpu_host.MoeCpuTuning)

@@ -104,6 +104,7 @@ class BlockSparseMLP_CPU:
         self.cpu_offload = False
         self.cpu_split_first = None   # split offload: first CPU-resident (tail) expert index
         self._split_map = None        # dynamic placement: router id -> physical slot
+        self.hybrid = None            # hybrid MoE layer state (model/moe_hybrid_dispatch.py)
 
     def cpu_maybe_offload_load(self, device, **kwargs) -> bool:
         """Whole-layer offload claim: when the budget allows and the layer is eligible,
@@ -130,6 +131,22 @@ class BlockSparseMLP_CPU:
                 return True
 
         return False
+
+    def cpu_maybe_hybrid_load(self, device, **kwargs) -> bool:
+        """Hybrid MoE claim (EXL3_HYBRID_MOE / -mh): the layer's experts live with the CPU
+        workers and are computed through the shared GPU expert cache, zero-copy host reads or
+        CPU lanes (model/moe_hybrid_dispatch.py). Returns True when claimed; ineligible layers
+        load normally"""
+        if device is None or torch.device(device).type != "cuda":
+            return False
+        from ..model.moe_hybrid_dispatch import HybridDispatcher
+        d = HybridDispatcher.for_module(self, device)
+        if d is None:
+            return False
+        ip = self.config.infer_params
+        assert not getattr(ip, "moe_cpu_split", 0) and not getattr(ip, "moe_cpu_offload", 0), \
+            "hybrid MoE (-mh / EXL3_HYBRID_MOE) is mutually exclusive with --moe_cpu_offload / --moe_cpu_split"
+        return d.load_module(self, device, **kwargs)
 
     def cpu_maybe_split_load(self, device, **kwargs):
         """Per-layer expert split registration (EXL3_MOE_CPU_SPLIT = tail experts per layer
@@ -411,7 +428,11 @@ class BlockSparseMLP_CPU:
         if hosts is None:
             hosts = {}
             self.config.moe_cpu_hosts = hosts
-        host = hosts.get(comp)
+        # EXL3_NUMA_ENABLE: whole layers round-robin over per-node workers (moe_numa_hosts.py)
+        from ..model.moe_numa_hosts import legacy_host_for_layer
+        host = legacy_host_for_layer(self.config, comp, device, self.key)
+        if host is None:
+            host = hosts.get(comp)
         if host is None:
             host = MoeCpuHost(self.config)
             hosts[comp] = host
@@ -541,7 +562,11 @@ class BlockSparseMLP_CPU:
         if hosts is None:
             hosts = {}
             self.config.moe_cpu_hosts = hosts
-        host = hosts.get(comp)
+        # EXL3_NUMA_ENABLE: whole layers round-robin over per-node workers (moe_numa_hosts.py)
+        from ..model.moe_numa_hosts import legacy_host_for_layer
+        host = legacy_host_for_layer(self.config, comp, device, self.key)
+        if host is None:
+            host = hosts.get(comp)
         if host is None:
             host = MoeCpuHost(self.config)
             hosts[comp] = host
