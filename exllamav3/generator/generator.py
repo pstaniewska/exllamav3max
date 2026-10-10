@@ -625,6 +625,9 @@ class Generator:
         # numerics) and must never land mid-stream
         from ..modules.block_sparse_mlp_cpu import run_pending_swap_sweeps
         run_pending_swap_sweeps(self.model.config.infer_params)
+        # Hybrid MoE expert caches: decay pick history, check lanes, regrow toward the budget
+        from ..model.moe_hybrid_dispatch import idle_all
+        idle_all()
         malloc_trim()
 
 

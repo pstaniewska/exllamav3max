@@ -608,6 +608,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         mine, maxe = self.routing_first, self.routing_last
         if mine is None or maxe - mine == self.num_experts:
             mine, maxe = -1, -1
+        # Hybrid MoE: CPU-lane picks reach the GPU kernels as id num_experts, which the range
+        # test must drop
+        if self.hybrid is not None:
+            mine, maxe = 0, self.num_experts
 
         # Routed sum of the fused decode path, one exact-width row per token (the kernel trims the
         # padded down width on the way out)
@@ -661,6 +665,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             else:
                 g_trellis_ptr, g_suh_ptr, g_svh_ptr = u_trellis_ptr, u_suh_ptr, u_svh_ptr
             gu_trellis_ptr = torch.stack((g_trellis_ptr, u_trellis_ptr), dim = 0).T.contiguous().to(self.device)
+            # Kept for the hybrid expert cache, which owns every per-expert trellis row
+            self._gu_trellis_ptr = gu_trellis_ptr
             gu_suh_ptr = torch.stack((g_suh_ptr, u_suh_ptr), dim = 0).T.contiguous().to(self.device)
             gu_svh_ptr = torch.stack((g_svh_ptr, u_svh_ptr), dim = 0).T.contiguous().to(self.device)
 
@@ -798,8 +804,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # GPU load entirely; a split registration shrinks the module to its GPU slice first
         if self.cpu_maybe_offload_load(device, **kwargs):
             return
-        self.cpu_maybe_split_load(device, **kwargs)
-        super().load(device, **kwargs)
+        # Hybrid MoE (moe_hybrid_dispatch.py): experts held by the CPU workers and the shared
+        # GPU expert cache; the claim loads every non-expert submodule itself
+        hybrid = self.cpu_maybe_hybrid_load(device, **kwargs)
+        if not hybrid:
+            self.cpu_maybe_split_load(device, **kwargs)
+            super().load(device, **kwargs)
 
         if self.e_score_correction_bias_key:
             for k in [self.e_score_correction_bias_key, "gate.e_score_correction_bias"]:
@@ -839,6 +849,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self.cpu_post_load()
             self.load_local(**kwargs)
             self.load_routing(**kwargs)
+            if self.hybrid is not None:
+                assert self.support_fused and self.bc is not None, \
+                    f"{self.key}: hybrid MoE needs the fused and table-driven expert paths"
+                self.hybrid.dispatcher.attach(self)
 
 
     def _batch_recon_layer(self, y):
@@ -931,6 +945,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
     def _autosplit_worst_case(self, rows: int) -> int:
         """Upper bound on this layer's prefill transient for a `rows`-token chunk, in bytes"""
         A = rows * self.num_experts_per_tok
+        if self.hybrid is not None:
+            return self.hybrid.dispatcher.worst_case(self.hybrid, rows)
         host = getattr(self, "cpu_host", None)
         if host is not None and getattr(self, "cpu_layer_idx", None) is not None:
             # Split layers: the assignments divide between GPU-resident and CPU-resident
@@ -945,8 +961,29 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             total = sum(self.prefill_worst_case_parts(rows, A))
         return total
 
+    def _run_hybrid_heavy(self, recon, y, fhs_ext, token_sorted, weight_sorted, expert_count_list, experts):
+        """Hybrid MoE fallback for experts the fused and batched tiers leave over (more rows than
+        the batched tier's per-expert cap, or between the two tiers' ranges): each expert runs
+        as single-expert batched-reconstruct groups of at most recon.max_rows rows, so every
+        call stays inside the batched tier's own buffer bounds, and the weights come from the
+        live pointer tables (VRAM slot or host home) instead of the per-expert Linear objects
+        the dequant path would read. Accumulates weighted into fhs_ext. Returns the experts"""
+        rows = y.shape[0]
+        y_ext = torch.cat([y, torch.zeros((1, y.shape[1]), dtype = y.dtype, device = y.device)])
+        tok_ext = torch.cat([token_sorted, torch.full((1,), rows, dtype = token_sorted.dtype, device = y.device)])
+        w_ext = torch.cat([weight_sorted.half(), torch.zeros((1,), dtype = torch.half, device = y.device)])
+        starts = [0]
+        for c in expert_count_list:
+            starts.append(starts[-1] + c)
+        step = max(1, recon.max_rows)
+        for e in experts:
+            c = expert_count_list[e]
+            for off in range(0, c, step):
+                recon.run_group(y_ext, fhs_ext, tok_ext, w_ext, [e], [starts[e] + off], [min(step, c - off)])
+        return set(experts)
+
     def _run_batch_recon(self, recon, y, fhs_ext, token_sorted, weight_sorted, expert_count_list, groups,
-                         scratch = None, tables = None):
+                         scratch = None, tables = None, fused_rows = None):
         """Run the planned groups through the batched reconstruct tier. With a slot scratch each
         group's down projection lands in its slots (summed later by exl3_moe_gather); otherwise
         each group accumulates into fhs_ext (rows + 1, the last row a padding sink). Returns the
@@ -962,8 +999,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         slot = None
         if scratch is not None:
             # groups were laid out after the fused slots, in plan order, len(grp) * cmax each
+            fr = fused_rows if fused_rows is not None else self.fused_rows
             slot = sum(c for c in expert_count_list[:self.num_local_experts or self.num_experts]
-                       if 0 < c <= self.fused_rows) if self.fused_mode_buffers is not None else 0
+                       if 0 < c <= fr) if self.fused_mode_buffers is not None else 0
         for grp in groups:
             out_slab = None
             if scratch is not None:
@@ -980,6 +1018,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
     @override
     def unload(self):
         self.cpu_unload()
+        if self.hybrid is not None:
+            self.hybrid.dispatcher.detach(self)
         self.bc = None
         self.fused_mode_buffers = None
         self.batch_recon = None
@@ -1094,9 +1134,27 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if self.cpu_split_first is not None and not params.get("autosplit_measure"):
             cpu_partial, cpu_pending = self.cpu_split_submit(y, bsz, selected_experts, routing_weights)
 
+        # Hybrid MoE: lane assignment (cache hit / admission / zero-copy / CPU node) and CPU job
+        # issue; the GPU tiers below then run on the masked selection
+        hy = self.hybrid
+        hy_pending = None
+        hy_measure = hy is not None and params.get("autosplit_measure")
+        if hy is not None and not hy_measure:
+            hy_pending, selected_experts = hy.dispatcher.submit(hy, y, selected_experts, routing_weights)
+        fr = self.fused_rows
+        if hy_pending is not None and hy_pending.fused_cap is not None:
+            # Non-resident experts read over PCIe: the fused kernel re-reads an expert's weights
+            # once per row tile, the batched tier once per call, so above the cap they batch
+            fr = min(fr, hy_pending.fused_cap)
+
         if self.cpu_offload:
             final_hidden_states, cpu_pending = self.cpu_offload_issue(
                 eshape, y, selected_experts, routing_weights, params)
+
+        # Hybrid layer in the autosplit measuring forward: the cache and workers are not up yet;
+        # the transient bound is taken separately (autosplit_extra_measure)
+        elif hy_measure:
+            final_hidden_states = torch.zeros(eshape, dtype = torch.float, device = y.device)
 
         # Empty slice
         elif self.intermediate_size == 0 or self.num_local_experts == 0:
@@ -1136,7 +1194,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
                 # Map to local expert ids whenever this module holds a slice (TP shard or
                 # CPU expert split), not only in the multi-device routing case
-                if self.num_local_experts == self.num_experts:
+                if self.num_local_experts == self.num_experts and hy is None:
                     flat_expert_local = flat_expert_global
                 else:
                     flat_expert_local = flat_expert_global - self.routing_first
@@ -1152,7 +1210,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 # expert can exceed the fused kernel's row capacity, so the readback (a CPU sync
                 # per layer, ~33% idle at MTP verify shapes) is skipped and everything is fused
                 expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
-                if self.fused_mode_buffers is not None and num_tokens * top_k <= self.fused_rows:
+                if self.fused_mode_buffers is not None and num_tokens * top_k <= fr:
                     expert_count_list = None
                 else:
                     expert_count_list = expert_count.tolist()
@@ -1167,8 +1225,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 else:
                     fused_total = 0
                     if self.fused_mode_buffers is not None:
-                        min_rows = self.fused_rows
-                        fused_total = sum(c for c in expert_count_list[:num_ex] if 0 < c <= self.fused_rows)
+                        min_rows = fr
+                        fused_total = sum(c for c in expert_count_list[:num_ex] if 0 < c <= fr)
                     recon = self._batch_recon_layer(y)
                     if recon is not None:
                         lim = max(min_rows, TEMP_ROWS_GRAPH)
@@ -1208,7 +1266,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         if self.fused_mode_buffers is not None:
                             for e in range(num_ex):
                                 c = expert_count_list[e]
-                                if 0 < c <= self.fused_rows:
+                                if 0 < c <= fr:
                                     base[e] = n_slots; kind[e] = 1; n_slots += c
                         for grp in groups:
                             cmax = max(expert_count_list[e] for e in grp)
@@ -1218,7 +1276,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         tables = host_to_device(torch.from_numpy(np.stack([base, starts_np, kind])), y.device)
                     scratch = torch.empty((max(n_slots, 1), y.shape[1]), dtype = torch.float, device = y.device)
 
-                def run_fused(num_active, count_lo = 1, count_hi = self.fused_rows, m_tile = 16):
+                def run_fused(num_active, count_lo = 1, count_hi = fr, m_tile = 16):
                     # Gateless: the up module stands in for the gate pointer tables (the kernel
                     # skips the gate GEMM when activation_fn_idx is MOE_ACT_RELU2_NOGATE)
                     multi_gate = self.multi_gate if self.gated else self.multi_up
@@ -1262,14 +1320,14 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     if expert_count_list is None:
                         run_fused(-1)
                     else:
-                        counts = [c for c in expert_count_list[:num_ex] if 0 < c <= self.fused_rows]
+                        counts = [c for c in expert_count_list[:num_ex] if 0 < c <= fr]
                         t1 = sum(1 for c in counts if MTILE_T1 < c <= MTILE_T2)
                         t2 = sum(1 for c in counts if c > MTILE_T2)
                         if self.mtile_ok and (t1 or t2):
                             # One launch per row tile over its expert range, largest first
                             t0 = len(counts) - t1 - t2
                             if t2:
-                                run_fused(t2, MTILE_T2 + 1, self.fused_rows, 64)
+                                run_fused(t2, MTILE_T2 + 1, fr, 64)
                             if t1:
                                 run_fused(t1, MTILE_T1 + 1, MTILE_T2, 32)
                             if t0:
@@ -1282,7 +1340,16 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 if groups:
                     batched = self._run_batch_recon(
                         recon, y, fhs_ext, token_sorted, weight_sorted, expert_count_list, groups,
-                        scratch, tables)
+                        scratch, tables, fused_rows = fr)
+
+                # Hybrid: whatever neither tier took runs as bounded single-expert groups (the
+                # per-expert loop below reads Linear objects, which hybrid layers do not back)
+                if hy is not None and expert_count_list is not None:
+                    left = [e for e in range(num_ex) if expert_count_list[e] > min_rows and e not in batched]
+                    if left:
+                        assert recon is not None, f"{self.key}: hybrid MoE needs the batched reconstruct tier"
+                        batched = set(batched) | self._run_hybrid_heavy(
+                            recon, y, fhs_ext, token_sorted, weight_sorted, expert_count_list, left)
 
                 # One fixed-order gather over every slot
                 if scratch is not None:
@@ -1302,6 +1369,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     if count <= min_rows or expert_idx in batched:
                         start = end
                         continue
+                    assert hy is None, f"{self.key}: hybrid MoE expert reached the per-expert path"
 
                     top_x = token_sorted[start:end]
                     w = weight_sorted[start:end].unsqueeze(1)
@@ -1390,12 +1458,15 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # inside the routed path. Keep prefill scheduling and the order of post norms / TP
         # collectives unchanged.
         shared_hidden_states = None
-        if cpu_pending is not None and bsz <= MAX_BSZN and self.shared_experts and not bc_sh_exp:
+        cpu_waiting = cpu_pending is not None or (hy_pending is not None and hy_pending.kind == "decode")
+        if cpu_waiting and bsz <= MAX_BSZN and self.shared_experts and not bc_sh_exp:
             shared_hidden_states = self.shared_experts.forward(x, params)
 
         # CPU tail partial folds in before the post norms (nonlinear: they must see the
         # complete routed sum)
         final_hidden_states = self.cpu_split_combine(final_hidden_states, cpu_partial, cpu_pending, eshape)
+        if hy_pending is not None:
+            final_hidden_states = hy.dispatcher.combine(hy, final_hidden_states, hy_pending)
 
         # Latent MoE: project the routed sum back to the residual width (linear, so under TP
         # each rank's partial sum projects on its own ahead of the reduction)

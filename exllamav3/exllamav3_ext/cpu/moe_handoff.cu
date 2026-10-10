@@ -242,7 +242,8 @@ void exl3_moe_cpu_worker_run
     int64_t num_wslots,
     int64_t wslot_size,
     int64_t threads,
-    int64_t stage_threads
+    int64_t stage_threads,
+    int64_t telemetry_offset
 )
 {
     // GIL is released by the binding's call_guard; do not release it again here
@@ -370,6 +371,7 @@ void exl3_moe_cpu_worker_run
         {
             uint8_t* slot = data + size_t(job.slot) * slot_size;
             bool run = true;
+            const auto tl_t0 = std::chrono::steady_clock::now();
             if (job.kind == MOE_JOB_KIND_COMPUTE_GATED)
             {
                 // Fused-issue job: the collecting kernel reads the output only when some
@@ -405,6 +407,31 @@ void exl3_moe_cpu_worker_run
                     static_cast<int>(job.topk),
                     static_cast<int>(threads)
                 );
+            if (telemetry_offset >= 0)
+            {
+                MoeJobTelemetry* tl = reinterpret_cast<MoeJobTelemetry*>(slot + telemetry_offset);
+                const int32_t* selp = reinterpret_cast<const int32_t*>(slot + off_sel);
+                const int total = (int) job.rows * (int) job.topk;
+                uint32_t na = 0, ne = 0;
+                if (run)
+                {
+                    // Distinct experts by a small open bitmap over the local ids seen
+                    uint64_t seen[8] = {};
+                    for (int i = 0; i < total; ++i)
+                    {
+                        const int32_t e = selp[i];
+                        if (e < 0) continue;
+                        na++;
+                        if (e < 512 && !(seen[e >> 6] >> (e & 63) & 1)) { seen[e >> 6] |= 1ull << (e & 63); ne++; }
+                    }
+                }
+                tl->compute_us = run ? (uint32_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - tl_t0).count() : 0u;
+                tl->assignments = na;
+                tl->rows = job.rows;
+                tl->experts = ne;
+                store_release_u32(&tl->seq, job.seq);
+            }
         }
 
         store_release_flag(done + size_t(job.slot) * 16, job);

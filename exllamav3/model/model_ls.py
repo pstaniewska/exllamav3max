@@ -309,6 +309,8 @@ class Model_LSMixin(ABC):
 
             dummy_state = None
             unset_memory_fraction(touched_devices)
+            # Largest measured transient per device: the floor the hybrid expert cache keeps free
+            config.autosplit_transient = dict(max_transient)
             if verbose:
                 for i in touched_devices:
                     print(f" -- autosplit: cuda:{i} largest measured transient {max_transient.get(i, 0) >> 20} MiB, "
@@ -333,6 +335,9 @@ class Model_LSMixin(ABC):
     ):
         for h in getattr(self.config, "moe_cpu_hosts", {}).values():
             h.begin_pass()
+        if getattr(self.config, "moe_hybrid_dispatchers", None):
+            from .moe_hybrid_dispatch import begin_pass_all
+            begin_pass_all(self.config, x)
         for module, instance, idx in self.fwd_modules:
             params["layer_instance"] = instance
             pf = (idx, instance) == self.last_kv_module_idx_instance
@@ -352,6 +357,9 @@ class Model_LSMixin(ABC):
     ):
         for h in getattr(self.config, "moe_cpu_hosts", {}).values():
             h.begin_pass()
+        if getattr(self.config, "moe_hybrid_dispatchers", None):
+            from .moe_hybrid_dispatch import begin_pass_all
+            begin_pass_all(self.config, x)
         for module, instance, idx in self.fwd_modules:
             params["layer_instance"] = instance
             if module.caps.get("logits_output") and (num := params.get("last_tokens_only")):

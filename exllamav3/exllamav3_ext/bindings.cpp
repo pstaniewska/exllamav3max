@@ -43,6 +43,7 @@
 #include "generator/rep_pen.cuh"
 #include "generator/dry.cuh"
 #include "moe_unswizzle.cuh"
+#include "moe_hybrid.cuh"
 #include "generator/cache.cuh"
 
 #include "cache/q_cache.cuh"
@@ -119,6 +120,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("moe_split_map", &moe_split_map, "moe_split_map");
     m.def("moe_split_issue", &moe_split_issue, "moe_split_issue");
     m.def("moe_split_collect_add", &moe_split_collect_add, "moe_split_collect_add");
+    m.def("moe_hybrid_issue", &moe_hybrid_issue, "moe_hybrid_issue",
+        py::arg("state"), py::arg("layer"), py::arg("num_experts"), py::arg("sel"), py::arg("y"), py::arg("w"),
+        py::arg("sel_gpu"), py::arg("lane_out"), py::arg("cpu_sel"), py::arg("nodes"), py::arg("node_cost"),
+        py::arg("hi"), py::arg("prefill"), py::arg("admit"), py::arg("gpu_max"), py::arg("cpu_frac"),
+        py::arg("prefill_gpu_min"), py::arg("node_policy"), py::arg("pref_node"));
+    m.def("moe_hybrid_gather", &moe_hybrid_gather, "moe_hybrid_gather",
+        py::arg("state"), py::arg("like"), py::arg("blocks_per_job"));
+    m.def("moe_hybrid_host_ops", &moe_hybrid_host_ops, "moe_hybrid_host_ops",
+        py::arg("state"), py::arg("ops"), py::arg("num_ops"));
     m.def("dsv4_compress", &dsv4_compress, "dsv4_compress");
     m.def("dsv4_pool_quant_scatter", &dsv4_pool_quant_scatter, "dsv4_pool_quant_scatter");
     m.def("dsv4_ring_append", &dsv4_ring_append, "dsv4_ring_append");
@@ -199,6 +209,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe_cpu_pool_stress", &exl3_moe_cpu_pool_stress, "exl3_moe_cpu_pool_stress");
     m.def("exl3_moe_cpu_core_order", &exl3_moe_cpu_core_order, "exl3_moe_cpu_core_order");
     m.def("exl3_moe_cpu_worker_run", &exl3_moe_cpu_worker_run, "exl3_moe_cpu_worker_run",
+          py::arg("shm_base"), py::arg("num_slots"), py::arg("slot_size"), py::arg("cap_rows"),
+          py::arg("max_hi"), py::arg("max_ho"), py::arg("max_topk"), py::arg("wstage_offset"),
+          py::arg("num_wslots"), py::arg("wslot_size"), py::arg("threads"), py::arg("stage_threads"),
+          py::arg("telemetry_offset") = -1,
           py::call_guard<py::gil_scoped_release>());
     m.def("exl3_moe_cpu_has_avx512_bw", &exl3_moe_cpu_has_avx512_bw, "exl3_moe_cpu_has_avx512_bw");
     m.def("exl3_moe_cpu_has_avx512_vnni", &exl3_moe_cpu_has_avx512_vnni, "exl3_moe_cpu_has_avx512_vnni");
