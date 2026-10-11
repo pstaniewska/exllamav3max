@@ -127,6 +127,11 @@ class HybridTuning:
         # a fraction of the pool such as 0.75 fixes it, "off" leaves the workers' caps alone
         dt = os.environ.get("EXL3_MOE_DECODE_THREADS", "auto").strip().lower()
         self.decode_threads = None if dt in ("", "auto") else -1.0 if dt in ("off", "0") else float(dt)
+        # Expert deferral (DeferredPartial): a decode layer's CPU partial reaches the residual at
+        # the end of the next block instead of the layer's own routed sum, so the CPU job overlaps
+        # the next block's GPU work. An approximation: that block's attention and router see the
+        # residual without it
+        self.defer = os.environ.get("EXL3_MOE_DEFER", "0") not in ("", "0")
 
 
 HT = HybridTuning()
@@ -417,6 +422,11 @@ class HybridLayer:
         self.sel_buf = torch.empty((cap,), dtype = torch.long, device = self.device)
         self.lane_buf = torch.empty((EMAX,), dtype = torch.int32, device = self.device)
         self._worst = {}
+        # Expert deferral (EXL3_MOE_DEFER): set per pass by _link_layers; mHC fold buffers
+        # (v twice, rows x H; d, rows x h) allocated at the layer's first deferral
+        self.defer_next = False
+        self.defer_v = None
+        self.defer_d = None
 
 
 class HybridPending:
@@ -426,6 +436,52 @@ class HybridPending:
         self.kind = kind
         self.items = items
         self.fused_cap = fused_cap
+
+
+# Module (or transformer block) attributes after the routed sum that a deferred CPU partial would
+# bypass: it is added to the residual later, unprojected, unnormed, unscaled and unreduced
+DEFER_BLOCKERS = ("latent_out", "routed_post_norm", "tp_reduce", "mlp_resid_scalar", "mlp_post_norm",
+                  "layer_scalar_f")
+
+
+class DeferredPartial:
+    """Decode CPU partial of one layer left out of its routed sum (EXL3_MOE_DEFER) and folded into
+    the residual at the end of the next transformer block (HybridDispatcher.fold). The jobs stay
+    in the dispatcher's inflight list until then, so an interrupted forward still drains them.
+    With hyperconnections (mHC) the partial enters the streams as v ⊗ d: v starts as the layer's
+    post weights and is carried through every later site's combine (carry), v <- combᵀ v"""
+
+    __slots__ = ("items", "dispatcher", "hl", "device", "rows", "v", "vi")
+
+    def __init__(self, items, dispatcher, hl, device, rows):
+        self.items = items
+        self.dispatcher = dispatcher
+        self.hl = hl
+        self.device = device
+        self.rows = rows
+        self.v = None
+        self.vi = 0
+
+    def set_post(self, post):
+        """mHC: keep the layer's post weights (rows, H); the mix scratch they live in is reused by
+        the next site. Copied into the layer's static buffer (allocated once)"""
+        H = post.shape[-1]
+        buf = getattr(self.hl, "defer_v", None)
+        if buf is None or buf.shape[2] != H:
+            cap = max(self.dispatcher.decode_rows, self.rows, 1)
+            buf = self.hl.defer_v = torch.empty((2, cap, H), dtype = torch.float, device = post.device)
+            self.hl.defer_d = torch.empty((cap, self.hl.ho), dtype = torch.float, device = post.device)
+        self.vi = 0
+        self.v = buf[0, :self.rows]
+        self.v.copy_(post.reshape(self.rows, H))
+
+    def carry(self, comb):
+        """mHC: a site applied x <- post ⊗ y + combᵀ x, so the pending v ⊗ d becomes (combᵀ v) ⊗ d"""
+        R, H = self.v.shape
+        self.vi ^= 1
+        nv = self.hl.defer_v[self.vi, :R]
+        torch.bmm(self.v.view(R, 1, H), comb.reshape(R, H, H), out = nv.view(R, 1, H))
+        self.v = nv
 
 
 class HybridDispatcher:
@@ -865,6 +921,8 @@ class HybridDispatcher:
             if rows > self.decode_rows:
                 extra = max((self.worst_case(hl, rows) for hl in self.layers if hl.device == dev), default = 0)
                 cache.ensure_headroom(extra)
+        if HT.defer:
+            self._link_layers()
         self._update_lane_params()
         frac = self.decode_tuner.on_pass(rows <= self.decode_rows, time.perf_counter())
         if frac is not None:
@@ -976,6 +1034,60 @@ class HybridDispatcher:
         w = gpu + cpu + sel
         hl._worst[rows] = w
         return w
+
+    # ---- expert deferral (EXL3_MOE_DEFER) -------------------------------------------------------
+
+    def _link_layers(self):
+        """Per layer: may it defer its CPU partial? Not the last hybrid layer, the next one on the
+        same device, and at least two CPU slots per worker: the deferred job holds its slot
+        unconsumed while the next layer reserves, and with one slot that reserve would wait on
+        it forever"""
+        from .moe_cpu_host import TUNING as HOST_TUNING
+        slots = all(getattr(h, "num_slots", HOST_TUNING.num_slots) >= 2 for h in self.group.hosts)
+        n = len(self.layers)
+        for i, hl in enumerate(self.layers):
+            hl.defer_next = slots and i + 1 < n and self.layers[i + 1].device == hl.device
+
+    def can_defer(self, hl: HybridLayer, module, rows: int) -> bool:
+        """This decode call's CPU partial may skip combine and fold into the residual later"""
+        if not HT.defer or rows > self.decode_rows or not getattr(hl, "defer_next", False):
+            return False
+        for a in DEFER_BLOCKERS:
+            v = getattr(module, a, None)
+            if v is not None and v is not False:
+                return False
+        return True
+
+    def defer(self, hl: HybridLayer, pending: HybridPending, rows: int) -> DeferredPartial:
+        """Instead of combine: the jobs stay inflight until fold"""
+        return DeferredPartial(pending.items, self, hl, hl.device, rows)
+
+    def fold(self, rec: DeferredPartial, x2d, v = None):
+        """Add a deferred CPU partial into the residual, stream-ordered. Plain residual (fp32,
+        rows x h): collected straight into it. mHC (v given, (rows, H)): collected into the
+        layer's static fp32 buffer, then x[h] += v[h] * d"""
+        cuda = rec.device.type == "cuda"
+        tel = self.telemetry if cuda else None
+        compute = torch.cuda.current_stream(rec.device) if cuda else None
+        if v is None:
+            out = x2d.view(-1, x2d.shape[-1])
+        else:
+            out = rec.hl.defer_d[:rec.rows]
+            out.zero_()
+        for i, h, r in rec.items:
+            e0 = tel.begin(compute) if tel is not None else None
+            h.fused_collect(r, out)
+            if tel is not None:
+                tel.end(i, "defer", e0, compute)
+            self.inflight = [x for x in self.inflight if x[1] is not r]
+        if v is not None:
+            R, H = v.shape
+            xs = x2d.view(R, H, -1)
+            if cuda:
+                from ..ext import exllamav3_ext as ext
+                ext.hc_apply(xs, out, v, None, None, None)
+            else:
+                xs.add_(v.unsqueeze(-1) * out.unsqueeze(-2))
 
     # ---- per layer call --------------------------------------------------------------------------
 
@@ -1207,6 +1319,19 @@ def _bounce_linear(l, bounce: torch.Tensor, off: int, nbytes: int, device, shape
     l.inner = LinearEXL3(l.config, l.in_features, l.out_features, None, su, sv, suh, svh, trellis,
                          None, mul1, None, l.out_dtype, key = key)
     l.quant_type = "exl3"
+
+
+def fold_deferred(params: dict, x):
+    """Fold the deferred CPU partial in params["moe_fold"], if any, into the residual x (the
+    forward loop's safety net: before a module that would not fold it, and after the last)"""
+    rec = params.get("moe_fold")
+    if rec is None:
+        return
+    params["moe_fold"] = None
+    if "hc_pending" in params:
+        from ..modules.hyperconnections import hc_flush
+        hc_flush(params)
+    rec.dispatcher.fold(rec, x, rec.v)
 
 
 def finalize_all(config):

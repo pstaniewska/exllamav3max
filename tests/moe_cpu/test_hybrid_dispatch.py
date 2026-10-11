@@ -697,3 +697,141 @@ def test_decode_thread_tuner_fixed_and_off():
     assert D.DecodeThreadTuner(0.5).on_pass(True, 0.0) == 0.5
     off = D.DecodeThreadTuner(-1.0)
     assert off.on_pass(True, 0.0) is None and off.on_pass(True, 0.05) is None
+
+
+def defer_setup(rows = 1, **ht):
+    """Dispatcher with two hybrid layers on one device (the first may defer), every miss on the CPU"""
+    d, hl, hosts, cache = make(rows = rows, dispatch = "hybrid", zc_max = 0, defer = True, **ht)
+    hl2 = object.__new__(D.HybridLayer)
+    hl2.device = torch.device("cpu")
+    hl2.finalized, hl2.cache_layer = True, None
+    d.layers = [hl, hl2]
+    d.finalized = True
+    d._link_layers()
+    return d, hl, hl2, hosts, cache
+
+
+def defer_module(**kw):
+    m = type("M", (), {})()
+    m.latent_out = m.routed_post_norm = None
+    m.tp_reduce = False
+    for k, v in kw.items():
+        setattr(m, k, v)
+    return m
+
+
+def cpu_partial(hosts, rows):
+    out = torch.zeros((rows, 8))
+    for h in hosts:
+        if int(h.counts[0]):
+            out += h.out[:rows]
+    return out
+
+
+def test_defer_skips_collect_until_fold():
+    d, hl, hl2, hosts, cache = defer_setup()
+    assert hl.defer_next and not hl2.defer_next
+    assert d.can_defer(hl, defer_module(), 1)
+    pend, sel_gpu = d.submit(hl, torch.randn((1, 8)).half(), torch.tensor([[1, 2, 3, 4]]), torch.rand((1, 4)).half())
+    rec = d.defer(hl, pend, 1)
+    assert all(h.events == ["reserve", "publish"] for h in hosts)    # nothing waits for the CPU yet
+    assert len(d.inflight) == 2                                      # still drained if interrupted
+    x = torch.zeros((1, 1, 8))
+    params = {"moe_fold": rec}
+    D.fold_deferred(params, x)
+    assert params["moe_fold"] is None and d.inflight == []
+    assert all(h.events == ["reserve", "publish", "collect"] for h in hosts)
+    assert torch.allclose(x.view(1, 8), cpu_partial(hosts, 1))
+    D.fold_deferred(params, x)                                       # nothing pending: no-op
+    assert all(h.events.count("collect") == 1 for h in hosts)
+
+
+@pytest.mark.parametrize("rows", [65, 128])
+def test_prefill_never_defers(rows):
+    d, hl, hl2, hosts, cache = defer_setup(rows = rows)
+    assert not d.can_defer(hl, defer_module(), rows)
+    sel = torch.stack([torch.randperm(16)[:4] for _ in range(rows)])
+    pend, _ = d.submit(hl, torch.randn((rows, 8)).half(), sel, torch.rand((rows, 4)).half())
+    assert pend.kind == "prefill"
+
+
+def test_interrupted_deferral_is_drained_by_begin_pass():
+    d, hl, hl2, hosts, cache = defer_setup()
+    pend, _ = d.submit(hl, torch.randn((1, 8)).half(), torch.tensor([[1, 2, 3, 4]]), torch.rand((1, 4)).half())
+    d.defer(hl, pend, 1)                                             # the fold never runs
+    d._update_lane_params = lambda: None
+    d.begin_pass(None)
+    assert d.inflight == []
+    assert all(h.events.count("collect") == 1 for h in hosts)
+
+
+def test_can_defer_rejections():
+    d, hl, hl2, hosts, cache = defer_setup()
+    m = defer_module()
+    assert d.can_defer(hl, m, 1)
+    assert not d.can_defer(hl, m, d.decode_rows + 1)                 # prefill-shaped call
+    assert not d.can_defer(hl2, m, 1)                                # last hybrid layer
+    for k, v in (("latent_out", object()), ("routed_post_norm", object()), ("tp_reduce", True),
+                 ("mlp_resid_scalar", torch.ones(1)), ("mlp_post_norm", object()), ("layer_scalar_f", 0.5)):
+        assert not d.can_defer(hl, defer_module(**{k: v}), 1), k
+    hl2.device = torch.device("meta")                                # next hybrid layer elsewhere
+    d._link_layers()
+    assert not hl.defer_next
+    hl2.device = torch.device("cpu")
+    for h in hosts:
+        h.num_slots = 1                                              # the next reserve would wait on it
+    d._link_layers()
+    assert not d.can_defer(hl, m, 1)
+    for h in hosts:
+        h.num_slots = 2
+    d._link_layers()
+    assert d.can_defer(hl, m, 1)
+    D.HT.defer = False
+    assert not d.can_defer(hl, m, 1)
+
+
+def hc_site(x, y, post, comb):
+    """HyperConnection.apply_ reference: x <- post ⊗ y + combᵀ x, (R, H, D)"""
+    return post.unsqueeze(-1) * y.unsqueeze(-2) + torch.matmul(comb.transpose(-1, -2), x)
+
+
+def test_hc_fold_is_exact():
+    # Layer L's partial d enters the streams as post_m ⊗ d; deferred past the next block's two
+    # sites (comb_a, comb_m) it must still land as (comb_mᵀ comb_aᵀ post_m) ⊗ d
+    R, Hc, Dm = 2, 4, 8
+    d, hl, hl2, hosts, cache = defer_setup(rows = R)
+    torch.manual_seed(11)
+    sel = torch.stack([torch.randperm(16)[:4] for _ in range(R)])
+    pend, _ = d.submit(hl, torch.randn((R, 8)).half(), sel, torch.rand((R, 4)).half())
+    rec = d.defer(hl, pend, R)
+    part = cpu_partial(hosts, R)
+    assert part.abs().sum() > 0
+
+    x0 = torch.randn((R, Hc, Dm))
+    post_m = torch.rand((R, Hc)) * 2
+    y_a, y_m = torch.randn((R, Dm)), torch.randn((R, Dm))
+    post_a, post_b = torch.rand((R, Hc)) * 2, torch.rand((R, Hc)) * 2
+    comb_a, comb_m = torch.rand((R, Hc, Hc)), torch.rand((R, Hc, Hc))
+
+    want = x0 + post_m.unsqueeze(-1) * part.unsqueeze(-2)
+    want = hc_site(hc_site(want, y_a, post_a, comb_a), y_m, post_b, comb_m)
+
+    rec.set_post(post_m.view(1, R, Hc))
+    post_m.fill_(-1.0)                                               # mix scratch reused: v was copied
+    x = hc_site(hc_site(x0.clone(), y_a, post_a, comb_a), y_m, post_b, comb_m)
+    rec.carry(comb_a.view(1, R, Hc, Hc))
+    rec.carry(comb_m)
+    x = x.view(1, R, Hc, Dm).contiguous()
+    params = {"moe_fold": rec}
+    D.fold_deferred(params, x)
+    assert torch.allclose(x.view(R, Hc, Dm), want, atol = 1e-5)
+    assert d.inflight == [] and all(h.events.count("collect") == 1 for h in hosts)
+    # Static buffers: a second deferral reuses them
+    v_buf, d_buf = hl.defer_v, hl.defer_d
+    pend, _ = d.submit(hl, torch.randn((R, 8)).half(), sel, torch.rand((R, 4)).half())
+    rec = d.defer(hl, pend, R)
+    rec.set_post(torch.rand((R, Hc)))
+    rec.carry(comb_a)
+    assert hl.defer_v is v_buf and hl.defer_d is d_buf
+    assert rec.v.data_ptr() in (v_buf[0].data_ptr(), v_buf[1].data_ptr())
+    d.fold(rec, torch.zeros((R, Hc, Dm)), rec.v)

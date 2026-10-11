@@ -390,6 +390,19 @@ processes also use (VMs, kubelet), a full pool waits at every phase barrier for 
 thread was preempted, and a smaller share is faster. A number such as `0.75` fixes the share;
 `off` leaves the caps alone (as `eval/hybrid_perf.py -sweep` does).
 
+### `EXL3_MOE_DEFER` (default: `0`)
+
+Hybrid MoE (`-mh`): expert deferral for decode-sized passes. A layer's CPU expert partial is not
+waited for inside the layer; it is added to the residual at the end of the next transformer
+block, so the CPU job overlaps that block's GPU work. This is an approximation: the next layer's
+attention and router see the residual without the CPU partial (the partial still reaches the
+residual, and every later layer sees it). With hyperconnections (mHC) the partial is carried
+through the next block's stream mixes and lands exactly where the immediate add would have put
+it. Applies only to layers whose MoE output goes straight into the residual (no latent
+projection, post-norms, residual or layer scalars, tensor parallelism), not to the last hybrid
+layer or one whose successor is on another device, and needs `EXL3_MOE_CPU_SLOTS` of at least
+`2`. Prefill passes never defer.
+
 ### `EXL3_MOE_CPU_DECODE_WORKERS` (default: `0`, no cap)
 
 Caps the worker threads that run a single-token (decode) job. With `EXL3_MOE_CPU_THREADS` set to
@@ -832,8 +845,9 @@ its default. In short:
   `EXL3_EXPERT_PREFILL_GPU_MIN` (default `auto`: the prefill split between zero-copy and CPU
   lanes is chosen per call from measured PCIe and CPU costs; a number fixes the row threshold),
   `EXL3_MOE_ADAPTIVE_EMA`,
-  `EXL3_HYBRID_MOE_DEBUG`, and `EXL3_HYBRID_MOE_PROFILE` (CPU-lane wait measured with CUDA events,
-  no host sync).
+  `EXL3_HYBRID_MOE_DEBUG`, `EXL3_HYBRID_MOE_PROFILE` (CPU-lane wait measured with CUDA events,
+  no host sync), and `EXL3_MOE_DEFER` (decode CPU partials folded in one block later; an
+  approximation, default off).
 - **NUMA:** `EXL3_NUMA_ENABLE` (one CPU worker per node; also applies to `-mcl` / `-mcs`, whose
   layers then go round-robin over the nodes), `EXL3_NUMA_POLICY` (default `auto`: measured
   cost split under `replicate`, GPU-local under `shard`), `EXL3_NUMA_MEMORY_POLICY`

@@ -368,15 +368,35 @@ class Model_LSMixin(ABC):
     ):
         for h in getattr(self.config, "moe_cpu_hosts", {}).values():
             h.begin_pass()
+        defer = False
         if getattr(self.config, "moe_hybrid_dispatchers", None):
-            from .moe_hybrid_dispatch import begin_pass_all, note_kv_staging
+            from .moe_hybrid_dispatch import begin_pass_all, note_kv_staging, fold_deferred, HT
             note_kv_staging(self)
             begin_pass_all(self.config, x, getattr(self, "component", "text"))
-        for module, instance, idx in self.fwd_modules:
-            params["layer_instance"] = instance
-            if module.caps.get("logits_output") and (num := params.get("last_tokens_only")):
-                x = x[..., -num:, :].contiguous()
-            x = module.prepare_for_device(x, params)
-            x = module.forward(x, params)
+            # Expert deferral (EXL3_MOE_DEFER): a transformer block may leave its CPU expert
+            # partial in params["moe_fold"] for the next block to fold in. Anything else, or a
+            # block on another device, gets it folded in here first, as does the end of the pass
+            if HT.defer:
+                from ..modules import TransformerBlock
+                defer = True
+                params["moe_fold"] = None
+        try:
+            for module, instance, idx in self.fwd_modules:
+                params["layer_instance"] = instance
+                if defer and (rec := params["moe_fold"]) is not None and (
+                        not isinstance(module, TransformerBlock) or module.device is None or
+                        torch.device(module.device) != rec.device):
+                    fold_deferred(params, x)
+                if module.caps.get("logits_output") and (num := params.get("last_tokens_only")):
+                    x = x[..., -num:, :].contiguous()
+                x = module.prepare_for_device(x, params)
+                x = module.forward(x, params)
+            if defer:
+                fold_deferred(params, x)
+        finally:
+            # An interrupted pass leaves its jobs to the dispatcher's inflight drain; the marker
+            # must not outlive the pass (another loop would defer without folding)
+            if defer:
+                params.pop("moe_fold", None)
         return x
 
