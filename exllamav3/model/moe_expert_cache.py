@@ -251,9 +251,12 @@ class ExpertCache:
             ext.moe_hybrid_host_ops(self.state, td, len(ops))
 
     def issue(self, layer: CacheLayer, sel, y, w, sel_gpu, lane_out, cpu_sel, nodes, node_cost, hi,
-              prefill, admit, gpu_max, cpu_frac, prefill_gpu_min, node_policy, pref_node, lane_cost = None):
+              prefill, admit, gpu_max, cpu_frac, prefill_gpu_min, node_policy, pref_node, lane_cost = None,
+              gather = True):
         """One layer call's lane assignment (see moe_hybrid_issue). nodes: int64 CPU (ND_ROWS, n),
-        node_cost: float CPU (n), lane_cost: float CPU (4) or None (cost model off)"""
+        node_cost: float CPU (n), lane_cost: float CPU (4) or None (cost model off). gather = False:
+        the caller runs the decode admission copy itself (gather) once it has published the CPU jobs,
+        so the copy stays off the CPU lanes' critical path. Returns whether a gather is owed"""
         if self.policy_none():
             admit = 0
         if lane_cost is None:
@@ -272,15 +275,29 @@ class ExpertCache:
                     prefill, admit, gpu_max, cpu_frac, prefill_gpu_min, node_policy, pref_node,
                     lane_cost.tolist())
                 if admit and not prefill:
+                    if not gather:
+                        return True
                     ref.gather(self.ref_state)
-                return
+                return False
             from ..ext import exllamav3_ext as ext
             ext.moe_hybrid_issue(
                 self.state, layer.L, layer.num_experts, sel.view(-1), y, w.view(-1), sel_gpu,
                 lane_out, cpu_sel, nodes, node_cost, hi, prefill, admit, gpu_max, cpu_frac, lane_cost,
                 prefill_gpu_min, node_policy, pref_node)
             if admit and not prefill:
+                if not gather:
+                    return True
                 ext.moe_hybrid_gather(self.state, sel_gpu, self.T.gather_blocks)
+            return False
+
+    def gather(self, sel_gpu):
+        """Decode admission copy owed by issue(..., gather = False), stream-ordered after it"""
+        with self.lock:
+            if self.backend == "ref":
+                ref.gather(self.ref_state)
+                return
+            from ..ext import exllamav3_ext as ext
+            ext.moe_hybrid_gather(self.state, sel_gpu, self.T.gather_blocks)
 
     def policy_none(self) -> bool:
         return self.T.policy == "none"

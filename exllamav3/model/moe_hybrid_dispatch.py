@@ -1248,9 +1248,12 @@ class HybridDispatcher:
                     nodes[ND_SELCAP, i] = ds.shape[1]
             sel_gpu = hl.sel_buf[:n]
             gpu_max, cpu_frac, admit, lane_cost = self._lane_args(n)
-            cache.issue(hl.cache_layer, sel, y, w, sel_gpu, None, None, nodes, self.node_cost, hl.hi,
-                        0, admit, gpu_max, cpu_frac, PREFILL_GPU_MIN_BOOT, self.node_policy, self.group.pref,
-                        lane_cost)
+            # The admission copy (gather) is enqueued after the publish: the workers only read
+            # what issue staged (selections, activations, weights), so they start while the GPU
+            # copies admitted experts; the GPU tiers still run after the copy on this stream
+            owed = cache.issue(hl.cache_layer, sel, y, w, sel_gpu, None, None, nodes, self.node_cost, hl.hi,
+                               0, admit, gpu_max, cpu_frac, PREFILL_GPU_MIN_BOOT, self.node_policy,
+                               self.group.pref, lane_cost, gather = False)
             if dres is not None:
                 self._split_deferred(hl, y, w, rows, res, dres)
             for _, h, r in res + (dres or []):
@@ -1258,6 +1261,8 @@ class HybridDispatcher:
                 for entry in self.inflight:
                     if entry[1] is r:
                         entry[2] = True
+            if owed:
+                cache.gather(sel_gpu)
             return HybridPending("decode", res, deferred = dres), sel_gpu.view(rows, hl.topk)
         return self._submit_prefill(hl, cache, y, sel, w, rows, n)
 
