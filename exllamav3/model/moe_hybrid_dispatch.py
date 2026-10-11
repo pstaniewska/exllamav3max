@@ -111,6 +111,17 @@ class HybridTuning:
         # Unset or "auto": chosen per prefill call from measured costs; a number fixes it
         pgm = os.environ.get("EXL3_EXPERT_PREFILL_GPU_MIN", "auto").strip().lower()
         self.prefill_gpu_min = None if pgm in ("", "auto") else int(pgm)
+        # Prefill stream lane (StreamWork): zero-copy experts of wide prefill calls are DMAed
+        # into a VRAM ring on a copy stream and computed from there. "auto": calls of at least
+        # stream_rows rows; "1": every prefill call; "0": off. CUDA only
+        self.stream = os.environ.get("EXL3_EXPERT_PREFILL_STREAM", "auto").strip().lower() or "auto"
+        assert self.stream in ("auto", "0", "1"), "EXL3_EXPERT_PREFILL_STREAM must be auto, 0 or 1"
+        self.stream_rows = int(os.environ.get("EXL3_EXPERT_PREFILL_STREAM_ROWS", 2048))
+        self.stream_min_rows = max(1, int(os.environ.get("EXL3_EXPERT_PREFILL_STREAM_MIN_ROWS", 1)))
+        # Ring size: at most stream_slots experts and stream_mb MiB, in stream_bufs buffers
+        self.stream_slots = int(os.environ.get("EXL3_EXPERT_PREFILL_STREAM_SLOTS", 32))
+        self.stream_mb = int(os.environ.get("EXL3_EXPERT_PREFILL_STREAM_MB", 512))
+        self.stream_bufs = max(2, int(os.environ.get("EXL3_EXPERT_PREFILL_STREAM_BUFS", 4)))
         # Widest pass that takes the decode path (cost model, cache admission, no host sync),
         # capped by the CPU slot capacity. Unset: the slot capacity, so speculative verify passes
         # (batch x (draft + 1) rows, hybrid drafts of up to 63 tokens at batch 1) and batched
@@ -325,6 +336,191 @@ def choose_prefill_gpu_min(counts: np.ndarray, t_gpu0: float, t_zc: float, t_fix
     return int(c[best]) if best < m else int(c[-1]) + 1
 
 
+def prefill_stream_on(rows: int, cuda: bool) -> bool:
+    """Whether a prefill call of `rows` rows uses the stream lane (EXL3_EXPERT_PREFILL_STREAM)"""
+    if not cuda or HT.stream == "0":
+        return False
+    return HT.stream == "1" or rows >= HT.stream_rows
+
+
+def stream_ring_shape(expert_bytes: int) -> tuple[int, int, int] | None:
+    """(buffers, experts per buffer, bytes per expert) of the stream lane's VRAM ring: at most
+    EXL3_EXPERT_PREFILL_STREAM_SLOTS experts and _MB MiB, split into _BUFS buffers (fewer when
+    the budget holds fewer experts). Experts start 256-byte aligned, as in a cache slot. None
+    when the budget holds fewer than two experts (no double buffering)"""
+    stride = (expert_bytes + 255) // 256 * 256
+    total = min(HT.stream_slots, (HT.stream_mb << 20) // stride)
+    if total < 2:
+        return None
+    nbufs = min(HT.stream_bufs, total)
+    return nbufs, total // nbufs, stride
+
+
+def select_stream_experts(lanes: np.ndarray, counts: np.ndarray, min_rows: int,
+                          max_rows: int | None = None) -> np.ndarray:
+    """Experts of a prefill call that take the stream lane: zero-copy lane, at least min_rows
+    rows (and at most max_rows when the layer has no batched tier for larger ones). Hottest
+    first, so the batched tier's groups of one ring buffer have similar row counts"""
+    E = counts.shape[0]
+    pick = (lanes[:E] == LANE_ZC) & (counts >= min_rows)
+    if max_rows is not None:
+        pick &= counts <= max_rows
+    ids = np.nonzero(pick)[0]
+    return ids[np.argsort(-counts[ids], kind = "stable")]
+
+
+def mask_streamed(sel_gpu: torch.Tensor, ids: np.ndarray, num_experts: int):
+    """Stream-lane experts leave the GPU tiers' selection like CPU picks (masked to num_experts,
+    which the tiers skip); stream-ordered, no host sync"""
+    from ..util.device_copy import host_to_device
+    table = np.zeros(num_experts + 1, dtype = np.bool_)
+    table[ids] = True
+    t = host_to_device(torch.from_numpy(table), sel_gpu.device)
+    sel_gpu.masked_fill_(t.index_select(0, sel_gpu.view(-1)).view(sel_gpu.shape), num_experts)
+
+
+class StreamRing:
+    """Per (device, expert stride) state of the prefill stream lane: the copy stream and one
+    (ready, consumed) event pair per ring buffer. The ring memory itself is taken per call from
+    the caching allocator (StreamWork), so between prefill calls it is free memory the expert
+    cache can grow into, and while a call runs it is part of the call's transient
+    (HybridDispatcher.worst_case)"""
+
+    def __init__(self, device, nbufs: int, per: int, stride: int):
+        self.device = device
+        self.nbufs, self.per, self.stride = nbufs, per, stride
+        self.copy = torch.cuda.Stream(device = device)
+        self.ready = [torch.cuda.Event() for _ in range(nbufs)]
+        self.consumed = [torch.cuda.Event() for _ in range(nbufs)]
+
+
+class StreamWork:
+    """One prefill call's stream lane. Zero-copy experts with enough rows are copied from their
+    pinned home (the same bytes the zero-copy kernels would read over PCIe) into a VRAM ring on
+    the ring's copy stream, and computed from the ring by the layer's own GPU kernels (fused
+    exl3_moe per row tile, batched reconstruct groups; moe_cpu_host.run_staged_experts) into an
+    fp32 partial that combine folds into the routed sum. Same kernels and weights as the GPU
+    tiers, so each expert's output is the all-VRAM one; only the fp32 summation order differs.
+
+    Stream ordering (the -mcl / -mcs streamed prefill's ring protocol):
+      submit:   ring memory allocated on the compute stream; copy.wait_stream(compute) so the
+                first DMA is ordered after the block's previous users; record_stream(copy) so a
+                call that never reaches combine cannot have its block reused under a pending DMA.
+                DMAs of the first `nbufs` batches enqueued, each ending in ready[b].record(copy)
+      combine:  after the GPU tiers, per batch k (buffer b = k % nbufs): compute.wait_event(
+                ready[b]), the kernels, consumed[b].record(compute), then the DMA of batch
+                k + nbufs into b, which starts with copy.wait_event(consumed[b]). Every DMA is
+                consumed before combine returns, so the block is free on the compute stream after
+
+    The first ring fill overlaps the call's GPU tiers and the CPU lanes; later fills overlap the
+    previous buffers' compute.
+    TODO: prefetch layer L+1's streamed experts during layer L (residency is fixed within a pass,
+    but its selection is only known after its router)"""
+
+    @staticmethod
+    def layer_tiers(module, y) -> tuple:
+        """(fused row cap, fused temp buffers, batched tier) the stream lane runs a layer's
+        experts with: the layer's own (uncapped: the weights are in VRAM), None where it has none"""
+        fb = module.fused_mode_buffers
+        fbufs = None if fb is None else (fb.temp_state_g, fb.temp_state_u, fb.temp_intermediate_g,
+                                         fb.temp_intermediate_u)
+        recon = module._batch_recon_layer(y)
+        return (module.fused_rows if fb is not None else 0), fbufs, (recon if recon not in (None, False) else None)
+
+    def __init__(self, ring: StreamRing, hl, module, tiers: tuple, y, sel_flat, w, ids: np.ndarray,
+                 counts: np.ndarray):
+        E = hl.num_experts
+        self.ring = ring
+        self.hl = hl
+        self.module = module
+        self.tiers = tiers
+        self.y = y
+        self.ids = ids
+        self.counts = counts
+        self.host_view = hl.cache_layer.host_view
+        self.nbytes = hl.expert_bytes
+        per = ring.per
+        self.batches = [ids[i: i + per].tolist() for i in range(0, ids.size, per)]
+        # Expert-sorted assignment lists: every expert's segment is a slice at host-known offsets
+        # (counts were read back with the lanes), so the batches below need no further sync
+        s = torch.where((sel_flat >= 0) & (sel_flat < E), sel_flat, E)
+        order = torch.argsort(s)
+        self.token_sorted = torch.div(order, hl.topk, rounding_mode = "floor")
+        self.weight_sorted = w.reshape(-1).index_select(0, order)
+        self.offs = np.concatenate(([0], np.cumsum(counts[:E])))[:E].astype(np.int64)
+        dev = y.device
+        compute = torch.cuda.current_stream(dev)
+        self.buf = torch.empty((ring.nbufs * per * ring.stride,), dtype = torch.uint8, device = dev)
+        ring.copy.wait_stream(compute)
+        self.buf.record_stream(ring.copy)
+        self.used = [False] * ring.nbufs
+        for k in range(min(ring.nbufs, len(self.batches))):
+            self._dma(k)
+
+    def _dma(self, k: int):
+        ring = self.ring
+        b = k % ring.nbufs
+        base = b * ring.per * ring.stride
+        with torch.cuda.stream(ring.copy):
+            if self.used[b]:
+                ring.copy.wait_event(ring.consumed[b])
+            for j, e in enumerate(self.batches[k]):
+                o = base + j * ring.stride
+                self.buf[o: o + self.nbytes].copy_(self.host_view(e), non_blocking = True)
+            ring.ready[b].record(ring.copy)
+        self.used[b] = True
+
+    def run(self) -> torch.Tensor:
+        """Compute every batch on the current (compute) stream; returns the fp32 partial
+        (rows x h)"""
+        from .moe_cpu_host import run_staged_experts, staged_recon_inputs
+        hl, m, ring, y = self.hl, self.module, self.ring, self.y
+        rows = y.shape[0]
+        compute = torch.cuda.current_stream(y.device)
+        out_ext = torch.zeros((rows + 1, hl.h), dtype = torch.float, device = y.device)
+        mg = m.multi_gate if m.gated else m.multi_up
+        mu, md = m.multi_up, m.multi_down
+        sc = getattr(hl, "stream_scales", None)
+        if sc is None:
+            # Host copy of the per-expert suh / svh addresses (g, u, d; the up tables stand in
+            # for the gate when gateless), as the fused kernel's pointer tables take them
+            sc = hl.stream_scales = np.array(
+                [[getattr(l.inner, t).data_ptr() for l in ml.linears]
+                 for ml in (mg, mu, md) for t in ("suh", "svh")], dtype = np.int64)
+        fused_t, fbufs, recon = self.tiers
+        g_off, u_off, d_off = hl.proj_off
+        ctx = {}
+        counts, offs = self.counts, self.offs
+        nb = len(self.batches)
+        for k, batch in enumerate(self.batches):
+            b = k % ring.nbufs
+            compute.wait_event(ring.ready[b])
+            base = self.buf.data_ptr() + b * ring.per * ring.stride
+            single = run_staged_experts(
+                y, out_ext, [(j, e, int(offs[e]), int(counts[e])) for j, e in enumerate(batch)],
+                self.token_sorted, self.weight_sorted, base, ring.stride, hl.proj_off, m.gated,
+                lambda e: tuple(int(v) for v in sc[:, e]), (mg.K, mu.K, md.K),
+                m.activation_fn_idx, m.act_limit, (mg.mcg, mg.mul1, mu.mcg, mu.mul1, md.mcg, md.mul1),
+                fused_t, fbufs, m.mtile_ok, recon, ctx)
+            if single:
+                # Above the batched tier's row cap: single-expert groups of at most max_rows
+                # rows each, as the GPU tiers' leftover path (BlockSparseMLP._run_hybrid_heavy)
+                y_ext, tok_ext, w_ext = staged_recon_inputs(y, self.token_sorted, self.weight_sorted,
+                                                            recon.dims_u[0], ctx)
+                step = max(1, recon.max_rows)
+                for j, e in single:
+                    bb = base + j * ring.stride
+                    ptrs = ([bb + g_off] if m.gated else None, [bb + u_off], [bb + d_off])
+                    c, s0 = int(counts[e]), int(offs[e])
+                    for off in range(0, c, step):
+                        recon.run_group(y_ext, out_ext, tok_ext, w_ext, [e], [s0 + off],
+                                        [min(step, c - off)], ptrs = ptrs)
+            ring.consumed[b].record(compute)
+            if k + ring.nbufs < nb:
+                self._dma(k + ring.nbufs)
+        return out_ext[:rows]
+
+
 def mixed_rate_gpu_mask(widths: list[list[int]]) -> tuple[np.ndarray | None, tuple]:
     """Mixed-rate ("MixedK") layers: widths holds, per projection (gate, up, down order), each
     expert's trellis tile width. The GPU tiers take one K per projection, so only the experts of
@@ -427,6 +623,8 @@ class HybridLayer:
         self.cpuloc = cpuloc                # (num_hosts, E) worker-local index or -1
         self.cache_layer = None
         self.finalized = False
+        # Prefill stream lane: host copy of the experts' suh / svh addresses, built at first use
+        self.stream_scales = None
         # Decode-size static buffers (rows up to the slot capacity): masked selection
         cap = max(dispatcher.cap_rows, 1) * self.topk
         self.sel_buf = torch.empty((cap,), dtype = torch.long, device = self.device)
@@ -443,15 +641,17 @@ class HybridLayer:
 
 
 class HybridPending:
-    __slots__ = ("kind", "items", "fused_cap", "deferred")
+    __slots__ = ("kind", "items", "fused_cap", "deferred", "stream")
 
-    def __init__(self, kind, items, fused_cap = None, deferred = None):
+    def __init__(self, kind, items, fused_cap = None, deferred = None, stream = None):
         self.kind = kind
         self.items = items
         self.fused_cap = fused_cap
         # Partial deferral (decode): the second job per node holding the deferred picks, until
         # defer() takes it over; combine() collects it if the call does not defer after all
         self.deferred = deferred
+        # Prefill stream lane (StreamWork), computed and folded in by combine()
+        self.stream = stream
 
 
 # Module (or transformer block) attributes after the routed sum that a deferred CPU partial would
@@ -567,6 +767,8 @@ class HybridDispatcher:
         self.prefill_gpu_min_last = None    # threshold of the last prefill call
         self.explore = False                # this pass uses the bootstrap share (re-measure)
         self.side = {}                      # (host index, device index) -> stream
+        self.stream_rings = {}              # (device index, expert stride) -> StreamRing
+        self.prefill_stream_last = None     # (experts, MiB) on the stream lane, last prefill call
         # Decode jobs reserved but not yet collected: [host, reservation, published]. Normally
         # empty between layer calls; anything left (an exception or interrupt between submit and
         # combine) is drained at the next pass start, or the slots' reuse would wait forever
@@ -961,6 +1163,8 @@ class HybridDispatcher:
             prefill_cost_us = None if self.prefill_cost is None else
                 dict(per_expert = round(self.prefill_cost[0], 2), per_row = round(self.prefill_cost[1], 3)),
             prefill_gpu_min = self.prefill_gpu_min_last,
+            prefill_stream = None if getattr(self, "prefill_stream_last", None) is None else
+                dict(experts = self.prefill_stream_last[0], mib = self.prefill_stream_last[1]),
             cpu_frac_bootstrap = self.cpu_frac,
             cpu_us_per_expert = list(self.cpu_us),
             decode_threads = dict(fraction = self.decode_tuner.current(),
@@ -1030,8 +1234,10 @@ class HybridDispatcher:
         """Upper bound on a hybrid layer's prefill transient for `rows` tokens: the GPU tiers'
         bound (fused, batched groups; the heavy per-expert fallback is bounded by one batched
         group of max_rows rows plus its fp32 down slab), the CPU lanes' staging (per node: the
-        gathered rows, selections and the fp32 partial) and the selection buffers"""
-        w = hl._worst.get(rows)
+        gathered rows, selections and the fp32 partial), the selection buffers and the stream
+        lane (its VRAM ring and partial), so the cache gives the ring back before such a pass"""
+        shape = stream_ring_shape(hl.expert_bytes) if prefill_stream_on(rows, hl.device.type == "cuda") else None
+        w = hl._worst.get((rows, shape))
         if w is not None:
             return w
         m = hl.module_ref()
@@ -1047,8 +1253,14 @@ class HybridDispatcher:
         n = len(self.group.hosts)
         cpu = n * (rows * hl.ho * 4 + rows * hl.hi * 2 + rows * hl.topk * 12 + self.cap_rows * hl.ho * 4)
         sel = A * (8 + 4 * n) + EMAX * 4
-        w = gpu + cpu + sel
-        hl._worst[rows] = w
+        # Stream lane: the ring, its fp32 partial (with the padding sink row) and the sorted
+        # assignment lists. Its batched groups run after the GPU tiers' and fit their bound
+        stream = 0
+        if shape is not None:
+            nbufs, per, stride = shape
+            stream = nbufs * per * stride + (rows + 1) * hl.h * 4 + A * 32 + EMAX * 8
+        w = gpu + cpu + sel + stream
+        hl._worst[(rows, shape)] = w
         return w
 
     # ---- expert deferral (EXL3_MOE_DEFER) -------------------------------------------------------
@@ -1278,12 +1490,21 @@ class HybridDispatcher:
         self.prefill_gpu_min_last = gpu_min
         cache.issue(hl.cache_layer, sel, y, w, sel_gpu, hl.lane_buf, cpu_sel, nodes, self.node_cost, hl.hi,
                     1, 0, -1, 0.0, gpu_min, self.node_policy, self.group.pref)
+        E = hl.num_experts
+        cuda = dev.type == "cuda"
+        # Stream lane: the call's expert counts join the readback below
+        stream_on = prefill_stream_on(rows, cuda) and hl.cache_layer.host_view is not None
+        parts = [hl.lane_buf[:E], cpu_sel.view(-1)]
+        if stream_on:
+            s = sel.view(-1)
+            s = torch.where((s >= 0) & (s < E), s, E)
+            parts.append(torch.bincount(s, minlength = E + 1)[:E].to(torch.int32))
         # One host sync for the tier plan and the CPU row compression (the GPU tiers sync on
         # their own counts anyway)
-        both = torch.cat([hl.lane_buf[:hl.num_experts], cpu_sel.view(-1)]).cpu().numpy()
-        lanes = both[:hl.num_experts]
-        cs = both[hl.num_experts:].reshape(N, rows, hl.topk)
-        cuda = dev.type == "cuda"
+        both = torch.cat(parts).cpu().numpy()
+        lanes = both[:E]
+        cs = both[E: E + N * n].reshape(N, rows, hl.topk)
+        stream = self._stream_begin(hl, cache, y, sel, w, sel_gpu, lanes, both[E + N * n:]) if stream_on else None
         compute = torch.cuda.current_stream(dev) if cuda else None
         items = []
         w2 = w.view(rows, hl.topk)
@@ -1323,9 +1544,45 @@ class HybridDispatcher:
             items.append((i, tidx_d, out_t, done))
         # Zero-copy experts read host memory once per row tile in the fused kernel; capping the
         # fused tier moves larger experts to the batched tier (one read). That changes the tier
-        # of resident experts too, so gpu_exact keeps the regular plan (exact, more PCIe reads)
-        any_zc = bool((lanes == LANE_ZC).any()) and HT.dispatch != "gpu_exact"
-        return HybridPending("prefill", items, HT.zc_fused_rows if any_zc else None), sel_gpu.view(rows, hl.topk)
+        # of resident experts too, so gpu_exact keeps the regular plan (exact, more PCIe reads).
+        # Stream-lane experts are read from VRAM and do not count
+        zc = lanes == LANE_ZC
+        if stream is not None:
+            zc = zc.copy()
+            zc[stream.ids] = False
+        any_zc = bool(zc.any()) and HT.dispatch != "gpu_exact"
+        return HybridPending("prefill", items, HT.zc_fused_rows if any_zc else None, stream = stream), \
+            sel_gpu.view(rows, hl.topk)
+
+    def _stream_begin(self, hl, cache, y, sel, w, sel_gpu, lanes, counts):
+        """Prefill stream lane for this call (StreamWork), or None: zero-copy experts with at
+        least EXL3_EXPERT_PREFILL_STREAM_MIN_ROWS rows leave the GPU tiers' selection and
+        their weights start copying into the VRAM ring"""
+        m = hl.module_ref()
+        shape = stream_ring_shape(hl.expert_bytes)
+        if m is None or shape is None:
+            self.prefill_stream_last = None
+            return None
+        tiers = StreamWork.layer_tiers(m, y)
+        fused_t, fbufs, recon = tiers
+        if fbufs is None and recon is None:
+            self.prefill_stream_last = None
+            return None
+        # Without a batched tier only experts the fused tier takes can stream
+        ids = select_stream_experts(lanes, counts, HT.stream_min_rows,
+                                    None if recon is not None else fused_t)
+        self.prefill_stream_last = (int(ids.size), round(int(ids.size) * hl.expert_bytes / 2**20, 1))
+        if not ids.size:
+            return None
+        dev = hl.device
+        key = (dev.index, shape[2])
+        rings = self.__dict__.setdefault("stream_rings", {})
+        ring = rings.get(key)
+        if ring is None or (ring.nbufs, ring.per) != shape[:2]:
+            ring = rings[key] = StreamRing(dev, *shape)
+            cache.note_stream(ring.copy)
+        mask_streamed(sel_gpu, ids, hl.num_experts)
+        return StreamWork(ring, hl, m, tiers, y, sel.view(-1), w, ids, counts)
 
     def _prefill_gpu_min(self, hl, cache, sel) -> int:
         """Rows for a non-resident expert to go zero-copy in this prefill call: fixed by
@@ -1369,7 +1626,8 @@ class HybridDispatcher:
         return gpu_min
 
     def combine(self, hl: HybridLayer, final_hidden_states, pending: HybridPending):
-        """Fold the CPU lanes' partials into the routed sum (fp32, rows x h), stream-ordered"""
+        """Fold the CPU lanes' partials (and a prefill call's stream lane) into the routed sum
+        (fp32, rows x h), stream-ordered"""
         if pending is None:
             return final_hidden_states
         f2 = final_hidden_states.view(-1, final_hidden_states.shape[-1])
@@ -1387,6 +1645,10 @@ class HybridDispatcher:
                     tel.end(i, "decode", e0, compute)
                 self.inflight = [x for x in self.inflight if x[1] is not r]
             return final_hidden_states
+        if pending.stream is not None:
+            # Stream lane first: its batches run on the compute stream while the CPU lanes finish
+            st, pending.stream = pending.stream, None
+            f2.add_(st.run())
         for i, tidx, out_t, done in pending.items:
             e0 = tel.begin(compute) if tel is not None else None
             if done is not None:

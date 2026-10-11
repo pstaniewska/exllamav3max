@@ -908,6 +908,113 @@ def probe_bandwidth(timed_copy, floor_s = 0.5, cap_s = 2.0, asleep_gbs = 5.0):
             return sorted(tail)[len(tail) // 2]
 
 
+def run_staged_experts(y, out_ext, items, token_sorted, weight_sorted, base, stride, proj_off, gated,
+                       scales, Ks, activation, act_limit, cb, fused_t, fbufs, mtile, recon, ctx):
+    """GPU tiers over one batch of experts whose weights sit in a VRAM staging buffer, all on the
+    current stream (the caller has made it wait for the buffer's DMA). Shared by the streamed
+    prefill of -mcl / -mcs (_submit_prefill_streamed) and the hybrid prefill stream lane
+    (moe_hybrid_dispatch.StreamWork).
+
+    items: per expert (buffer position, expert id, segment start in token_sorted /
+    weight_sorted, rows). Position j's native-layout block starts at base + j * stride, its
+    projections at proj_off (g, u, d) within it. scales(e): the expert's (suh_g, svh_g, suh_u,
+    svh_u, suh_d, svh_d) addresses (gate entries ignored when gateless). Ks: (Kg, Ku, Kd); cb:
+    (mcg, mul1) per projection, flattened. Experts with up to fused_t rows run through one
+    fused exl3_moe launch per row tile (fbufs: its temp buffers, None = no fused tier); the
+    rest through batched reconstruct groups (recon, None = no batched tier) up to recon.max_rows
+    rows. ctx: per-call dict caching the batched tier's padded inputs across batches.
+    Accumulates weighted into out_ext (rows + 1, the last row the batched tier's padding sink).
+    Returns the (position, expert) pairs neither tier took, for the caller's own fallback"""
+    from ..modules.moe_batch_recon import plan_groups
+    rows = out_ext.shape[0] - 1
+    out = out_ext[:rows]
+    g_off, u_off, d_off = proj_off
+
+    # Mid tier: one fused kernel over the batch's cooler experts. Heavy experts stay in the
+    # descriptor (the kernel skips counts above the temp-row capacity) so the token segments
+    # line up with expert_count
+    fc = [c for _, _, _, c in items if c <= fused_t] if fbufs is not None and fused_t else []
+    if fc:
+        tbl = [[] for _ in range(9)]
+        for j, e, _, _ in items:
+            bb = base + j * stride
+            sg, vg, su, vu, sd, vd = scales(e)
+            if gated:
+                tbl[0].append(bb + g_off)
+                tbl[1].append(sg)
+                tbl[2].append(vg)
+            tbl[3].append(bb + u_off)
+            tbl[4].append(su)
+            tbl[5].append(vu)
+            tbl[6].append(bb + d_off)
+            tbl[7].append(sd)
+            tbl[8].append(vd)
+        if not gated:
+            # Placeholder gate tables, never dereferenced (gate GEMM is skipped)
+            for i in (0, 1, 2):
+                tbl[i] = tbl[i + 3]
+        tblt = host_to_device(torch.tensor(tbl, dtype = torch.int64), y.device)
+        ec = host_to_device(torch.tensor([c for _, _, _, c in items] + [0], dtype = torch.long), y.device)
+        tok = torch.cat([token_sorted[s : s + c] for _, _, s, c in items])
+        wts = torch.cat([weight_sorted[s : s + c] for _, _, s, c in items]).half()
+        Kg, Ku, Kd = Ks
+        # Row-tile tiers as on the GPU side (block_sparse_mlp): one launch per tile over its
+        # expert range
+        t1 = sum(1 for c in fc if 16 < c <= 32)
+        t2 = sum(1 for c in fc if c > 32)
+        tiers = [(t2, 33, fused_t, 64), (t1, 17, 32, 32), (len(fc) - t1 - t2, 1, 16, 16)] \
+            if mtile and (t1 or t2) else [(len(fc), 1, fused_t, 16)]
+        for n_act, lo, hi, mt in tiers:
+            if not n_act:
+                continue
+            ext.exl3_moe(
+                y, out, ec, tok, wts,
+                fbufs[0], fbufs[1], fbufs[2], fbufs[3],
+                activation, Kg, Ku, Kd,
+                tblt[0], tblt[1], tblt[2], tblt[3], tblt[4], tblt[5],
+                tblt[6], tblt[7], tblt[8],
+                *cb,
+                act_limit, n_act, None, None, lo, hi, mt
+            )
+
+    # Heavy tier: batched reconstruct (groups of experts, a handful of launches per group; see
+    # moe_batch_recon.py). Experts above the batched tier's row cap are left to the caller
+    # (large slabs pad and stream more than they save in launches)
+    heavy = [(j, e, s, c) for j, e, s, c in items if not (fc and c <= fused_t)]
+    if recon is None:
+        return [(j, e) for j, e, _, _ in heavy]
+    single = [(j, e) for j, e, _, c in heavy if c > recon.max_rows]
+    heavy = [h for h in heavy if h[3] <= recon.max_rows]
+    if heavy:
+        y_ext, tok_ext, w_ext = staged_recon_inputs(y, token_sorted, weight_sorted, recon.dims_u[0], ctx)
+        at = {e: (j, s, c) for j, e, s, c in heavy}
+        for grp in plan_groups([e for _, e, _, _ in heavy], lambda e: at[e][2], recon.cap):
+            # Trellis addresses inside the staging buffer, per projection
+            bb = [base + at[e][0] * stride for e in grp]
+            recon.run_group(
+                y_ext, out_ext, tok_ext, w_ext,
+                grp, [at[e][1] for e in grp], [at[e][2] for e in grp],
+                ptrs = ([b + g_off for b in bb] if gated else None,
+                        [b + u_off for b in bb], [b + d_off for b in bb]))
+    return single
+
+
+def staged_recon_inputs(y, token_sorted, weight_sorted, hi, ctx):
+    """Padding sources / sinks of the batched tier, built once per call (cached in ctx): the
+    input zero-padded to the quantized width with a zero row appended, and the sorted assignment
+    lists with a sentinel entry (token = rows, the output's sink row; weight 0)"""
+    r = ctx.get("recon_ext")
+    if r is None:
+        rows = y.shape[0]
+        y_in = y if y.shape[1] == hi else torch.nn.functional.pad(y, (0, hi - y.shape[1]))
+        r = ctx["recon_ext"] = (
+            torch.cat([y_in, torch.zeros((1, hi), dtype = y.dtype, device = y.device)]),
+            torch.cat([token_sorted, torch.full((1,), rows, dtype = token_sorted.dtype, device = y.device)]),
+            torch.cat([weight_sorted.half(), torch.zeros((1,), dtype = torch.half, device = y.device)]),
+        )
+    return r
+
+
 # Page-locking budget and failure tracking for mapped expert homes (hybrid MoE), shared by every
 # host in the process: registering 100+ GiB is not guaranteed to succeed (RLIMIT_MEMLOCK, driver
 # limits, fragmentation), so each 1 GiB chunk is registered on its own as it appears, failures
@@ -2018,7 +2125,6 @@ class MoeCpuHost:
 
     def _submit_prefill_streamed(self, layer_idx, y, selected_experts, routing_weights, spec,
                                  streamed, st, counts_h, flat, shifted, neg):
-        from ..modules.moe_batch_recon import plan_groups
         rows = y.shape[0]
         h = y.shape[1]
         E = spec["num_experts"]
@@ -2079,7 +2185,7 @@ class MoeCpuHost:
         # gateless, no per-expert biases, no padded dims
         fused_t = self._stream_fused_t(spec, aux, h)
         recon = self._stream_recon_layer(st, layer_idx, spec, aux, y.device)
-        recon_ctx = None
+        recon_ctx = {}
         fbufs = None
         if fused_t and any(counts_h[e] <= fused_t for e in streamed):
             fbufs = self._stream_fused_bufs(st, spec, y.device)
@@ -2162,102 +2268,26 @@ class MoeCpuHost:
             per_e = [(bi, e, token_sorted[offs[e] : offs[e] + counts_h[e]],
                       weight_sorted[offs[e] : offs[e] + counts_h[e]])
                      for bi, e in enumerate(batch)]
-
-            # Mid tier: one fused kernel over the batch's cooler experts. Heavy experts stay in
-            # the descriptor (the kernel skips counts above the temp-row capacity) so the
-            # token_sorted segments line up with expert_count
-            n_fused = sum(1 for _, e, _, _ in per_e if counts_h[e] <= fused_t) if fused_t else 0
             if TUNING.stream_debug:
+                n_fused = sum(1 for e in batch if counts_h[e] <= fused_t) if fused_t and fbufs is not None else 0
                 print(f" --   batch L{layer_idx} ws{ws}: {len(batch)} experts, fused_t {fused_t}, "
                       f"n_fused {n_fused}, counts {[counts_h[e] for e in batch]}")
-            if n_fused:
-                base = vslot.data_ptr()
-                tbl = [[] for _ in range(9)]
-                for bi, e, _, _ in per_e:
-                    bb = bi * exp_b
-                    if gated:
-                        tbl[0].append(base + bb)
-                        tbl[1].append(aux["suh_g"][e].data_ptr())
-                        tbl[2].append(aux["svh_g"][e].data_ptr())
-                    tbl[3].append(base + bb + gb)
-                    tbl[4].append(aux["suh_u"][e].data_ptr())
-                    tbl[5].append(aux["svh_u"][e].data_ptr())
-                    tbl[6].append(base + bb + gb + ub)
-                    tbl[7].append(aux["suh_d"][e].data_ptr())
-                    tbl[8].append(aux["svh_d"][e].data_ptr())
-                if not gated:
-                    # Placeholder gate tables, never dereferenced (gate GEMM is skipped)
-                    for i in (0, 1, 2):
-                        tbl[i] = tbl[i + 3]
-                tblt = host_to_device(torch.tensor(tbl, dtype = torch.int64), y.device)
-                ec = host_to_device(torch.tensor([counts_h[e] for _, e, _, _ in per_e] + [0], dtype = torch.long), y.device)
-                tok = torch.cat([seg for _, _, seg, _ in per_e])
-                wts = torch.cat([wseg for _, _, _, wseg in per_e]).half()
-                Ku, Kd = pd["u"][2], pd["d"][2]
-                Kg = pd["g"][2] if gated else Ku
-                # Row-tile tiers as on the GPU side (block_sparse_mlp): one launch per tile over
-                # its expert range. Streamed experts are mul1 by construction
-                fc = [counts_h[e] for _, e, _, _ in per_e if counts_h[e] <= fused_t]
-                t1 = sum(1 for c in fc if 16 < c <= 32)
-                t2 = sum(1 for c in fc if c > 32)
-                tiers = [(t2, 33, fused_t, 64), (t1, 17, 32, 32), (len(fc) - t1 - t2, 1, 16, 16)] \
-                    if TUNING.mtile and (t1 or t2) else [(n_fused, 1, fused_t, 16)]
-                for n_act, lo, hi, mt in tiers:
-                    if not n_act:
-                        continue
-                    ext.exl3_moe(
-                        y, out, ec, tok, wts,
-                        fbufs[0], fbufs[1], fbufs[2], fbufs[3],
-                        spec["activation"], Kg, Ku, Kd,
-                        tblt[0], tblt[1], tblt[2], tblt[3], tblt[4], tblt[5],
-                        tblt[6], tblt[7], tblt[8],
-                        False, True, False, True, False, True,
-                        float(spec["act_limit"] or 0.0), n_act, None, None, lo, hi, mt
-                    )
 
-            # Heavy tier: batched reconstruct (groups of experts, a handful of launches per
-            # group; see moe_batch_recon.py) when eligible, else per expert
-            heavy = [(bi, e) for bi, e, _, _ in per_e if not (fused_t and counts_h[e] <= fused_t)]
-            if recon is not None:
-                # Experts above the batched tier's row cap stay on the per-expert loop (large
-                # slabs pad and stream more than they save in launches)
-                single = [(bi, e) for bi, e in heavy if counts_h[e] > recon.max_rows]
-                heavy = [(bi, e) for bi, e in heavy if counts_h[e] <= recon.max_rows]
-            else:
-                # No batched tier (EXL3_MOE_STREAM_BATCH_RECON=0 or biased experts): every
-                # heavy expert runs on the per-expert loop below
-                single = heavy
-                heavy = []
-            if heavy:
-                if recon_ctx is None:
-                    # Padding sources / sinks: a zero input row, an output sink row (out is a
-                    # view of the first `rows` rows of out_ext) and sentinel entries after the
-                    # sorted assignment lists
-                    hi = spec["hi"]
-                    y_in = y if y.shape[1] == hi else torch.nn.functional.pad(y, (0, hi - y.shape[1]))
-                    recon_ctx = (
-                        torch.cat([y_in, torch.zeros((1, hi), dtype = y.dtype, device = y.device)]),
-                        torch.cat([token_sorted, torch.full((1,), rows, dtype = token_sorted.dtype,
-                                                            device = y.device)]),
-                        torch.cat([weight_sorted.half(), torch.zeros((1,), dtype = torch.half,
-                                                                     device = y.device)]),
-                    )
-                y_ext, tok_ext, w_ext = recon_ctx
-                base = vslot.data_ptr()
-                slot_of = {e: bi for bi, e in heavy}
-                for grp in plan_groups([e for _, e in heavy], lambda e: counts_h[e], recon.cap):
-                    # Trellis addresses inside the VRAM slot, per projection
-                    bb = [base + slot_of[e] * exp_b for e in grp]
-                    recon.run_group(
-                        y_ext, out_ext, tok_ext, w_ext,
-                        grp, [offs[e] for e in grp], [counts_h[e] for e in grp],
-                        ptrs = (bb if gated else None, [b + gb for b in bb], [b + gb + ub for b in bb]))
-                heavy = []
-            single_ids = {e for _, e in single} if recon is not None else None
+            # Fused and batched tiers (run_staged_experts); what neither takes (experts above
+            # the batched tier's row cap, or every heavy expert without a batched tier) runs on
+            # the per-expert loop below. Streamed experts are mul1 by construction
+            single = run_staged_experts(
+                y, out_ext, [(bi, e, offs[e], counts_h[e]) for bi, e in enumerate(batch)],
+                token_sorted, weight_sorted, vslot.data_ptr(), exp_b, (0, gb, gb + ub), gated,
+                lambda e: (aux["suh_g"][e].data_ptr() if gated else 0, aux["svh_g"][e].data_ptr() if gated else 0,
+                           aux["suh_u"][e].data_ptr(), aux["svh_u"][e].data_ptr(),
+                           aux["suh_d"][e].data_ptr(), aux["svh_d"][e].data_ptr()),
+                (pd["g"][2] if gated else pd["u"][2], pd["u"][2], pd["d"][2]),
+                spec["activation"], float(spec["act_limit"] or 0.0), (False, True, False, True, False, True),
+                fused_t, fbufs, TUNING.mtile, recon, recon_ctx)
+            single_ids = {e for _, e in single}
             for bi, e, idx, wseg in per_e:
-                if fused_t and counts_h[e] <= fused_t:
-                    continue
-                if single_ids is not None and e not in single_ids:
+                if e not in single_ids:
                     continue
                 boff = (bi * exp_b) // 2
                 xg = y.index_select(0, idx)

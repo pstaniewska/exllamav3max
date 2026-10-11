@@ -1006,3 +1006,123 @@ def test_partial_defer_needs_three_slots():
         h.num_slots = 3
     d._link_layers()
     assert d.can_defer(hl, m, 1)
+
+
+# ---- prefill stream lane (EXL3_EXPERT_PREFILL_STREAM) -------------------------------------------
+
+@pytest.mark.parametrize("mode, rows, cuda, want", [
+    ("auto", 2047, True, False), ("auto", 2048, True, True), ("auto", 1 << 14, False, False),
+    ("1", 65, True, True), ("1", 65, False, False), ("0", 1 << 14, True, False),
+])
+def test_prefill_stream_threshold(mode, rows, cuda, want):
+    D.HT.stream, D.HT.stream_rows = mode, 2048
+    assert D.prefill_stream_on(rows, cuda) is want
+
+
+def test_stream_ring_shape_respects_slots_and_mib():
+    D.HT.stream_slots, D.HT.stream_mb, D.HT.stream_bufs = 32, 512, 4
+    assert D.stream_ring_shape(3 << 20) == (4, 8, 3 << 20)          # 32 slots, 96 MiB
+    nb, per, stride = D.stream_ring_shape(17 << 20)                 # MiB-bound: 30 experts
+    assert stride == 17 << 20 and nb * per * stride <= 512 << 20 and (nb, per) == (4, 7)
+    assert D.stream_ring_shape((17 << 20) + 1)[2] % 256 == 0        # cache-slot alignment
+    D.HT.stream_slots = 3
+    assert D.stream_ring_shape(1 << 20) == (3, 1, 1 << 20)          # fewer experts than buffers
+    assert D.stream_ring_shape(300 << 20) is None                   # cannot double-buffer
+
+
+def test_select_stream_experts_takes_zero_copy_experts_hottest_first():
+    E = 8
+    lanes = np.full(ref.EMAX, ref.LANE_NONE, dtype = np.int32)
+    lanes[[1, 2, 3, 5, 6]] = ref.LANE_ZC
+    lanes[4] = ref.LANE_GPU                                         # resident: never streamed
+    lanes[0] = 1                                                    # CPU node 1
+    counts = np.array([90, 3, 40, 1, 70, 200, 0, 5], dtype = np.int32)
+    assert D.select_stream_experts(lanes, counts, 1).tolist() == [5, 2, 1, 3]
+    assert D.select_stream_experts(lanes, counts, 4).tolist() == [5, 2]
+    assert D.select_stream_experts(lanes, counts, 1, max_rows = 64).tolist() == [2, 1, 3]
+    assert D.select_stream_experts(lanes[:E], counts, 1000).size == 0
+
+
+def test_mask_streamed_drops_picks_like_cpu_lanes():
+    E = 8
+    sel_gpu = torch.tensor([0, 3, 5, 8, 3, 7])                      # 8: already a CPU pick
+    D.mask_streamed(sel_gpu, np.array([3, 7]), E)
+    assert sel_gpu.tolist() == [0, 8, 5, 8, 8, 8]
+
+
+def test_prefill_stream_lane_stays_off_on_the_reference_backend():
+    d, hl, hosts, cache = make(E = 16, N = 2, rows = 80, dispatch = "hybrid", zc_max = None,
+                               stream = "1", stream_rows = 1)
+    sel = torch.stack([torch.randperm(16)[:4] for _ in range(80)])
+    pend, sel_gpu = d.submit(hl, torch.randn((80, 8)).half(), sel, torch.rand((80, 4)).half())
+    assert pend.kind == "prefill" and pend.stream is None
+
+
+def test_worst_case_counts_the_stream_ring():
+    d, hl, hosts, cache = make(dispatch = "hybrid", zc_max = None)
+    mod = type("M", (), dict(batch_recon = None, prefill_worst_case_parts = lambda self, r, a: (0,)))()
+    hl.module_ref = lambda: mod
+    hl._worst = {}
+    hl.expert_bytes = 3 << 20
+    hl.device = torch.device("cuda", 0)                             # a device object, never used
+    D.HT.stream, D.HT.stream_rows = "0", 2048
+    D.HT.stream_slots, D.HT.stream_mb, D.HT.stream_bufs = 32, 512, 4
+    base, small = d.worst_case(hl, 4096), d.worst_case(hl, 1024)
+    D.HT.stream = "auto"
+    with_ring = d.worst_case(hl, 4096)
+    assert with_ring - base >= 32 * (3 << 20) + 4097 * hl.h * 4
+    assert d.worst_case(hl, 1024) == small                          # below the threshold: no ring
+    D.HT.stream = "0"
+    assert d.worst_case(hl, 4096) == base                           # cached per setting
+
+
+def test_run_staged_experts_tables_and_tiers(monkeypatch):
+    # The shared batch body of the streamed prefill and the stream lane, with the kernels stubbed:
+    # pointer tables address the staging buffer per (position, projection), the fused tier is
+    # split into row tiles, heavier experts form batched groups with buffer pointers, and experts
+    # above the batched tier's row cap come back to the caller
+    for name in ("silu_mul", "gelu_mul", "silu_oai_mul", "relu2_mul", "relu_mul"):
+        monkeypatch.setattr(H.ext, name, lambda *a: None, raising = False)
+    launches, groups = [], []
+
+    def exl3_moe(y, out, ec, tok, wts, b0, b1, b2, b3, act, Kg, Ku, Kd, *rest):
+        tbl = [t.tolist() for t in rest[:9]]
+        flags = rest[9:15]
+        lo, hi, mt = rest[-3:]
+        launches.append(dict(tbl = tbl, ec = ec.tolist(), tok = tok.tolist(), n_act = rest[16],
+                             tier = (lo, hi, mt), flags = flags, K = (Kg, Ku, Kd)))
+
+    monkeypatch.setattr(H.ext, "exl3_moe", exl3_moe, raising = False)
+
+    class Recon:
+        max_rows, cap, dims_u = 512, 4, (8, 16, 3)
+
+        def run_group(self, y_ext, out_ext, tok_ext, w_ext, ids, starts, counts, ptrs = None):
+            groups.append((ids, starts, counts, ptrs, y_ext.shape[0], tok_ext[-1].item()))
+
+    rows, base, stride, off = 1000, 1 << 32, 4096, (0, 1024, 2048)
+    counts = [5, 20, 40, 300, 900]
+    starts = np.concatenate(([0], np.cumsum(counts)))[:-1].tolist()
+    items = [(j, 10 + j, starts[j], c) for j, c in enumerate(counts)]
+    tok = torch.arange(sum(counts)) % rows
+    wts = torch.rand(sum(counts)).half()
+    y = torch.randn((rows, 8)).half()
+    out_ext = torch.zeros((rows + 1, 8))
+    scales = lambda e: tuple(e * 100 + i for i in range(6))
+    single = H.host.run_staged_experts(
+        y, out_ext, items, tok, wts, base, stride, off, True, scales, (3, 4, 5), 0, 0.0,
+        (False, True) * 3, 64, (None,) * 4, True, Recon(), {})
+    assert single == [(4, 14)]
+    assert [l["tier"] for l in launches] == [(33, 64, 64), (17, 32, 32), (1, 16, 16)]
+    assert [l["n_act"] for l in launches] == [1, 1, 1]
+    t = launches[0]
+    assert t["ec"] == counts + [0] and t["K"] == (3, 4, 5) and t["flags"] == (False, True) * 3
+    assert t["tbl"][0] == [base + j * stride for j in range(5)]
+    assert t["tbl"][3] == [base + j * stride + 1024 for j in range(5)]
+    assert t["tbl"][6] == [base + j * stride + 2048 for j in range(5)]
+    assert t["tbl"][1] == [(10 + j) * 100 for j in range(5)] and t["tbl"][8] == [(10 + j) * 100 + 5 for j in range(5)]
+    assert t["tok"] == tok.tolist()
+    ids, gs, gc, ptrs, ny, sentinel = groups[0]
+    assert len(groups) == 1 and ids == [13] and gs == [starts[3]] and gc == [300]
+    assert ptrs == ([base + 3 * stride], [base + 3 * stride + 1024], [base + 3 * stride + 2048])
+    assert ny == rows + 1 and sentinel == rows                    # padded inputs and the sink row

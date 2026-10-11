@@ -863,6 +863,14 @@ its default. In short:
   call on the decode lane policy, default the CPU slot rows; wider calls use the prefill rule),
   `EXL3_EXPERT_PREFILL_GPU_MIN` (default `auto`: the prefill split between zero-copy and CPU
   lanes is chosen per call from measured PCIe and CPU costs; a number fixes the row threshold),
+  `EXL3_EXPERT_PREFILL_STREAM` (default `auto`: in prefill calls of at least
+  `EXL3_EXPERT_PREFILL_STREAM_ROWS` rows, default 2048, zero-copy experts with at least
+  `EXL3_EXPERT_PREFILL_STREAM_MIN_ROWS` rows, default 1, are DMAed from their pinned home into a
+  VRAM ring on a copy stream and run by the layer's own fused / batched GPU kernels instead of
+  reading host memory inside the kernels; `1` every prefill call, `0` off; CUDA only, decode
+  unaffected; the ring holds at most `EXL3_EXPERT_PREFILL_STREAM_SLOTS` experts, default 32, and
+  `EXL3_EXPERT_PREFILL_STREAM_MB`, default 512, in `EXL3_EXPERT_PREFILL_STREAM_BUFS` buffers,
+  default 4, and counts toward the prefill transient the cache leaves free),
   `EXL3_MOE_ADAPTIVE_EMA`,
   `EXL3_HYBRID_MOE_DEBUG`, `EXL3_HYBRID_MOE_PROFILE` (CPU-lane wait measured with CUDA events,
   no host sync), and `EXL3_MOE_DEFER` (decode CPU partials folded in one block later; an

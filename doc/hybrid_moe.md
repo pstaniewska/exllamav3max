@@ -376,6 +376,19 @@ The GPU tiers are the upstream ones with two changes:
   an expert's weights once per row tile; the batched reconstruct tier reads them once per call. The
   slot-scratch accounting uses the same cap. The cap moves resident experts to another tier too, so
   `gpu_exact` never applies it and keeps the all-VRAM tier plan at the cost of more PCIe reads.
+- **Stream lane** (`EXL3_EXPERT_PREFILL_STREAM`, default `auto`: calls of at least
+  `EXL3_EXPERT_PREFILL_STREAM_ROWS` rows; CUDA only). Zero-copy experts with at least
+  `EXL3_EXPERT_PREFILL_STREAM_MIN_ROWS` rows leave the GPU tiers' selection like CPU picks. Their
+  native-layout blocks are copied from the pinned homes into a VRAM ring on a copy stream (a few
+  buffers, double-buffered with ready / consumed events, the `-mcl` / `-mcs` streamed prefill's
+  protocol) and computed from there by the layer's own fused and batched kernels
+  (`moe_cpu_host.run_staged_experts`, shared with that path) into an fp32 partial that `combine`
+  adds before the CPU lanes' partials. The first ring fill overlaps the call's GPU tiers. Same
+  kernels and weights, so each expert's output equals the all-VRAM one; only the fp32 summation
+  order differs. With every zero-copy expert streamed, the fused row cap above does not apply.
+  The ring (`_SLOTS` experts and `_MB` MiB in `_BUFS` buffers) is allocated per call and counted
+  in `worst_case`, so the cache gives back a chunk ahead of such passes. Layer L + 1 is not
+  prefetched during layer L yet.
 - **Leftover experts.** An expert neither tier takes (above the batched tier's per-expert row cap)
   runs as single-expert batched groups of at most that cap, accumulating weighted. Every group
   stays inside the batched tier's own buffer bound, and its weights come from the live tables.
@@ -426,6 +439,12 @@ classic paths, `EXL3_NUMA_ENABLE=1`) is set.
 | `EXL3_EXPERT_HOME_PIN_LIMIT_GB` | unset | registered-bytes cap for homes |
 | `EXL3_EXPERT_DECODE_MAX_ROWS` | slot rows (`64`) | widest call on the decode path; wider calls take the prefill path |
 | `EXL3_EXPERT_PREFILL_GPU_MIN` | `auto` | prefill rows for a non-resident expert to go zero-copy; `auto` chooses per call from measured costs |
+| `EXL3_EXPERT_PREFILL_STREAM` | `auto` | stream lane for zero-copy experts in prefill: `auto` (calls of at least `_ROWS` rows), `1`, `0` |
+| `EXL3_EXPERT_PREFILL_STREAM_ROWS` | `2048` | smallest prefill call that streams under `auto` |
+| `EXL3_EXPERT_PREFILL_STREAM_MIN_ROWS` | `1` | rows for a zero-copy expert to take the stream lane |
+| `EXL3_EXPERT_PREFILL_STREAM_SLOTS` | `32` | ring capacity in experts |
+| `EXL3_EXPERT_PREFILL_STREAM_MB` | `512` | ring capacity in MiB |
+| `EXL3_EXPERT_PREFILL_STREAM_BUFS` | `4` | ring buffers (DMA / compute pipeline depth) |
 | `EXL3_MOE_ZC_MAX` | `auto` | GPU quota of misses per decode call |
 | `EXL3_MOE_ZC_CPU_FRAC_INIT` | `0.5` | CPU share of flexible misses until the cost model is measured |
 | `EXL3_MOE_ADAPTIVE_EMA` | `0.1` | smoothing of measured CPU cost |
