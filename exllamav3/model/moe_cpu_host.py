@@ -1299,6 +1299,8 @@ class MoeCpuHost:
         self.v_pass_wake = u32[16:17]
         self.v_abort = u32[32:33]
         self.v_ready = u32[48:49]
+        self.v_thread_caps = u32[49:51]     # runtime caps: multi-row jobs, single-row jobs
+        self.v_thread_caps[:] = getattr(self, "_thread_caps", (0, 0))
         self.v_jobs_tail = u32[64:65]
         self.v_jobs_head = u32[80:81]
         self.v_jobs = np.frombuffer(
@@ -1426,6 +1428,18 @@ class MoeCpuHost:
 
     def aborted(self) -> bool:
         return bool(self.started and self.v_abort is not None and self.v_abort[0])
+
+    def set_thread_caps(self, multi_row: int = 0, single_row: int = 0) -> bool:
+        """Cap the worker's pool participants per job from the next job on, without a restart:
+        multi_row for prefill-shaped jobs, single_row for one-token (decode) jobs; 0 lifts a cap.
+        Caps never exceed the pool's thread count. Before the worker starts they are kept and
+        applied at start; returns whether they took effect now"""
+        self._thread_caps = (max(0, int(multi_row)), max(0, int(single_row)))
+        v = getattr(self, "v_thread_caps", None)
+        if v is None:
+            return False
+        v[:] = self._thread_caps
+        return True
 
     def begin_pass(self):
         if not self.started:
@@ -2345,6 +2359,7 @@ class MoeCpuHost:
             self.sstate = None
             self._dev_bufs = {}
             self.v_quit = self.v_pass_wake = self.v_abort = self.v_ready = None
+            self.v_thread_caps = None
             self.v_jobs_tail = self.v_jobs_head = self.v_jobs = None
             self.v_stage_tail = self.v_stage_head = self.v_stage_jobs = None
             self._flags_u32 = None
