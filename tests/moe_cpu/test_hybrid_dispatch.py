@@ -835,3 +835,174 @@ def test_hc_fold_is_exact():
     assert hl.defer_v is v_buf and hl.defer_d is d_buf
     assert rec.v.data_ptr() in (v_buf[0].data_ptr(), v_buf[1].data_ptr())
     d.fold(rec, torch.zeros((R, Hc, Dm)), rec.v)
+
+
+class SlotHost(FakeHost):
+    """FakeHost with a ring of slots (as MoeCpuHost) whose collect runs the fake expert function
+    on what the slot holds: out[r] += w[r, k] * (local + 1 + 100 * node) * x[r] per pick >= 0"""
+
+    def __init__(self, rows, topk, h, num_slots):
+        super().__init__(rows * topk, rows, h, h)
+        self.num_slots, self.next_slot, self.topk, self.h = num_slots, 0, topk, h
+        self.ring = [dict(sel = torch.full((rows * topk,), -9, dtype = torch.int32),
+                          x = torch.zeros((rows * h,), dtype = torch.half),
+                          w = torch.zeros((rows * topk,), dtype = torch.half)) for _ in range(num_slots)]
+        self.collected = []
+
+    def fused_reserve(self, idx, rows, device):
+        self.events.append("reserve")
+        k = self.next_slot
+        self.next_slot = (k + 1) % self.num_slots
+        s = self.ring[k]
+        slot = dict(sel_dev = s["sel"].data_ptr(), x_dev = s["x"].data_ptr(), w_dev = s["w"].data_ptr(),
+                    x_cap = s["x"].numel(), sel_cap = s["sel"].numel(), **s)
+        return dict(seq = 1, slot_idx = k, slot = slot, counts = self.counts, ho = self.h, dev = device, rows = rows)
+
+    def fused_collect(self, r, final_2d):
+        self.events.append("collect")
+        k, rows = r["slot_idx"], r["rows"]
+        picks = set()
+        if int(self.counts[k]):
+            s = self.ring[k]
+            sel = s["sel"][:rows * self.topk].view(rows, self.topk)
+            w = s["w"][:rows * self.topk].view(rows, self.topk)
+            x = s["x"][:rows * self.h].view(rows, self.h)
+            for i in range(rows):
+                for j in range(self.topk):
+                    e = int(sel[i, j])
+                    if e >= 0:
+                        final_2d[i] += float(w[i, j]) * (e + 1 + 100 * self.node) * x[i].float()
+                        picks.add((i, j))
+        self.collected.append(picks)
+
+
+def split_setup(rows = 2, num_slots = 3, **ht):
+    """defer_setup with slot-ring hosts that compute their partial from the staged slot"""
+    d, hl, hl2, _, cache = defer_setup(rows = rows, **ht)
+    hosts = [SlotHost(rows, 4, 8, num_slots) for _ in range(2)]
+    for q, fh in enumerate(hosts):
+        fh.node = q
+    d.group.hosts = hosts
+    d._link_layers()
+    return d, hl, hl2, hosts, cache
+
+
+def split_case(d, hl, rows, w):
+    torch.manual_seed(5)
+    y = torch.randn((rows, 8)).half()
+    sel = torch.stack([torch.randperm(16)[:4] for _ in range(rows)])
+    pend, sel_gpu = d.submit(hl, y, sel, w, True)
+    cpu = {(i, j) for i in range(rows) for j in range(4) if int(sel_gpu[i, j]) == 16}
+    assert cpu, "expected CPU-lane picks"
+
+    def partial(picks):
+        out = torch.zeros((rows, 8))
+        for i, j in picks:
+            e = int(sel[i, j])
+            out[i] += float(w[i, j]) * (e // 2 + 1 + 100 * (e % 2)) * y[i].float()
+        return out
+    return pend, cpu, partial
+
+
+def lowest(cpu, w, cap, min_w = None):
+    want = set()
+    for i in range(w.shape[0]):
+        c = sorted((float(w[i, j]), j) for j in range(w.shape[1])
+                   if (i, j) in cpu and (min_w is None or float(w[i, j]) < min_w))
+        want |= {(i, j) for _, j in (c[:cap] if cap else c)}
+    return want
+
+
+@pytest.mark.parametrize("cap", [1, 2, 3])
+def test_partial_defer_takes_the_lowest_weight_cpu_picks(cap):
+    rows = 2
+    d, hl, hl2, hosts, cache = split_setup(rows, defer_max = cap)
+    assert d.can_defer(hl, defer_module(), rows)
+    w = torch.tensor([[0.5, 0.125, 0.25, 0.375], [0.0625, 0.75, 0.1875, 0.3125]]).half()
+    pend, cpu, partial = split_case(d, hl, rows, w)
+    assert pend.deferred is not None and len(d.inflight) == 4
+    assert all(h.events == ["reserve"] * 2 + ["publish"] * 2 for h in hosts)
+    rec = d.defer(hl, pend, rows)
+    # Immediate part: collected in the layer (combine), before the layer output
+    f = torch.zeros((rows, 8))
+    d.combine(hl, f, pend)
+    assert all(h.events.count("collect") == 1 for h in hosts) and len(d.inflight) == 2
+    deferred = lowest(cpu, w, cap)
+    assert set().union(*(h.collected[0] for h in hosts)) == cpu - deferred
+    assert torch.allclose(f, partial(cpu - deferred), atol = 1e-3)
+    # Deferred part: folded at the end of the next block
+    x = torch.zeros((1, rows, 8))
+    D.fold_deferred({"moe_fold": rec}, x)
+    assert d.inflight == [] and all(h.events.count("collect") == 2 for h in hosts)
+    assert set().union(*(h.collected[1] for h in hosts)) == deferred
+    assert torch.allclose(x.view(rows, 8), partial(deferred), atol = 1e-3)
+    assert torch.allclose(f + x.view(rows, 8), partial(cpu), atol = 1e-3)
+
+
+@pytest.mark.parametrize("cap", [0, 1])
+def test_partial_defer_keeps_heavy_experts_immediate(cap):
+    rows = 2
+    d, hl, hl2, hosts, cache = split_setup(rows, defer_max = cap, defer_min_w = 0.3)
+    w = torch.tensor([[0.5, 0.125, 0.25, 0.375], [0.0625, 0.75, 0.1875, 0.3125]]).half()
+    pend, cpu, partial = split_case(d, hl, rows, w)
+    rec = d.defer(hl, pend, rows)
+    f = torch.zeros((rows, 8))
+    d.combine(hl, f, pend)
+    x = torch.zeros((rows, 8))
+    d.fold(rec, x)
+    deferred = lowest(cpu, w, cap, 0.3)
+    assert all(float(w[i, j]) < 0.3 for i, j in deferred)
+    assert torch.allclose(f, partial(cpu - deferred), atol = 1e-3)
+    assert torch.allclose(x, partial(deferred), atol = 1e-3)
+
+
+def test_defer_max_zero_defers_every_cpu_pick_in_one_job():
+    rows = 2
+    d, hl, hl2, hosts, cache = split_setup(rows)
+    assert not D.HT.defer_partial()
+    w = torch.rand((rows, 4)).half()
+    pend, cpu, partial = split_case(d, hl, rows, w)
+    assert pend.deferred is None and len(d.inflight) == 2
+    assert all(h.events == ["reserve", "publish"] for h in hosts)
+    rec = d.defer(hl, pend, rows)
+    f = torch.zeros((rows, 8))
+    d.combine(hl, f, pend)                                           # nothing left to collect
+    assert f.abs().sum() == 0 and all(h.events.count("collect") == 0 for h in hosts)
+    x = torch.zeros((rows, 8))
+    d.fold(rec, x)
+    assert torch.allclose(x, partial(cpu), atol = 1e-3)
+
+
+def test_split_call_that_does_not_defer_collects_both_jobs():
+    rows = 2
+    d, hl, hl2, hosts, cache = split_setup(rows, defer_max = 1)
+    w = torch.rand((rows, 4)).half()
+    pend, cpu, partial = split_case(d, hl, rows, w)
+    f = torch.zeros((rows, 8))
+    d.combine(hl, f, pend)
+    assert d.inflight == [] and all(h.events.count("collect") == 2 for h in hosts)
+    assert torch.allclose(f, partial(cpu), atol = 1e-3)
+
+
+def test_interrupted_partial_deferral_is_drained_by_begin_pass():
+    rows = 2
+    d, hl, hl2, hosts, cache = split_setup(rows, defer_max = 1)
+    pend, cpu, partial = split_case(d, hl, rows, torch.rand((rows, 4)).half())
+    d.defer(hl, pend, rows)                                          # neither collect nor fold runs
+    d._update_lane_params = lambda: None
+    d.begin_pass(None)
+    assert d.inflight == [] and all(h.events.count("collect") == 2 for h in hosts)
+
+
+def test_partial_defer_needs_three_slots():
+    d, hl, hl2, hosts, cache = split_setup(1, num_slots = 2)
+    m = defer_module()
+    assert d.can_defer(hl, m, 1)                                     # whole-partial deferral: two
+    D.HT.defer_max = 2
+    assert not d.can_defer(hl, m, 1)
+    D.HT.defer_max, D.HT.defer_min_w = 0, 0.1
+    assert not d.can_defer(hl, m, 1)
+    for h in hosts:
+        h.num_slots = 3
+    d._link_layers()
+    assert d.can_defer(hl, m, 1)

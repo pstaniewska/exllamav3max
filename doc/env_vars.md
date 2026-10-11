@@ -403,6 +403,25 @@ projection, post-norms, residual or layer scalars, tensor parallelism), not to t
 layer or one whose successor is on another device, and needs `EXL3_MOE_CPU_SLOTS` of at least
 `2`. Prefill passes never defer.
 
+### `EXL3_MOE_DEFER_MAX` (default: `0`, every CPU expert)
+
+With `EXL3_MOE_DEFER`: partial deferral. Per token, only the CPU-lane experts with the smallest
+routing weights are deferred, at most this many; the token's other CPU-lane experts are computed
+and added inside the layer as without deferral. Each node's decode CPU job is then split into an
+immediate job and a deferred job (the worker runs the immediate one first), on two CPU slots per
+layer. This needs `EXL3_MOE_CPU_SLOTS` of at least `3`: the deferred slot stays unconsumed until
+the end of the next block, and that block's own two reserves must land on other slots (with
+fewer, layers do not defer, and a notice is printed once). `0` defers every CPU-lane expert in
+one job, as before. Also settable at runtime as `HT.defer_max` (`exllamav3.model.moe_hybrid_dispatch`),
+read at every layer call.
+
+### `EXL3_MOE_DEFER_MIN_W` (default: unset)
+
+With `EXL3_MOE_DEFER`: never defer a CPU-lane expert whose routing weight is at least this value
+(it is computed inside the layer). Combines with `EXL3_MOE_DEFER_MAX` (`0` there: every CPU-lane
+expert below the bound is deferred). Setting it also selects the split jobs, with the same slot
+requirement. Runtime: `HT.defer_min_w` (`None` for unset).
+
 ### `EXL3_MOE_CPU_DECODE_WORKERS` (default: `0`, no cap)
 
 Caps the worker threads that run a single-token (decode) job. With `EXL3_MOE_CPU_THREADS` set to
@@ -847,7 +866,8 @@ its default. In short:
   `EXL3_MOE_ADAPTIVE_EMA`,
   `EXL3_HYBRID_MOE_DEBUG`, `EXL3_HYBRID_MOE_PROFILE` (CPU-lane wait measured with CUDA events,
   no host sync), and `EXL3_MOE_DEFER` (decode CPU partials folded in one block later; an
-  approximation, default off).
+  approximation, default off) with `EXL3_MOE_DEFER_MAX` / `EXL3_MOE_DEFER_MIN_W` (defer only the
+  lowest-weight CPU experts).
 - **NUMA:** `EXL3_NUMA_ENABLE` (one CPU worker per node; also applies to `-mcl` / `-mcs`, whose
   layers then go round-robin over the nodes), `EXL3_NUMA_POLICY` (default `auto`: measured
   cost split under `replicate`, GPU-local under `shard`), `EXL3_NUMA_MEMORY_POLICY`

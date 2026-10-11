@@ -132,6 +132,16 @@ class HybridTuning:
         # the next block's GPU work. An approximation: that block's attention and router see the
         # residual without it
         self.defer = os.environ.get("EXL3_MOE_DEFER", "0") not in ("", "0")
+        # Partial deferral: only the CPU-lane picks with the smallest routing weights are
+        # deferred, at most defer_max per token (0: every CPU pick), never one whose weight is
+        # >= defer_min_w (None: no bound). The rest is collected inside the layer as usual
+        self.defer_max = int(os.environ.get("EXL3_MOE_DEFER_MAX", "0") or 0)
+        mw = os.environ.get("EXL3_MOE_DEFER_MIN_W", "").strip()
+        self.defer_min_w = float(mw) if mw else None
+
+    def defer_partial(self) -> bool:
+        """Deferral splits each node's CPU job into an immediate and a deferred one"""
+        return self.defer_max > 0 or self.defer_min_w is not None
 
 
 HT = HybridTuning()
@@ -427,15 +437,21 @@ class HybridLayer:
         self.defer_next = False
         self.defer_v = None
         self.defer_d = None
+        # Partial deferral: the issue kernel's per-node CPU selections (nodes x decode rows *
+        # topk, device), split from there into the immediate and the deferred slot
+        self.defer_sel = None
 
 
 class HybridPending:
-    __slots__ = ("kind", "items", "fused_cap")
+    __slots__ = ("kind", "items", "fused_cap", "deferred")
 
-    def __init__(self, kind, items, fused_cap = None):
+    def __init__(self, kind, items, fused_cap = None, deferred = None):
         self.kind = kind
         self.items = items
         self.fused_cap = fused_cap
+        # Partial deferral (decode): the second job per node holding the deferred picks, until
+        # defer() takes it over; combine() collects it if the call does not defer after all
+        self.deferred = deferred
 
 
 # Module (or transformer block) attributes after the routed sum that a deferred CPU partial would
@@ -1041,9 +1057,13 @@ class HybridDispatcher:
         """Per layer: may it defer its CPU partial? Not the last hybrid layer, the next one on the
         same device, and at least two CPU slots per worker: the deferred job holds its slot
         unconsumed while the next layer reserves, and with one slot that reserve would wait on
-        it forever"""
+        it forever. Partial deferral needs three (can_defer): a layer then takes two slots per
+        worker (immediate, deferred), and between the deferred job's reserve and its fold at the
+        end of the next block only that block's two reserves come, which must both land on
+        other slots than the unconsumed one"""
         from .moe_cpu_host import TUNING as HOST_TUNING
-        slots = all(getattr(h, "num_slots", HOST_TUNING.num_slots) >= 2 for h in self.group.hosts)
+        self.defer_slots = min((getattr(h, "num_slots", HOST_TUNING.num_slots) for h in self.group.hosts), default = 0)
+        slots = self.defer_slots >= 2
         n = len(self.layers)
         for i, hl in enumerate(self.layers):
             hl.defer_next = slots and i + 1 < n and self.layers[i + 1].device == hl.device
@@ -1052,6 +1072,12 @@ class HybridDispatcher:
         """This decode call's CPU partial may skip combine and fold into the residual later"""
         if not HT.defer or rows > self.decode_rows or not getattr(hl, "defer_next", False):
             return False
+        if HT.defer_partial() and getattr(self, "defer_slots", 0) < 3:
+            if "defer_slots" not in self.notices:
+                self.notices.add("defer_slots")
+                print(" !! hybrid MoE: EXL3_MOE_DEFER_MAX / EXL3_MOE_DEFER_MIN_W need EXL3_MOE_CPU_SLOTS >= 3, "
+                      "not deferring")
+            return False
         for a in DEFER_BLOCKERS:
             v = getattr(module, a, None)
             if v is not None and v is not False:
@@ -1059,8 +1085,69 @@ class HybridDispatcher:
         return True
 
     def defer(self, hl: HybridLayer, pending: HybridPending, rows: int) -> DeferredPartial:
-        """Instead of combine: the jobs stay inflight until fold"""
-        return DeferredPartial(pending.items, self, hl, hl.device, rows)
+        """Take the deferred jobs out of pending (all of them, or with partial deferral the
+        second job per node); they stay inflight until fold. combine() still collects what is
+        left (the immediate jobs of a partial deferral)"""
+        if pending.deferred is not None:
+            items, pending.deferred = pending.deferred, None
+        else:
+            items, pending.items = pending.items, []
+        return DeferredPartial(items, self, hl, hl.device, rows)
+
+    def _reserve_deferred(self, hl: HybridLayer, rows: int, res: list) -> list:
+        """Partial deferral: a second slot per node for the deferred picks, reserved after the
+        immediate one (the worker runs jobs in ring order: immediate first)"""
+        dres = []
+        for i, h, r in res:
+            rd = h.fused_reserve(hl.host_idx[i], rows, hl.device)
+            dres.append((i, h, rd))
+            self.inflight.append([h, rd, False])
+        return dres
+
+    def _defer_sel(self, hl: HybridLayer):
+        """Device scratch the issue kernel writes the nodes' CPU selections into (instead of the
+        immediate slot); rows of nodes without experts of the layer are never written, stay -1"""
+        if getattr(hl, "defer_sel", None) is None:
+            hl.defer_sel = torch.full((len(self.group.hosts), self.decode_rows * hl.topk), -1,
+                                      dtype = torch.int32, device = hl.device)
+        return hl.defer_sel
+
+    def _split_deferred(self, hl: HybridLayer, y, w, rows: int, res: list, dres: list):
+        """Partial deferral, stream-ordered after the issue kernel: per token, the CPU-lane picks
+        with the smallest routing weights (at most HT.defer_max, all for 0; only those below
+        HT.defer_min_w) go to the deferred slot, the others to the immediate one. The kernel
+        staged x, w and the gate into the immediate slot already; the deferred slot gets them
+        here, and both gates follow their selections. No host sync"""
+        k = hl.topk
+        n = rows * k
+        s = hl.defer_sel[:, :n]
+        cpu = (s >= 0).any(dim = 0).view(rows, k)
+        wf = w.view(rows, k).float()
+        dm = cpu
+        if HT.defer_min_w is not None:
+            dm = dm & (wf < HT.defer_min_w)
+        cap = HT.defer_max
+        if 0 < cap < k:
+            # Rank of each pick among its token's deferrable picks by weight (stable: ties keep
+            # router order); picks that may not defer sort last
+            order = wf.masked_fill(~dm, float("inf")).argsort(dim = 1, stable = True)
+            ar = torch.arange(k, device = w.device).expand(rows, k)
+            rank = torch.empty_like(order).scatter_(1, order, ar)
+            dm = dm & (rank < cap)
+        dm = dm.view(-1)
+        hi = hl.hi
+        xd = y if y.shape[1] == hi else torch.nn.functional.pad(y, (0, hi - y.shape[1]))
+        wd = w.view(-1).to(torch.half)
+        for (i, h, ra), (_, _, rd) in zip(res, dres):
+            si = s[i]
+            sa = si.masked_fill(dm, -1)
+            sd = si.masked_fill(~dm, -1)
+            ra["slot"]["sel"].view(-1)[:n].copy_(sa, non_blocking = True)
+            rd["slot"]["sel"].view(-1)[:n].copy_(sd, non_blocking = True)
+            rd["slot"]["w"].view(-1)[:n].copy_(wd, non_blocking = True)
+            rd["slot"]["x"].view(-1)[:rows * hi].copy_(xd.reshape(-1), non_blocking = True)
+            ra["counts"][ra["slot_idx"]] = (sa >= 0).any()
+            rd["counts"][rd["slot_idx"]] = (sd >= 0).any()
 
     def fold(self, rec: DeferredPartial, x2d, v = None):
         """Add a deferred CPU partial into the residual, stream-ordered. Plain residual (fp32,
@@ -1139,9 +1226,11 @@ class HybridDispatcher:
         admit = int(n_picks <= CACHE_TUNING.admit_max)
         return gpu_max, cpu_frac, admit, lane_cost
 
-    def submit(self, hl: HybridLayer, y, selected_experts, routing_weights):
+    def submit(self, hl: HybridLayer, y, selected_experts, routing_weights, defer: bool = False):
         """Lane assignment and CPU job issue for one layer call. Returns (pending, sel_gpu): the
-        GPU tiers must run on sel_gpu (CPU-lane picks masked to num_experts)"""
+        GPU tiers must run on sel_gpu (CPU-lane picks masked to num_experts). defer: the caller
+        will defer this call's CPU partial (can_defer); with partial deferral (HT.defer_max /
+        HT.defer_min_w) each node's CPU work is then split into an immediate and a deferred job"""
         rows = y.shape[0]
         cache = ExpertCache.for_device(hl.device)
         y = y.contiguous()
@@ -1150,17 +1239,26 @@ class HybridDispatcher:
         n = rows * hl.topk
         if rows <= self.decode_rows:
             res, nodes = self._nodes_decode(hl, rows)
+            dres = None
+            if defer and res and HT.defer_partial():
+                dres = self._reserve_deferred(hl, rows, res)
+                ds = self._defer_sel(hl)
+                for i, _, _ in res:
+                    nodes[ND_SEL, i] = ds[i].data_ptr()
+                    nodes[ND_SELCAP, i] = ds.shape[1]
             sel_gpu = hl.sel_buf[:n]
             gpu_max, cpu_frac, admit, lane_cost = self._lane_args(n)
             cache.issue(hl.cache_layer, sel, y, w, sel_gpu, None, None, nodes, self.node_cost, hl.hi,
                         0, admit, gpu_max, cpu_frac, PREFILL_GPU_MIN_BOOT, self.node_policy, self.group.pref,
                         lane_cost)
-            for _, h, r in res:
+            if dres is not None:
+                self._split_deferred(hl, y, w, rows, res, dres)
+            for _, h, r in res + (dres or []):
                 h.fused_publish(r)
                 for entry in self.inflight:
                     if entry[1] is r:
                         entry[2] = True
-            return HybridPending("decode", res), sel_gpu.view(rows, hl.topk)
+            return HybridPending("decode", res, deferred = dres), sel_gpu.view(rows, hl.topk)
         return self._submit_prefill(hl, cache, y, sel, w, rows, n)
 
     def _submit_prefill(self, hl, cache, y, sel, w, rows, n):
@@ -1274,7 +1372,10 @@ class HybridDispatcher:
         tel = self.telemetry if cuda else None
         compute = torch.cuda.current_stream(hl.device) if cuda else None
         if pending.kind == "decode":
-            for i, h, r in pending.items:
+            # A split call that did not defer after all collects its deferred jobs here too
+            items = pending.items + (pending.deferred or [])
+            pending.deferred = None
+            for i, h, r in items:
                 e0 = tel.begin(compute) if tel is not None else None
                 h.fused_collect(r, f2)
                 if tel is not None:

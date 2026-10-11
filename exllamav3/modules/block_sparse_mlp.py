@@ -1151,8 +1151,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         hy = self.hybrid
         hy_pending = None
         hy_measure = hy is not None and params.get("autosplit_measure")
+        # Expert deferral (EXL3_MOE_DEFER, only when the transformer block can take it): decided
+        # before the issue, which splits each node's CPU job under partial deferral
+        hy_defer = hy is not None and not hy_measure and cpu_pending is None and \
+            params.get("moe_defer_ok", False) and hy.dispatcher.can_defer(hy, self, bsz)
         if hy is not None and not hy_measure:
-            hy_pending, selected_experts = hy.dispatcher.submit(hy, y, selected_experts, routing_weights)
+            hy_pending, selected_experts = hy.dispatcher.submit(hy, y, selected_experts, routing_weights, hy_defer)
         fr = self.fused_rows
         if hy_pending is not None and hy_pending.fused_cap is not None:
             # Non-resident experts read over PCIe: the fused kernel re-reads an expert's weights
@@ -1469,13 +1473,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # before collect enqueues its stream wait. Fused shared experts have already run
         # inside the routed path. Keep prefill scheduling and the order of post norms / TP
         # collectives unchanged.
-        # Expert deferral (EXL3_MOE_DEFER, only when the transformer block can take it): the
-        # hybrid CPU partial skips combine and folds into the residual at the end of the next
-        # block, so nothing here waits for the CPU job
-        hy_defer = hy_pending is not None and hy_pending.kind == "decode" and cpu_pending is None and \
-            params.get("moe_defer_ok", False) and hy.dispatcher.can_defer(hy, self, bsz)
+        # Expert deferral: the hybrid CPU partial (or, with partial deferral, its low-weight
+        # share) skips combine and folds into the residual at the end of the next block, so
+        # nothing here waits for it
+        hy_defer = hy_defer and hy_pending is not None and hy_pending.kind == "decode" and cpu_pending is None
         shared_hidden_states = None
-        cpu_waiting = cpu_pending is not None or (hy_pending is not None and hy_pending.kind == "decode" and not hy_defer)
+        cpu_waiting = cpu_pending is not None or (hy_pending is not None and hy_pending.kind == "decode" and
+                                                  (not hy_defer or hy_pending.deferred is not None))
         if cpu_waiting and bsz <= MAX_BSZN and self.shared_experts and not bc_sh_exp:
             shared_hidden_states = self.shared_experts.forward(x, params)
 
@@ -1484,7 +1488,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         final_hidden_states = self.cpu_split_combine(final_hidden_states, cpu_partial, cpu_pending, eshape)
         if hy_defer:
             params["moe_deferred"] = hy.dispatcher.defer(hy, hy_pending, bsz)
-        elif hy_pending is not None:
+        if hy_pending is not None:
             final_hidden_states = hy.dispatcher.combine(hy, final_hidden_states, hy_pending)
 
         # Latent MoE: project the routed sum back to the residual width (linear, so under TP
