@@ -806,6 +806,14 @@ Their pool runs between the main model's passes on the same node; pinned to the 
 idle pool's spin-wait takes cores from the active one (on a 2x Xeon 6760P host, MTP decode fell
 from 17.8 to 13 tok/s with both pinned while plain decode gained 47% from pinning the main pool).
 
+### `EXL3_MOE_HOST_INTRAOP_THREADS` (default: `1`)
+
+Caps torch's intra-op thread pool in the host process for the duration of each forward pass while
+CPU MoE workers are up; restored after the pass. The host's CPU ops in a pass (the CPU embedding
+lookup and its pinned staging copy) go parallel in ATen from 9 rows at hidden size 4096, and the
+OpenMP team then competes with the spinning workers. On a 2x Xeon 6760P host a 9-row pass (an MTP
+verify with hybrid drafting) took 1.39 s against 0.15 s at 8 rows. `0` leaves torch's setting alone.
+
 ### `EXL3_MOE_HOST_CORES` (default: `1`)
 
 Physical cores kept free of worker threads and reserved for the host process. Only in effect with

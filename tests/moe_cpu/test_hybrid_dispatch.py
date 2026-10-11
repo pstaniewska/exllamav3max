@@ -1126,3 +1126,32 @@ def test_run_staged_experts_tables_and_tiers(monkeypatch):
     assert len(groups) == 1 and ids == [13] and gs == [starts[3]] and gc == [300]
     assert ptrs == ([base + 3 * stride], [base + 3 * stride + 1024], [base + 3 * stride + 2048])
     assert ny == rows + 1 and sentinel == rows                    # padded inputs and the sink row
+
+
+def test_host_intraop_threads_caps_and_restores(monkeypatch):
+    # A pass with CPU MoE workers runs the host's CPU ops serially (ATen's parallel_for opens no
+    # OpenMP region at one thread), and the caller's setting comes back afterwards, nesting included
+    import importlib
+    aff = importlib.import_module(f"{hybrid_isolated.PKG}.model.moe_cpu_affinity")
+    prev = torch.get_num_threads()
+    try:
+        torch.set_num_threads(2)
+        monkeypatch.setattr(aff, "HOST_INTRAOP_THREADS", 1)
+        with aff.host_intraop_threads(True):
+            assert torch.get_num_threads() == 1
+            with aff.host_intraop_threads(True):
+                assert torch.get_num_threads() == 1
+            assert torch.get_num_threads() == 1
+        assert torch.get_num_threads() == 2
+        with pytest.raises(RuntimeError):
+            with aff.host_intraop_threads(True):
+                raise RuntimeError("interrupted pass")
+        assert torch.get_num_threads() == 2
+        # No workers, or the cap disabled: torch's setting is left alone
+        with aff.host_intraop_threads(False):
+            assert torch.get_num_threads() == 2
+        monkeypatch.setattr(aff, "HOST_INTRAOP_THREADS", 0)
+        with aff.host_intraop_threads(True):
+            assert torch.get_num_threads() == 2
+    finally:
+        torch.set_num_threads(prev)
