@@ -17,7 +17,6 @@ A few defaults differ between the CUDA and ROCm builds. They are collected in
 | `EXL3_MOE_FUSED_ROWS` | `128` | `512` | the RDNA fused MoE kernel tiles the rows itself |
 | `EXL3_MOE_BATCH_RECON` | `1` | `0` | same |
 | `EXL3_MOE_MTILE` | `1` | `0` | same (no 32 / 64-row instances of the RDNA kernel) |
-| `EXL3_HC_FOLD` | `0` | `1` | the per-launch cost dominates the mHC decode kernels on RDNA |
 
 ## Attention
 
@@ -84,14 +83,15 @@ shared experts with 128-aligned widths and no post-norm. Under tensor parallelis
 expert is placed whole on one rank (its contribution enters the all-reduce from that rank only)
 rather than split across ranks. Set to `0` to keep the separate graph and the tensor split.
 
-### `EXL3_HC_FOLD` (default: `0` on CUDA, `1` on ROCm)
+### `EXL3_HC_FOLD` (default: `1`)
 
 Launch-count folds for the mHC hyper-connection sites (DeepSeek V4, GLM 5.3) at decode row counts
 (up to 32 rows): a site's residual update (`hc_apply`) is deferred and run inside the next site's
 mix kernel, and the RMSNorm that follows a mix runs inside the mix's finalize kernel, two launches
 fewer per site. The folded kernels repeat the unfused kernels' arithmetic in the same order, so
-the outputs are bit-identical either way (`tests/test_hc_fold.py`). On by default on ROCm, where
-the per-launch cost is a large part of these small kernels; `1` enables it on CUDA as well.
+the outputs are bit-identical either way (`tests/test_hc_fold.py`). On by default: the per-launch
+cost is a large part of these small kernels (on H100 with GLM 5.3 hybrid-MoE decode about 15%
+faster). `0` restores the separate launches.
 
 ### `EXL3_GR_MIX_TILED` (default: `1`)
 
