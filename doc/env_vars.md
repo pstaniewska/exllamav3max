@@ -861,8 +861,9 @@ its default. In short:
   if that shortens the call's slowest lane. Also `EXL3_MOE_ZC_CPU_FRAC_INIT` (the share used
   until the costs are measured), `EXL3_MOE_COST_REMEASURE`, `EXL3_EXPERT_DECODE_MAX_ROWS` (widest
   call on the decode lane policy, default the CPU slot rows; wider calls use the prefill rule),
-  `EXL3_EXPERT_PREFILL_GPU_MIN` (default `auto`: the prefill split between zero-copy and CPU
-  lanes is chosen per call from measured PCIe and CPU costs; a number fixes the row threshold),
+  `EXL3_EXPERT_PREFILL_GPU_MIN` (default `1`: every non-resident expert of a prefill call goes
+  to the GPU lanes; `auto` chooses the split between zero-copy and CPU lanes per call from
+  measured PCIe and CPU costs; another number fixes the row threshold),
   `EXL3_EXPERT_PREFILL_STREAM` (default `auto`: in prefill calls of at least
   `EXL3_EXPERT_PREFILL_STREAM_ROWS` rows, default 2048, zero-copy experts with at least
   `EXL3_EXPERT_PREFILL_STREAM_MIN_ROWS` rows, default 1, are DMAed from their pinned home into a

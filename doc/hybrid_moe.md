@@ -362,7 +362,10 @@ The threshold is chosen per call from measured costs (`choose_prefill_gpu_min`):
 This costs one extra host sync per hybrid layer call, for the expert counts and residency. Until
 the costs are measured, the threshold is 8. It is 8 again for one call after
 `EXL3_MOE_COST_REMEASURE` calls that left the CPU idle, so a stale estimate gets new samples.
-`EXL3_EXPERT_PREFILL_GPU_MIN=<n>` fixes the threshold instead. `summary()` reports the fit
+This rule applies with `EXL3_EXPERT_PREFILL_GPU_MIN=auto`. The default is `1`, every
+non-resident expert on the GPU lanes: on an H100 NVL with two Xeon 6760P the per-call rule sent
+too many experts to the CPU (155-169 tok/s prefill against 252 with `1`). Another number fixes
+the threshold. `summary()` reports the fit
 (`prefill_cost_us`) and the last threshold (`prefill_gpu_min`).
 
 The CPU lanes' rows are compressed to tokens that have CPU work. They are issued on one side
@@ -438,7 +441,7 @@ classic paths, `EXL3_NUMA_ENABLE=1`) is set.
 | `EXL3_EXPERT_HOME` | `native_copy` | `native_copy` or `worker_arena` |
 | `EXL3_EXPERT_HOME_PIN_LIMIT_GB` | unset | registered-bytes cap for homes |
 | `EXL3_EXPERT_DECODE_MAX_ROWS` | slot rows (`64`) | widest call on the decode path; wider calls take the prefill path |
-| `EXL3_EXPERT_PREFILL_GPU_MIN` | `auto` | prefill rows for a non-resident expert to go zero-copy; `auto` chooses per call from measured costs |
+| `EXL3_EXPERT_PREFILL_GPU_MIN` | `1` | prefill rows for a non-resident expert to go zero-copy; `auto` chooses per call from measured costs |
 | `EXL3_EXPERT_PREFILL_STREAM` | `auto` | stream lane for zero-copy experts in prefill: `auto` (calls of at least `_ROWS` rows), `1`, `0` |
 | `EXL3_EXPERT_PREFILL_STREAM_ROWS` | `2048` | smallest prefill call that streams under `auto` |
 | `EXL3_EXPERT_PREFILL_STREAM_MIN_ROWS` | `1` | rows for a zero-copy expert to take the stream lane |

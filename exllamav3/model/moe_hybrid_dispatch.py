@@ -108,8 +108,11 @@ class HybridTuning:
         self.zc_max = None if zc == "auto" else int(zc)
         self.cpu_frac_init = float(os.environ.get("EXL3_MOE_ZC_CPU_FRAC_INIT", 0.5))
         self.zc_fused_rows = int(os.environ.get("EXL3_EXPERT_CACHE_ZC_FUSED_ROWS", 32))
-        # Unset or "auto": chosen per prefill call from measured costs; a number fixes it
-        pgm = os.environ.get("EXL3_EXPERT_PREFILL_GPU_MIN", "auto").strip().lower()
+        # "auto": chosen per prefill call from measured costs; a number fixes it. Default 1 (every
+        # non-resident expert of a prefill call on the GPU): the per-call cost model sent too many
+        # experts to the CPU lanes and measured 155-169 tok/s against 252 with 1 (H100 NVL, two
+        # Xeon 6760P, GLM 5.3 at 4.91 bpw, 16k prompt); the CPU-only split ran at 88
+        pgm = os.environ.get("EXL3_EXPERT_PREFILL_GPU_MIN", "1").strip().lower()
         self.prefill_gpu_min = None if pgm in ("", "auto") else int(pgm)
         # Prefill stream lane (StreamWork): zero-copy experts of wide prefill calls are DMAed
         # into a VRAM ring on a copy stream and computed from there. "auto": calls of at least
