@@ -381,6 +381,13 @@ Worker thread count, set per component via `config.infer_params.moe_cpu_threads`
 
 Fallback worker thread count when the component's `-mclt`/`-dmclt` config value is not set.
 
+### `EXL3_MOE_CPU_DECODE_WORKERS` (default: `0`, no cap)
+
+Caps the worker threads that run a single-token (decode) job. With `EXL3_MOE_CPU_THREADS` set to
+every logical CPU (SMT siblings included) for prefill, set this to the physical core count to run
+decode on one thread per core. Applies per worker process, so with `EXL3_NUMA_ENABLE` it is per
+node. Pinning (`EXL3_MOE_CPU_PIN=1`) makes the first threads one per physical core.
+
 ### `EXL3_MOE_CPU_SLOTS` (default: `4`), `EXL3_MOE_CPU_SLOT_ROWS` (default: `64`)
 
 Compute job-ring depth and rows per slot (the CPU-tail chunk size). Each slot holds one

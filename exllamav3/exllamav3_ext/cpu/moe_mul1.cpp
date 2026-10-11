@@ -3427,7 +3427,15 @@ void exl3_moe_cpu_forward_raw(
         const char* e = getenv("EXL3_MOE_CPU_SMALL_WORKERS");
         return e ? atoi(e) : 0;
     }();
-    const int n_run = nc <= 2 ? small_cap : 0;
+    // Single-token (decode) worker cap: a pool sized to every SMT sibling for prefill can run
+    // decode on one LP per physical core (the pool's pinned order fills cores first). Decode
+    // streams weights, and two siblings sharing a core's caches and load ports slow each expert
+    static const int decode_cap = [](){
+        const char* e = getenv("EXL3_MOE_CPU_DECODE_WORKERS");
+        return e ? atoi(e) : 0;
+    }();
+    int n_run = nc <= 2 ? small_cap : 0;
+    if (rows == 1 && decode_cap > 0 && (n_run <= 0 || decode_cap < n_run)) n_run = decode_cap;
 
     // Per-phase wall time, reported every 512 jobs; enabled once at worker startup via
     // exl3_moe_cpu_set_prof (MoeCpuTuning.cpu_prof in moe_cpu_host.py, EXL3_MOE_CPU_PROF env)
