@@ -801,6 +801,11 @@ settles on a different throughput level each run; unpinned runs are faster and r
 Hence the per-platform default; set it explicitly to test the other layout. Falls back to no
 pinning if the CPU topology can't be read.
 
+`EXL3_MOE_DRAFT_CPU_PIN` (default `0`) sets it for the MTP head's or draft model's workers only.
+Their pool runs between the main model's passes on the same node; pinned to the same cores, the
+idle pool's spin-wait takes cores from the active one (on a 2x Xeon 6760P host, MTP decode fell
+from 17.8 to 13 tok/s with both pinned while plain decode gained 47% from pinning the main pool).
+
 ### `EXL3_MOE_HOST_CORES` (default: `1`)
 
 Physical cores kept free of worker threads and reserved for the host process. Only in effect with

@@ -1153,7 +1153,23 @@ class MoeCpuHost:
                     self.numa.get("mem_node"), self.home, self.numa.get("home_node")),
             daemon = True,
         )
-        self.proc.start()
+        # The MTP head / draft model's pool runs between the main model's passes on the same
+        # node: pinned to the same cores, each idle pool's spin-wait steals the active pool's
+        # cores. EXL3_MOE_DRAFT_CPU_PIN (default 0) sets EXL3_MOE_CPU_PIN for those workers only;
+        # the child reads it from the environment it is spawned with
+        comp = getattr(self.config.infer_params, "moe_cpu_component", "text")
+        pin_env = None
+        if comp != "text":
+            pin_env = os.environ.get("EXL3_MOE_CPU_PIN")
+            os.environ["EXL3_MOE_CPU_PIN"] = os.environ.get("EXL3_MOE_DRAFT_CPU_PIN", "0")
+        try:
+            self.proc.start()
+        finally:
+            if comp != "text":
+                if pin_env is None:
+                    os.environ.pop("EXL3_MOE_CPU_PIN", None)
+                else:
+                    os.environ["EXL3_MOE_CPU_PIN"] = pin_env
         child_conn.close()
         # Cleanupper fires at the end of the __main__ scope, before interpreter teardown breaks
         # the shm views and pipe machinery that shutdown() needs; PDEATHSIG in the child covers
