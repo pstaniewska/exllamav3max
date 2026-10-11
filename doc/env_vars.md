@@ -422,6 +422,13 @@ With `EXL3_MOE_DEFER`: never defer a CPU-lane expert whose routing weight is at 
 expert below the bound is deferred). Setting it also selects the split jobs, with the same slot
 requirement. Runtime: `HT.defer_min_w` (`None` for unset).
 
+### `EXL3_MOE_CPU_FUSED_DECODE` (default: `1`)
+
+Runs each single-token CPU expert job as one pool dispatch. Inside it, a step waits only for the data
+it reads: its own prepared input, its expert's activation, or the down outputs for its column blocks.
+The phased path instead puts a pool-wide barrier after each of five steps. Both paths give
+bit-identical outputs. `0` selects the phased path, for A/B timing.
+
 ### `EXL3_MOE_CPU_DECODE_WORKERS` (default: `0`, no cap)
 
 Caps the worker threads that run a single-token (decode) job. With `EXL3_MOE_CPU_THREADS` set to

@@ -1157,7 +1157,7 @@ class MoeCpuHost:
         # node: pinned to the same cores, each idle pool's spin-wait steals the active pool's
         # cores. EXL3_MOE_DRAFT_CPU_PIN (default 0) sets EXL3_MOE_CPU_PIN for those workers only;
         # the child reads it from the environment it is spawned with
-        comp = getattr(self.config.infer_params, "moe_cpu_component", "text")
+        comp = getattr(getattr(getattr(self, "config", None), "infer_params", None), "moe_cpu_component", "text")
         pin_env = None
         if comp != "text":
             pin_env = os.environ.get("EXL3_MOE_CPU_PIN")

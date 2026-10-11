@@ -75,6 +75,19 @@ void exl3_moe_cpu_set_prof(bool enabled)
     g_prof_enabled.store(enabled, std::memory_order_relaxed);
 }
 
+// Single-token jobs run as one pool dispatch whose stages wait on per-expert and per-column-block
+// counters instead of five pool-wide barriers (decode_fused_phase). EXL3_MOE_CPU_FUSED_DECODE=0
+// selects the phased path; both give bit-identical outputs
+namespace { std::atomic<bool> g_fused_decode { [](){
+    const char* e = getenv("EXL3_MOE_CPU_FUSED_DECODE");
+    return !(e && *e == '0');
+}() }; }
+
+void exl3_moe_cpu_set_fused_decode(bool enabled)
+{
+    g_fused_decode.store(enabled, std::memory_order_relaxed);
+}
+
 namespace {
 
 constexpr uint32_t MUL1_MULT = 0x83DCD12Du;
@@ -2753,6 +2766,12 @@ struct ForwardCtx
     std::vector<PreparedIn> prep_g, prep_u, prep_d;
 
     int phase = 0;
+
+    // Fused single-token path only (decode_fused_phase), zeroed before the dispatch:
+    std::atomic<int>* prep_state;   // per gate/up GEMV: 0 unprepared, 1 being prepared, 2 ready
+    std::atomic<int>* gu_tiles;     // per chunk: gate/up tiles finished
+    std::atomic<int>* down_ready;   // per chunk: 1 once its down input is prepared
+    std::atomic<int>* block_done;   // per 128-column block of H: chunks whose down GEMV covered it
 };
 
 struct ForwardArena
@@ -2892,6 +2911,74 @@ inline void assign_gemvs(int worker, int num_workers, int total, int tiles_n, Ge
         gemv(j, std::max(f0 - j * tiles_n, 0), std::min(f1 - j * tiles_n, tiles_n));
 }
 
+// Output transform for gate/up, activation, prepare down input; one chunk. Gated: act(g) * u
+// accumulated into g; gateless: relu2 applied to u in place
+void act_prep_down(ForwardCtx& c, int j)
+{
+    const MoeCpuLayer& L = *c.layer;
+    const int I = L.interm_size;
+    const bool gated = !L.gates.empty();
+    const Chunk& ch = c.chunks[j];
+    float* g = c.tout_g + static_cast<size_t>(j) * c.slots * I;
+    float* u = c.tout_u + static_cast<size_t>(j) * c.slots * I;
+    if (gated)
+    {
+        fold_rows(g, c.prep_g[j], ch.m, I, 0, I);
+        transform_out(L.gates[ch.expert], g, ch.m);
+    }
+    fold_rows(u, c.prep_u[j], ch.m, I, 0, I);
+    transform_out(L.ups[ch.expert], u, ch.m);
+    const size_t count = static_cast<size_t>(ch.m) * I;
+    float* a = gated ? g : u;
+    // Nonzero act_limit clamps the up path symmetrically and the activated gate
+    // from above, BEFORE the multiply (matching the GPU act_mul kernels). DS4
+    // ships swiglu_limit = 10 with plain silu: hidden states deep into a long
+    // context push |u| into the thousands, and skipping the clamp here made
+    // offloaded experts diverge arbitrarily far from their GPU-resident twins
+    const float lim = L.act_limit != 0.0f
+        ? L.act_limit : std::numeric_limits<float>::infinity();
+    // The exponent is bounded: past 88.7 exp() overflows, and the division by infinity
+    // that follows does not survive the reciprocal the compiler makes of it (NaN out of
+    // a pre-activation that should give zero)
+    const float exp_max = 80.0f;
+    switch (L.activation) {
+        case 0:
+            for (size_t i = 0; i < count; ++i) {
+                const float gv = g[i];
+                const float av = std::min(gv / (1.0f + std::exp(std::min(-gv, exp_max))), lim);
+                g[i] = av * std::clamp(u[i], -lim, lim);
+            }
+            break;
+        case 1:
+            for (size_t i = 0; i < count; ++i) {
+                const float gv = g[i];
+                const float cdf = 0.5f * (1.0f + std::erf(gv * 0.70710678f));
+                const float av = std::min(gv * cdf, lim);
+                g[i] = av * std::clamp(u[i], -lim, lim);
+            }
+            break;
+        case 3: {
+            // gpt-oss clamped swiglu: g = min(g, limit); a = (clamp(u, -l, l) + 1) * g *
+            // sigmoid(1.702 * g)
+            const float lim = L.act_limit;
+            for (size_t i = 0; i < count; ++i) {
+                const float gv = std::min(g[i], lim);
+                const float uv = std::clamp(u[i], -lim, lim);
+                g[i] = (uv + 1.0f) * gv / (1.0f + std::exp(std::min(-1.702f * gv, exp_max)));
+            }
+            break;
+        }
+        default:
+            for (size_t i = 0; i < count; ++i) {
+                const float uv = u[i] > 0.0f ? u[i] : 0.0f;
+                u[i] = uv * uv;
+            }
+            break;
+    }
+    static const int idx[MAX_CHUNK] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+    prepare_rows(L.downs[ch.expert], nullptr, a, I, idx, ch.m, c.prep_d[j]);   // (token rows, after the fold)
+}
+
 void forward_phase(void* vctx, int worker, int num_workers)
 {
     ForwardCtx& c = *static_cast<ForwardCtx*>(vctx);
@@ -2935,70 +3022,8 @@ void forward_phase(void* vctx, int worker, int num_workers)
 
         case 2:
         {
-            // Output transform for gate/up, activation, prepare down input; per chunk. Gated: act(g)
-            // * u accumulated into g; gateless: relu2 applied to u in place
-            const bool gated = !L.gates.empty();
-            for (int j = worker; j < nc; j += num_workers) {
-                const Chunk& ch = c.chunks[j];
-                float* g = c.tout_g + static_cast<size_t>(j) * c.slots * I;
-                float* u = c.tout_u + static_cast<size_t>(j) * c.slots * I;
-                if (gated)
-                {
-                    fold_rows(g, c.prep_g[j], ch.m, I, 0, I);
-                    transform_out(L.gates[ch.expert], g, ch.m);
-                }
-                fold_rows(u, c.prep_u[j], ch.m, I, 0, I);
-                transform_out(L.ups[ch.expert], u, ch.m);
-                const size_t count = static_cast<size_t>(ch.m) * I;
-                float* a = gated ? g : u;
-                // Nonzero act_limit clamps the up path symmetrically and the activated gate
-                // from above, BEFORE the multiply (matching the GPU act_mul kernels). DS4
-                // ships swiglu_limit = 10 with plain silu: hidden states deep into a long
-                // context push |u| into the thousands, and skipping the clamp here made
-                // offloaded experts diverge arbitrarily far from their GPU-resident twins
-                const float lim = L.act_limit != 0.0f
-                    ? L.act_limit : std::numeric_limits<float>::infinity();
-                // The exponent is bounded: past 88.7 exp() overflows, and the division by infinity
-                // that follows does not survive the reciprocal the compiler makes of it (NaN out of
-                // a pre-activation that should give zero)
-                const float exp_max = 80.0f;
-                switch (L.activation) {
-                    case 0:
-                        for (size_t i = 0; i < count; ++i) {
-                            const float gv = g[i];
-                            const float av = std::min(gv / (1.0f + std::exp(std::min(-gv, exp_max))), lim);
-                            g[i] = av * std::clamp(u[i], -lim, lim);
-                        }
-                        break;
-                    case 1:
-                        for (size_t i = 0; i < count; ++i) {
-                            const float gv = g[i];
-                            const float cdf = 0.5f * (1.0f + std::erf(gv * 0.70710678f));
-                            const float av = std::min(gv * cdf, lim);
-                            g[i] = av * std::clamp(u[i], -lim, lim);
-                        }
-                        break;
-                    case 3: {
-                        // gpt-oss clamped swiglu: g = min(g, limit); a = (clamp(u, -l, l) + 1) * g *
-                        // sigmoid(1.702 * g)
-                        const float lim = L.act_limit;
-                        for (size_t i = 0; i < count; ++i) {
-                            const float gv = std::min(g[i], lim);
-                            const float uv = std::clamp(u[i], -lim, lim);
-                            g[i] = (uv + 1.0f) * gv / (1.0f + std::exp(std::min(-1.702f * gv, exp_max)));
-                        }
-                        break;
-                    }
-                    default:
-                        for (size_t i = 0; i < count; ++i) {
-                            const float uv = u[i] > 0.0f ? u[i] : 0.0f;
-                            u[i] = uv * uv;
-                        }
-                        break;
-                }
-                static const int idx[MAX_CHUNK] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
-                prepare_rows(L.downs[ch.expert], nullptr, a, I, idx, ch.m, c.prep_d[j]);   // (token rows, after the fold)
-            }
+            // Output transform for gate/up, activation, prepare down input; per chunk
+            for (int j = worker; j < nc; j += num_workers) act_prep_down(c, j);
             break;
         }
 
@@ -3073,6 +3098,97 @@ void forward_phase(void* vctx, int worker, int num_workers)
                 }
             }
             break;
+        }
+    }
+}
+
+inline void spin_until(const std::atomic<int>& a, int target)
+{
+    while (a.load(std::memory_order_acquire) < target) cpu_pause();
+}
+
+// Single-token job in one dispatch. The five phases of forward_phase stay, but each step waits
+// only for the data it reads: a gate/up GEMV piece for its input (prepared once, by whichever
+// worker reaches it first), a down piece for its expert's activation (done by the worker that
+// finishes that expert's last gate/up tile), and the output accumulate for the down pieces that
+// cover its 128-column blocks. Tile ranges, kernels and accumulation order are those of the
+// phased path, so the output is bit-identical. No wait points backwards, so the stages cannot
+// deadlock: every producer a worker waits on is a step some worker reaches without waiting
+// on anything later
+void decode_fused_phase(void* vctx, int worker, int num_workers)
+{
+    ForwardCtx& c = *static_cast<ForwardCtx*>(vctx);
+    const MoeCpuLayer& L = *c.layer;
+    const int nc = static_cast<int>(c.chunks.size());
+    const int H = L.hidden_size;
+    const int I = L.interm_size;
+    const int gu = L.gates.empty() ? 1 : 2;
+
+    // Gate + up GEMVs, preparing each input on first use
+    assign_gemvs(worker, num_workers, nc * gu, I / 16, [&](int j, int t0, int t1)
+    {
+        if (t1 <= t0) return;
+        const int jc = j / gu;
+        const Chunk& ch = c.chunks[jc];
+        const bool up = gu == 1 || (j % gu);
+        const MoeCpuMatrix& mat = up ? L.ups[ch.expert] : L.gates[ch.expert];
+        PreparedIn& p = (up ? c.prep_u : c.prep_g)[jc];
+        std::atomic<int>& st = c.prep_state[j];
+        int expect = 0;
+        if (st.load(std::memory_order_acquire) != 2)
+        {
+            if (st.compare_exchange_strong(expect, 1, std::memory_order_acq_rel))
+            {
+                prepare_rows(mat, c.x, nullptr, H, ch.token, ch.m, p);
+                st.store(2, std::memory_order_release);
+            }
+            else spin_until(st, 2);
+        }
+        float* tout = (up ? c.tout_u : c.tout_g) + static_cast<size_t>(jc) * c.slots * I;
+        run_rows(mat, p, tout, t0, t1);
+        const int n = t1 - t0;
+        if (c.gu_tiles[jc].fetch_add(n, std::memory_order_acq_rel) + n == gu * (I / 16))
+        {
+            act_prep_down(c, jc);
+            c.down_ready[jc].store(1, std::memory_order_release);
+        }
+    });
+
+    // Down GEMVs; pieces are whole 8-tile groups, i.e. whole 128-column blocks
+    assign_gemvs(worker, num_workers, nc, H / 16, [&](int j, int t0, int t1)
+    {
+        if (t1 <= t0) return;
+        spin_until(c.down_ready[j], 1);
+        const Chunk& ch = c.chunks[j];
+        float* tout = c.tout_d + static_cast<size_t>(j) * c.slots * H;
+        run_rows(L.downs[ch.expert], c.prep_d[j], tout, t0, t1);
+        for (int b = t0 / 8; b < t1 / 8; ++b) c.block_done[b].fetch_add(1, std::memory_order_release);
+    });
+
+    // Down output transform and weighted accumulate, per owned 128-column block (phase 4)
+    const int b0 = (H / 128) * worker / num_workers;
+    const int b1 = (H / 128) * (worker + 1) / num_workers;
+    for (int b = b0; b < b1; ++b)
+    {
+        spin_until(c.block_done[b], nc);
+        const int block = b * 128;
+        for (int j = 0; j < nc; ++j)
+        {
+            const Chunk& ch = c.chunks[j];
+            const MoeCpuMatrix& mat = L.downs[ch.expert];
+            fold_rows(c.tout_d + static_cast<size_t>(j) * c.slots * H, c.prep_d[j], ch.m, H,
+                      block, block + 128);
+            for (int r = 0; r < ch.m; ++r)
+            {
+                float* v = c.tout_d + static_cast<size_t>(j) * c.slots * H + r * H + block;
+                MoeCpuMatrix part = mat;
+                part.n = 128;
+                part.svh += block;
+                if (part.bias) part.bias += block;
+                transform_out(part, v, 1);
+                for (int col = 0; col < 128; ++col)
+                    c.out[block + col] += ch.weight[r] * v[col];
+            }
         }
     }
 }
@@ -3358,29 +3474,61 @@ void exl3_moe_cpu_forward_raw(
     ctx.m_total = m_total;
     std::memset(ctx.out, 0, static_cast<size_t>(m_total) * layer->hidden_size * sizeof(float));
 
-    // Group token assignments by expert, then split into chunks of g_chunk_m rows
-    std::vector<std::vector<std::pair<int, float>>> per_expert(layer->num_experts);
-    for (int t = 0; t < m_total; ++t)
+    // Group token assignments by expert, then split into chunks of g_chunk_m rows. A single
+    // token's top_k picks sort in place (ascending expert, picks of one expert in pick order):
+    // the same chunks as the per-expert lists below, without allocating num_experts of them
+    if (m_total == 1 && top_k <= MAX_SLOTS)
+    {
+        std::pair<int, float> picks[MAX_SLOTS];
+        int np = 0;
         for (int j = 0; j < top_k; ++j)
         {
-            const int32_t e = sel[static_cast<size_t>(t) * top_k + j];
-            if (e >= 0 && e < layer->num_experts)
-                per_expert[e].emplace_back(t, half_to_float(wts[static_cast<size_t>(t) * top_k + j]));
+            const int32_t e = sel[j];
+            if (e < 0 || e >= layer->num_experts) continue;
+            std::pair<int, float> v { e, half_to_float(wts[j]) };
+            int i = np++;
+            for (; i > 0 && picks[i - 1].first > e; --i) picks[i] = picks[i - 1];
+            picks[i] = v;
         }
-    for (int e = 0; e < layer->num_experts; ++e)
-    {
-        auto& lst = per_expert[e];
-        for (size_t i = 0; i < lst.size(); i += g_chunk_m)
+        ctx.chunks.reserve(np);
+        for (int i = 0; i < np; )
         {
             Chunk ch;
-            ch.expert = e;
-            ch.m = static_cast<int>(std::min<size_t>(g_chunk_m, lst.size() - i));
-            for (int r = 0; r < ch.m; ++r)
+            ch.expert = picks[i].first;
+            ch.m = 0;
+            while (i < np && picks[i].first == ch.expert && ch.m < g_chunk_m)
             {
-                ch.token[r] = lst[i + r].first;
-                ch.weight[r] = lst[i + r].second;
+                ch.token[ch.m] = 0;
+                ch.weight[ch.m++] = picks[i++].second;
             }
             ctx.chunks.push_back(ch);
+        }
+    }
+    else
+    {
+        std::vector<std::vector<std::pair<int, float>>> per_expert(layer->num_experts);
+        for (int t = 0; t < m_total; ++t)
+            for (int j = 0; j < top_k; ++j)
+            {
+                const int32_t e = sel[static_cast<size_t>(t) * top_k + j];
+                if (e >= 0 && e < layer->num_experts)
+                    per_expert[e].emplace_back(t, half_to_float(wts[static_cast<size_t>(t) * top_k + j]));
+            }
+        for (int e = 0; e < layer->num_experts; ++e)
+        {
+            auto& lst = per_expert[e];
+            for (size_t i = 0; i < lst.size(); i += g_chunk_m)
+            {
+                Chunk ch;
+                ch.expert = e;
+                ch.m = static_cast<int>(std::min<size_t>(g_chunk_m, lst.size() - i));
+                for (int r = 0; r < ch.m; ++r)
+                {
+                    ch.token[r] = lst[i + r].first;
+                    ch.weight[r] = lst[i + r].second;
+                }
+                ctx.chunks.push_back(ch);
+            }
         }
     }
     const int nc = static_cast<int>(ctx.chunks.size());
@@ -3447,6 +3595,36 @@ void exl3_moe_cpu_forward_raw(
     static double phase_us[6] = {};
     static double phase_bytes[6] = {};
     static long prof_jobs = 0;
+
+    if (rows == 1 && g_fused_decode.load(std::memory_order_relaxed))
+    {
+        // Sync counters for decode_fused_phase: per gate/up GEMV, per chunk (x2), per H block
+        const int gu = layer->gates.empty() ? 1 : 2;
+        const size_t ns = static_cast<size_t>(nc) * (gu + 2) + H / 128;
+        static thread_local std::unique_ptr<std::atomic<int>[]> sync;
+        static thread_local size_t sync_cap = 0;
+        if (sync_cap < ns) { sync.reset(new std::atomic<int>[ns]); sync_cap = ns; }
+        for (size_t i = 0; i < ns; ++i) sync[i].store(0, std::memory_order_relaxed);
+        ctx.prep_state = sync.get();
+        ctx.gu_tiles = ctx.prep_state + static_cast<size_t>(nc) * gu;
+        ctx.down_ready = ctx.gu_tiles + nc;
+        ctx.block_done = ctx.down_ready + nc;   // published by the dispatch store in run()
+
+        const auto t0 = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        g_pool.run(&decode_fused_phase, &ctx, n_run);
+        if (prof)
+        {
+            static double fused_us = 0;
+            static long fused_jobs = 0;
+            fused_us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+            if (++fused_jobs % 512 == 0)
+            {
+                printf(" -- moe_cpu prof (%ld fused decode jobs): %.1f us/job\n", fused_jobs, fused_us / fused_jobs);
+                fflush(stdout);
+            }
+        }
+        return;
+    }
 
     const int num_phases = rows == 1 ? 5 : 6;
     for (int phase = 0; phase < num_phases; ++phase) {
@@ -3540,6 +3718,7 @@ void exl3_moe_cpu_forward
 #include <torch/extension.h>
 #define NO_MOE_CPU() TORCH_CHECK(false, "CPU MoE offload (moe_mul1) is not available on this CPU architecture (x86 AVX2/AVX-512 only)")
 void exl3_moe_cpu_set_prof(bool) {}
+void exl3_moe_cpu_set_fused_decode(bool) {}
 void exl3_moe_cpu_pool_prime(int) {}
 int64_t exl3_moe_cpu_pool_stress(int, int, int, int) { NO_MOE_CPU(); return 0; }
 std::pair<std::vector<int64_t>, int64_t> exl3_moe_cpu_core_order() { return { {}, 0 }; }
