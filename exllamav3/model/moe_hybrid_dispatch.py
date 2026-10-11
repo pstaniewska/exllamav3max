@@ -149,6 +149,7 @@ class DecodeThreadTuner:
     SAMPLES = 12        # timed passes per candidate
     HOLD = 2048         # decode passes on the winner before re-searching its neighbours
     GAP_S = 1.0         # a longer gap between passes is idle time, not a token
+    MARGIN = 0.05       # a smaller share must beat a larger one by this much to win
 
     def __init__(self, fixed: float | None = None):
         self.fixed = fixed
@@ -193,10 +194,16 @@ class DecodeThreadTuner:
         self.skip = self.SETTLE
         self.idx += 1
         if self.idx >= len(self.cands):
-            self.best = min(self.results, key = self.results.get)
+            self.best = self._pick()
             self.hold = self.HOLD
             self.idx = 0
         return self._apply(self.current())
+
+    def _pick(self) -> float:
+        """Largest fraction within MARGIN of the fastest: the medians are noisy on a shared host,
+        and a smaller pool only pays when it is clearly faster"""
+        t_best = min(self.results.values())
+        return max(f for f, t in self.results.items() if t <= t_best * (1.0 + self.MARGIN))
 
     def _neighbours(self):
         """Re-search the winner and its neighbours on the full ladder"""

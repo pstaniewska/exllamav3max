@@ -683,6 +683,16 @@ def test_decode_thread_tuner_settles_on_the_fastest_fraction():
     assert t.cands == [0.875, 0.75, 0.625]
 
 
+def test_decode_thread_tuner_keeps_the_larger_pool_within_margin():
+    t = D.DecodeThreadTuner()
+    # 0.875 is 2% faster than the full pool, inside the noise margin; 0.5 is slower
+    t.results = {1.0: 0.0530, 0.875: 0.0520, 0.75: 0.0604, 0.5: 0.0575}
+    assert t._pick() == 1.0
+    # A clearly faster smaller share still wins
+    t.results = {1.0: 0.080, 0.875: 0.070, 0.75: 0.050}
+    assert t._pick() == 0.75
+
+
 def test_decode_thread_tuner_fixed_and_off():
     assert D.DecodeThreadTuner(0.5).on_pass(True, 0.0) == 0.5
     off = D.DecodeThreadTuner(-1.0)
