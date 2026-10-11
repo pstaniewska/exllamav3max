@@ -2621,7 +2621,6 @@ struct Pool
 #endif
                 continue;
             }
-            idle = 0;
             seen = g;
 
             // The participant count may sit below this worker's index (pool shrink, or a
@@ -2630,11 +2629,16 @@ struct Pool
             // the participating workers have finished. The count travels in the dispatch word
             // itself, so it always belongs to the generation just observed
             const int nw = dispatch_nw(g);
+            if (nw == 0) idle = 0;   // prime(): spin hot ahead of the next dispatch
             if (idx < nw)
             {
+                idle = 0;
                 fn.load(std::memory_order_relaxed)(ctx, idx, nw);
                 done.fetch_add(1, std::memory_order_release);
             }
+            // A surplus worker of a capped dispatch keeps its idle count: while those keep
+            // coming (decode on one LP per core) it parks instead of spinning, since a spinning
+            // SMT sibling takes issue slots and load ports from the participant on its core
         }
     }
 
