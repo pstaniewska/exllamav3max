@@ -36,6 +36,7 @@ PREFILL_GPU_MIN_BOOT applies; EXL3_EXPERT_PREFILL_GPU_MIN=<n> fixes the threshol
 from __future__ import annotations
 import contextlib
 import os
+import time
 import weakref
 import numpy as np
 import torch
@@ -122,9 +123,94 @@ class HybridTuning:
         # are read at the next pass start with Event.query)
         self.profile = os.environ.get("EXL3_HYBRID_MOE_PROFILE", "0") not in ("", "0")
         self.remeasure = int(os.environ.get("EXL3_MOE_COST_REMEASURE", 256))
+        # Decode thread cap per CPU worker, chosen from measured token times (DecodeThreadTuner);
+        # a fraction of the pool such as 0.75 fixes it, "off" leaves the workers' caps alone
+        dt = os.environ.get("EXL3_MOE_DECODE_THREADS", "auto").strip().lower()
+        self.decode_threads = None if dt in ("", "auto") else -1.0 if dt in ("off", "0") else float(dt)
 
 
 HT = HybridTuning()
+
+
+class DecodeThreadTuner:
+    """Picks how many of each CPU worker's pool threads run one-token (decode) jobs, from the
+    measured wall time between consecutive decode passes.
+
+    A decode job is a few expert GEMVs split across the whole pool, with a barrier per phase:
+    every participant that another process preempts (a VM, kubelet, the host's own threads)
+    stalls all of them, every layer, every token. Fewer participants leave cores for the
+    neighbours and finish sooner once that wait outweighs the lost bandwidth, which depends on
+    the machine and its load, so it is measured: each candidate fraction of the pool runs for a
+    block of decode passes, the best median wins, and the search repeats now and then around
+    the winner as the load changes. Prefill-shaped jobs keep the full pool."""
+
+    FRACTIONS = (1.0, 0.875, 0.75, 0.625, 0.5, 0.375)
+    SETTLE = 2          # passes discarded after a switch
+    SAMPLES = 12        # timed passes per candidate
+    HOLD = 2048         # decode passes on the winner before re-searching its neighbours
+    GAP_S = 1.0         # a longer gap between passes is idle time, not a token
+
+    def __init__(self, fixed: float | None = None):
+        self.fixed = fixed
+        self.cands = list(self.FRACTIONS)
+        self.idx = 0
+        self.best = None
+        self.samples: list[float] = []
+        self.results: dict[float, float] = {}
+        self.skip = self.SETTLE
+        self.hold = 0
+        self.t_prev = None
+        self.applied = None
+
+    def current(self) -> float:
+        if self.fixed is not None:
+            return self.fixed
+        return self.best if self.hold > 0 else self.cands[self.idx]
+
+    def on_pass(self, decode: bool, now: float) -> float | None:
+        """Call at every pass start; returns the fraction to apply when it changes"""
+        if self.fixed is not None and self.fixed < 0:
+            return None
+        if self.fixed is not None:
+            return None if self.applied == self.fixed else self._apply(self.fixed)
+        prev, self.t_prev = self.t_prev, (now if decode else None)
+        if not decode or prev is None or now - prev > self.GAP_S:
+            return None if self.applied is not None else self._apply(self.current())
+        dt = now - prev
+        if self.hold > 0:
+            self.hold -= 1
+            if self.hold == 0:
+                self._neighbours()
+            return None if self.applied == self.current() else self._apply(self.current())
+        if self.skip > 0:
+            self.skip -= 1
+            return None
+        self.samples.append(dt)
+        if len(self.samples) < self.SAMPLES:
+            return None
+        self.results[self.cands[self.idx]] = float(np.median(self.samples))
+        self.samples = []
+        self.skip = self.SETTLE
+        self.idx += 1
+        if self.idx >= len(self.cands):
+            self.best = min(self.results, key = self.results.get)
+            self.hold = self.HOLD
+            self.idx = 0
+        return self._apply(self.current())
+
+    def _neighbours(self):
+        """Re-search the winner and its neighbours on the full ladder"""
+        f = list(self.FRACTIONS)
+        i = f.index(self.best)
+        self.cands = f[max(0, i - 1): i + 2]
+        self.idx = 0
+        self.results = {}
+        self.samples = []
+        self.skip = self.SETTLE
+
+    def _apply(self, frac: float) -> float:
+        self.applied = frac
+        return frac
 
 
 def decode_rows(cap_rows: int) -> int:
@@ -394,6 +480,7 @@ class HybridDispatcher:
         self.lane_cost = torch.zeros((4,), dtype = torch.float)
         self.telemetry = Telemetry(n) if HT.profile else None
         self.cost_stale = 0                 # passes since the last decode-shaped CPU sample
+        self.decode_tuner = DecodeThreadTuner(HT.decode_threads)
         self.prefill_fit = [PrefillCostFit() for _ in range(n)]
         self.marginal_fit = [MarginalCostFit() for _ in range(n)]
         self.prefill_cost = None            # (a, b) us, slowest node, from the fits
@@ -772,6 +859,13 @@ class HybridDispatcher:
                 extra = max((self.worst_case(hl, rows) for hl in self.layers if hl.device == dev), default = 0)
                 cache.ensure_headroom(extra)
         self._update_lane_params()
+        frac = self.decode_tuner.on_pass(rows <= self.decode_rows, time.perf_counter())
+        if frac is not None:
+            for h in self.group.hosts:
+                n = int(getattr(h, "threads", 0) or 0)
+                setter = getattr(h, "set_thread_caps", None)
+                if setter is not None:
+                    setter(0, 0 if frac >= 1.0 or n <= 0 else max(1, round(frac * n)))
         if self.telemetry is not None:
             self.telemetry.harvest()
 
@@ -788,6 +882,8 @@ class HybridDispatcher:
             prefill_gpu_min = self.prefill_gpu_min_last,
             cpu_frac_bootstrap = self.cpu_frac,
             cpu_us_per_expert = list(self.cpu_us),
+            decode_threads = dict(fraction = self.decode_tuner.current(),
+                                  token_ms = {str(k): round(v * 1e3, 3) for k, v in self.decode_tuner.results.items()}),
             caches = [ExpertCache.for_device(d).summary() for d in sorted(self.devices, key = str)],
         )
         if self.telemetry is not None:

@@ -102,6 +102,9 @@ if __name__ == "__main__":
 
             perf.model_init.init = _init_once
             _init_once(_args)
+            # The sweep sets the caps itself: keep the automatic decode thread search out of it
+            for d in (getattr(_loaded.get("config"), "moe_hybrid_dispatchers", None) or {}).values():
+                d.decode_tuner.fixed = -1.0
             hosts = getattr(_loaded.get("config"), "moe_cpu_hosts", None) or {}
             sweep = {}
             for i, (cp, cd) in enumerate(caps):

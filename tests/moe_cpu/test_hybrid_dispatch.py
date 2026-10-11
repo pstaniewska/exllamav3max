@@ -659,3 +659,31 @@ def test_marginal_cost_fit_excludes_the_fixed_job_cost():
     for _ in range(10):
         c.add(4, 800)
     assert c.marginal() is None
+
+
+def test_decode_thread_tuner_settles_on_the_fastest_fraction():
+    t = D.DecodeThreadTuner()
+    # Token time by fraction: fastest at 0.75
+    cost = {1.0: 0.080, 0.875: 0.070, 0.75: 0.050, 0.625: 0.055, 0.5: 0.060, 0.375: 0.075}
+    now, applied = 0.0, [t.on_pass(True, 0.0)]
+    per = (t.SETTLE + t.SAMPLES) * len(t.FRACTIONS) + 4
+    for _ in range(per):
+        now += cost[t.current()]
+        f = t.on_pass(True, now)
+        if f is not None:
+            applied.append(f)
+    assert applied[0] == 1.0 and t.best == 0.75 and t.current() == 0.75
+    # A prefill pass or an idle gap does not count as a token
+    assert t.on_pass(False, now + 0.01) is None
+    assert t.on_pass(True, now + 5.0) is None
+    # After the hold, only the winner's neighbours are searched again
+    t.hold = 1
+    t.on_pass(True, now + 5.05)
+    t.on_pass(True, now + 5.1)
+    assert t.cands == [0.875, 0.75, 0.625]
+
+
+def test_decode_thread_tuner_fixed_and_off():
+    assert D.DecodeThreadTuner(0.5).on_pass(True, 0.0) == 0.5
+    off = D.DecodeThreadTuner(-1.0)
+    assert off.on_pass(True, 0.0) is None and off.on_pass(True, 0.05) is None

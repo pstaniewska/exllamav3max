@@ -381,6 +381,15 @@ Worker thread count, set per component via `config.infer_params.moe_cpu_threads`
 
 Fallback worker thread count when the component's `-mclt`/`-dmclt` config value is not set.
 
+### `EXL3_MOE_DECODE_THREADS` (default: `auto`)
+
+Hybrid MoE (`-mh`): share of each CPU worker's pool that runs one-token (decode) jobs. `auto`
+measures the time per decode token for 1, 7/8, 3/4, 5/8, 1/2 and 3/8 of the pool, keeps the
+fastest and re-checks its neighbours every 2048 decode tokens. On a host whose cores other
+processes also use (VMs, kubelet), a full pool waits at every phase barrier for whichever
+thread was preempted, and a smaller share is faster. A number such as `0.75` fixes the share;
+`off` leaves the caps alone (as `eval/hybrid_perf.py -sweep` does).
+
 ### `EXL3_MOE_CPU_DECODE_WORKERS` (default: `0`, no cap)
 
 Caps the worker threads that run a single-token (decode) job. With `EXL3_MOE_CPU_THREADS` set to
