@@ -642,3 +642,20 @@ def test_numa_policy_auto_spreads_replicated_experts(monkeypatch, memory, expect
     monkeypatch.setenv("EXL3_NUMA_MEMORY_POLICY", memory)
     assert D.resolve_node_policy("auto") == expect
     assert D.resolve_node_policy("numa_balanced") == "numa_balanced"
+
+
+def test_marginal_cost_fit_excludes_the_fixed_job_cost():
+    # Node A: 1000 us fixed + 100 us per expert, seen only with 1-2 experts per job;
+    # node B: 100 us fixed + 150 us per expert, seen with 6-8. Per-expert averages call A dearer
+    # (~900 vs ~165 us), the marginal costs B (150 vs 100 us)
+    a, b = D.MarginalCostFit(), D.MarginalCostFit()
+    for e in (1, 2) * 20:
+        a.add(e, 1000 + 100 * e)
+    for e in (6, 7, 8) * 20:
+        b.add(e, 100 + 150 * e)
+    assert abs(a.marginal() - 100) < 1e-6 and abs(b.marginal() - 150) < 1e-6
+    # One job size only: f and c cannot be separated
+    c = D.MarginalCostFit()
+    for _ in range(10):
+        c.add(4, 800)
+    assert c.marginal() is None

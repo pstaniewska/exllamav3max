@@ -165,6 +165,31 @@ class PrefillCostFit:
         return a, b
 
 
+class MarginalCostFit:
+    """One node's decode-shaped CPU job cost as f + c * experts (microseconds), least squares with
+    exponential forgetting. c is the node's marginal cost of one more expert, the quantity a
+    node choice changes; us / experts would fold the fixed per-job cost f into it, so a node
+    handed fewer experts per job looks dearer per expert and is handed fewer still"""
+
+    def __init__(self, decay: float = PREFILL_FIT_DECAY):
+        self.decay = decay
+        self.s = np.zeros(5)                # sum 1, e, ee, u, eu
+
+    def add(self, experts: int, us: float):
+        e = float(experts)
+        self.s *= self.decay
+        self.s += (1.0, e, e * e, us, e * us)
+
+    def marginal(self) -> float | None:
+        """c > 0, or None while the records cannot separate it from f"""
+        n, se, see, su, seu = self.s
+        det = n * see - se * se
+        if n <= 0 or det <= 1e-3 * n * see:
+            return None
+        c = (n * seu - se * su) / det
+        return c if c > 0 else None
+
+
 def choose_prefill_gpu_min(counts: np.ndarray, t_gpu0: float, t_zc: float, t_fixed: float,
                            a: float, b: float, nodes: int, cpu0: tuple[int, int] = (0, 0)) -> int:
     """Row threshold for one prefill call: non-resident experts with at least this many rows read
@@ -370,6 +395,7 @@ class HybridDispatcher:
         self.telemetry = Telemetry(n) if HT.profile else None
         self.cost_stale = 0                 # passes since the last decode-shaped CPU sample
         self.prefill_fit = [PrefillCostFit() for _ in range(n)]
+        self.marginal_fit = [MarginalCostFit() for _ in range(n)]
         self.prefill_cost = None            # (a, b) us, slowest node, from the fits
         self.prefill_stale = 0              # prefill calls without a CPU lane in a row
         self.prefill_gpu_min_last = None    # threshold of the last prefill call
@@ -784,6 +810,7 @@ class HybridDispatcher:
                 # Per distinct expert: a job streams each selected expert's weights once, so that
                 # is the unit the cost model compares with one zero-copy expert read
                 v = us / max(ne, 1)
+                self.marginal_fit[i].add(ne, us)
                 self.cpu_us[i] = v if self.cpu_us[i] is None else (1 - HT.ema) * self.cpu_us[i] + HT.ema * v
                 changed = True
         if fit_changed:
@@ -806,8 +833,13 @@ class HybridDispatcher:
             return
         known = [c for c in self.cpu_us if c]
         if known:
-            mean = sum(known) / len(known)
-            for i, c in enumerate(self.cpu_us):
+            # Node choice compares marginal per-expert costs (fixed job cost excluded) once every
+            # node's fit separates them; until then the plain per-expert average
+            marg = [f.marginal() for f in self.marginal_fit]
+            rel = marg if all(m is not None for m in marg) else self.cpu_us
+            have = [c for c in rel if c]
+            mean = sum(have) / len(have)
+            for i, c in enumerate(rel):
                 self.node_cost[i] = (c or mean) / mean
         if HT.zc_max is None and self.zc_us and known:
             # Measured cost model for the issue kernel (greedy min-max per call). Per expert CPU
