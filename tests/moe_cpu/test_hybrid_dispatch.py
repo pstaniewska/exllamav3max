@@ -635,3 +635,10 @@ def test_choose_prefill_gpu_min_counts_forced_cpu_work():
     worst = lambda k: max(50.0 + (base + 100 * k + 10 * c[:k].sum()) / 2, (c.size - k) * 1000.0)
     k = int((c < t1).sum())
     assert worst(k) == min(worst(j) for j in range(c.size + 1) if j in (0, c.size) or c[j] != c[j - 1])
+
+
+@pytest.mark.parametrize("memory, expect", [("replicate", "numa_adaptive"), ("shard", "numa_local")])
+def test_numa_policy_auto_spreads_replicated_experts(monkeypatch, memory, expect):
+    monkeypatch.setenv("EXL3_NUMA_MEMORY_POLICY", memory)
+    assert D.resolve_node_policy("auto") == expect
+    assert D.resolve_node_policy("numa_balanced") == "numa_balanced"

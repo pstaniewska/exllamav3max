@@ -819,7 +819,8 @@ its default. In short:
   `EXL3_HYBRID_MOE_DEBUG`, and `EXL3_HYBRID_MOE_PROFILE` (CPU-lane wait measured with CUDA events,
   no host sync).
 - **NUMA:** `EXL3_NUMA_ENABLE` (one CPU worker per node; also applies to `-mcl` / `-mcs`, whose
-  layers then go round-robin over the nodes), `EXL3_NUMA_POLICY`, `EXL3_NUMA_MEMORY_POLICY`
+  layers then go round-robin over the nodes), `EXL3_NUMA_POLICY` (default `auto`: measured
+  cost split under `replicate`, GPU-local under `shard`), `EXL3_NUMA_MEMORY_POLICY`
   (`shard` or `replicate`), `EXL3_NUMA_SHARD` (`mod` or `blocked`), `EXL3_NUMA_CPU_MAP`,
   `EXL3_NUMA_GPU_NODE` and `EXL3_NUMA_DEBUG`. An undeterminable GPU node stays unknown and is
   never assumed. Hybrid mode supports at most 8 worker nodes and stops with an error before

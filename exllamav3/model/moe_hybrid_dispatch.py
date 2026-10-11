@@ -81,6 +81,15 @@ def release_tag(tag: str | None):
         _LIVE_TAGS.discard(tag)
 
 
+def resolve_node_policy(policy: str) -> str:
+    """EXL3_NUMA_POLICY "auto": measured cost split when experts are replicated on every node;
+    with shards the policy has no choice to make, so keep the GPU-local rule"""
+    if policy != "auto":
+        return policy
+    from .moe_numa_hosts import memory_policy
+    return "numa_adaptive" if memory_policy() == "replicate" else "numa_local"
+
+
 class HybridTuning:
 
     def __init__(self):
@@ -89,9 +98,11 @@ class HybridTuning:
         assert self.dispatch in DISPATCH_POLICIES, f"EXL3_EXPERT_DISPATCH_POLICY must be one of {DISPATCH_POLICIES}"
         self.home = os.environ.get("EXL3_EXPERT_HOME", "native_copy").strip().lower()
         assert self.home in HOME_MODES, f"EXL3_EXPERT_HOME must be one of {HOME_MODES}"
-        self.node_policy = os.environ.get("EXL3_NUMA_POLICY", "numa_local").strip().lower()
-        assert self.node_policy in NODE_POLICIES or self.node_policy == "legacy", \
-            f"EXL3_NUMA_POLICY must be legacy or one of {tuple(NODE_POLICIES)}"
+        # Unset or "auto": numa_adaptive with replicated experts (every node holds every expert, so
+        # spread the work by measured cost), numa_local with shards (the owner is the only holder)
+        self.node_policy = os.environ.get("EXL3_NUMA_POLICY", "auto").strip().lower()
+        assert self.node_policy in NODE_POLICIES or self.node_policy in ("legacy", "auto"), \
+            f"EXL3_NUMA_POLICY must be auto, legacy or one of {tuple(NODE_POLICIES)}"
         zc = os.environ.get("EXL3_MOE_ZC_MAX", "auto").strip().lower()
         self.zc_max = None if zc == "auto" else int(zc)
         self.cpu_frac_init = float(os.environ.get("EXL3_MOE_ZC_CPU_FRAC_INIT", 0.5))
@@ -324,8 +335,9 @@ class HybridDispatcher:
         self.comp = comp
         self.tag = None                     # acquired with the first layer (acquire_tag)
         self.device0 = torch.device(device)
-        self.node_policy = NODE_POLICIES.get(HT.node_policy, 0)
-        telemetry = HT.node_policy == "numa_adaptive" or (HT.dispatch == "hybrid" and HT.zc_max is None)
+        node_policy = resolve_node_policy(HT.node_policy)
+        self.node_policy = NODE_POLICIES.get(node_policy, 0)
+        telemetry = node_policy == "numa_adaptive" or (HT.dispatch == "hybrid" and HT.zc_max is None)
         self.group = HostGroup(config, comp, self.device0.index, home = HT.home, telemetry = telemetry,
                                max_nodes = MAX_NODES)
         if self.group.numa and HT.home == "native_copy":

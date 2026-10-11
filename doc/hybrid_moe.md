@@ -330,6 +330,9 @@ nothing else changes.
 
 `EXL3_NUMA_POLICY` chooses the node when an expert is held by several nodes (`replicate`):
 
+- `auto` (default): `numa_adaptive` under `replicate`, `numa_local` under `shard`. Sending every
+  replicated expert to the GPU's node leaves the other node's worker idle and roughly halves
+  prefill throughput.
 - `numa_local`, `numa_sharded`: the GPU's node when known, else the first holder. With shards,
   the owner is the only holder.
 - `numa_balanced`: the holder with the fewest assigned rows in this call.
@@ -430,7 +433,7 @@ classic paths, `EXL3_NUMA_ENABLE=1`) is set.
 | `EXL3_HYBRID_MOE_DEBUG` | `0` | print the cost probes (PCIe, VRAM, CPU round trip) |
 | `EXL3_HYBRID_MOE_PROFILE` | `0` | GPU-side CPU-lane wait profile with CUDA events (see [Telemetry](#telemetry)) |
 | `EXL3_NUMA_ENABLE` | `0` | one CPU worker per NUMA node (hybrid: at most 8) |
-| `EXL3_NUMA_POLICY` | `numa_local` | `numa_local`, `numa_sharded`, `numa_balanced`, `numa_adaptive` |
+| `EXL3_NUMA_POLICY` | `auto` | `auto`, `numa_local`, `numa_sharded`, `numa_balanced`, `numa_adaptive` |
 | `EXL3_NUMA_MEMORY_POLICY` | `shard` | `shard` or `replicate` |
 | `EXL3_NUMA_SHARD` | `mod` | `mod` or `blocked` |
 | `EXL3_NUMA_CPU_MAP` | auto | node:cpulist override, `;`-separated |
