@@ -22,7 +22,6 @@ node cannot be determined stays "unknown": GPU-adjacent buffers then get default
 
 from __future__ import annotations
 import os
-import sys
 from ..util.numa_topology import get_topology, gpu_numa_node, numa_debug, format_cpulist
 
 
@@ -45,11 +44,9 @@ def shard_layout() -> str:
 
 
 def pin_threads_enabled() -> bool:
-    """Same rule as the worker pool's pin_threads_enabled() (cpu/moe_mul1.cpp): Linux pins only
-    with EXL3_MOE_CPU_PIN=1, other platforms unless EXL3_MOE_CPU_PIN=0"""
+    """Same rule as the worker pool's pin_threads_enabled() (cpu/moe_mul1.cpp): pins on every
+    platform unless EXL3_MOE_CPU_PIN=0"""
     v = os.environ.get("EXL3_MOE_CPU_PIN", "")
-    if sys.platform.startswith("linux"):
-        return v[:1] == "1"
     return v[:1] != "0"
 
 

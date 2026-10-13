@@ -58,3 +58,54 @@ def test_decode_finish_matches_batch(activation, bias, cpu_runtime):
                 torch.testing.assert_close(out[0], reference[0], rtol = 5e-4, atol = 2e-5)
     finally:
         ext.exl3_moe_cpu_free_layer(handle)
+
+
+@pytest.mark.parametrize("activation", [0, 2])
+@pytest.mark.parametrize("bias", [False, True])
+def test_fused_decode_matches_phased(activation, bias, cpu_runtime):
+    # The single-dispatch decode path (fine-grained waits) against the five-barrier phased path:
+    # same tile ranges, kernels and accumulation order, so bit-identical, over partial routing,
+    # repeated experts, and worker counts above and below the 128-column block count
+    gen = torch.Generator().manual_seed(911)
+    hidden, intermediate, experts = 512, 384, 6
+    gated = activation != 2
+    swizzled = len(swizzle_layouts()) > 1
+
+    def matrices(k, n, enabled = True):
+        ts, us, vs, bs = [], [], [], []
+        if enabled:
+            for e in range(experts):
+                bits = (1, 2, 3, 4, 6, 8)[e]
+                t = torch.randint(-32768, 32767, (k // 16, n // 16, 16 * bits),
+                                  dtype = torch.int16, generator = gen)
+                if swizzled:
+                    t = swizzle(t)
+                ts.append(t)
+                us.append((torch.randn(k, generator = gen) * 0.015).half())
+                vs.append(torch.randn(n, generator = gen).half())
+                if bias:
+                    bs.append((torch.randn(n, generator = gen) * 0.1).half())
+        return ts, us, vs, bs
+
+    g = matrices(hidden, intermediate, gated)
+    u = matrices(hidden, intermediate)
+    d = matrices(intermediate, hidden)
+    handle = ext.exl3_moe_cpu_make_layer(
+        *g[:3], *u[:3], *d[:3], g[3], u[3], d[3], activation, 1.0, int(swizzled))
+    try:
+        x = torch.randn(1, hidden, generator = gen).half()
+        weights = torch.tensor([[0.1, 0.2, 0.05, 0.15, 0.3, 0.2]], dtype = torch.half)
+        for selected in ([5, 0, 3, 1, 4, 2], [-1, 4, -1, 1, -1, -1], [2, 2, 5, 2, -1, 0],
+                         [-1] * 6, [3, 1, 3, 1, 3, 1]):
+            sel = torch.tensor([selected], dtype = torch.long)
+            for threads in (1, 2, 3, 4, 7, 16):
+                outs = []
+                for fused in (False, True):
+                    ext.exl3_moe_cpu_set_fused_decode(fused)
+                    out = torch.full((1, hidden), float("nan"))
+                    ext.exl3_moe_cpu_forward(handle, x, sel, weights, out, threads)
+                    outs.append(out)
+                assert torch.equal(outs[0], outs[1]), (selected, threads)
+    finally:
+        ext.exl3_moe_cpu_set_fused_decode(True)
+        ext.exl3_moe_cpu_free_layer(handle)

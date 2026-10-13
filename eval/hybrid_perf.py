@@ -2,6 +2,11 @@
 Hybrid MoE baseline: eval/perf.py (prefill and decode speed over context lengths) with the hybrid
 dispatchers' telemetry written to a JSON file afterwards (cache hits, lane costs, measured PCIe and
 CPU costs, per-device cache state). Run with -mh; see eval/hybrid_baseline.sh for the full sweep.
+
+-sweep "P:D,P:D,..." loads the model once and repeats the measurements for each pair of CPU worker
+thread caps (P for prefill-shaped jobs, D for one-token decode jobs, 0 = the pool's full size),
+switched in place between runs instead of reloading. Caps only lower a worker's pool, so size the
+pool for the largest P (EXL3_MOE_CPU_THREADS). Results go to the JSON under "sweep".
 """
 
 import sys, os
@@ -75,11 +80,42 @@ if __name__ == "__main__":
     parser.add_argument("-short", "--short_prefill", action = "store_true", help = "Test short-prefill/batch throughput")
     parser.add_argument("-sd", "--spec_dec", action = "store_true", help = "Test spec-decode seqlens 1..4")
     parser.add_argument("-json", "--json_out", type = str, default = "hybrid_perf.json", help = "Telemetry output path")
+    parser.add_argument("-sweep", "--thread_sweep", type = str, default = None,
+                        help = "Comma-separated prefill:decode CPU thread caps, measured in one load (e.g. 0:0,0:48,0:32)")
     _args = parser.parse_args()
     perf.model_init.init = _capture_init
     _wrap("measure_prefill")
     _wrap("measure_generate")
     try:
-        perf.main(_args)
+        if not _args.thread_sweep:
+            perf.main(_args)
+        else:
+            caps = [tuple(int(v) for v in p.split(":")) for p in _args.thread_sweep.split(",")]
+            _real_main = perf.main
+            _real_init = perf.model_init.init
+            loaded = {}
+
+            def _init_once(args, *a, **kw):
+                if "out" not in loaded:
+                    loaded["out"] = _real_init(args, *a, **kw)
+                return loaded["out"]
+
+            perf.model_init.init = _init_once
+            _init_once(_args)
+            # The sweep sets the caps itself: keep the automatic decode thread search out of it
+            for d in (getattr(_loaded.get("config"), "moe_hybrid_dispatchers", None) or {}).values():
+                d.decode_tuner.fixed = -1.0
+            hosts = getattr(_loaded.get("config"), "moe_cpu_hosts", None) or {}
+            sweep = {}
+            for i, (cp, cd) in enumerate(caps):
+                ok = [h.set_thread_caps(cp, cd) for h in hosts.values()]
+                print(f" -- Sweep {i + 1}/{len(caps)}: prefill cap {cp or 'full'}, decode cap {cd or 'full'}"
+                      f" ({len(ok)} workers)")
+                _loaded.pop("results", None)
+                # Warmup once only: later settings reuse the warmed caches
+                _args.skip_warmup = _args.skip_warmup or i > 0
+                _real_main(_args)
+                sweep[f"{cp}:{cd}"] = _loaded.get("results", {})
+            _loaded["results"] = {"sweep": sweep}
     finally:
         dump(_args.json_out, _args)

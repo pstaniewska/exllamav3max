@@ -206,6 +206,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("group") = 0, py::arg("planar") = 0);
     m.def("exl3_moe_cpu_set_memops", &exl3_moe_cpu_set_memops, "exl3_moe_cpu_set_memops");
     m.def("exl3_moe_cpu_set_prof", &exl3_moe_cpu_set_prof, "exl3_moe_cpu_set_prof");
+    m.def("exl3_moe_cpu_set_fused_decode", &exl3_moe_cpu_set_fused_decode, "exl3_moe_cpu_set_fused_decode");
     m.def("exl3_moe_cpu_pool_stress", &exl3_moe_cpu_pool_stress, "exl3_moe_cpu_pool_stress");
     m.def("exl3_moe_cpu_core_order", &exl3_moe_cpu_core_order, "exl3_moe_cpu_core_order");
     m.def("exl3_moe_cpu_worker_run", &exl3_moe_cpu_worker_run, "exl3_moe_cpu_worker_run",

@@ -140,6 +140,21 @@ class TransformerBlock(Module):
             hc_flush(params)
         return super().prepare_for_device(x, params)
 
+    def _moe_defer_ok(self, x: torch.Tensor, params: dict, out_dtype, export_state) -> bool:
+        """The hybrid MoE of this block may leave its CPU partial to the next block (EXL3_MOE_DEFER):
+        only under a forward loop that folds leftovers (forward_ls sets params["moe_fold"]), in
+        decode-style inference, with an fp32 residual that takes the partial as is (no MLP
+        post-norm or scalars) and that nothing reads before the fold"""
+        if "moe_fold" not in params or getattr(self.mlp, "hybrid", None) is None:
+            return False
+        if any(k in params for k in ("prefill", "backend", "capture", "quant_preserve")) or export_state:
+            return False
+        if self.mlp_post_norm is not None or self.mlp_resid_scalar is not None or self.layer_scalar_f is not None:
+            return False
+        if x.dtype != torch.float or not x.is_contiguous() or (out_dtype or self.out_dtype or torch.float) != torch.float:
+            return False
+        return self.mlp_hc is None or (x.dim() == 4 and x.shape[2] == 4)
+
     @override
     def forward(
         self,
@@ -152,6 +167,11 @@ class TransformerBlock(Module):
         export_state = export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0
 
         y_resid = None  # pending attn output whose residual add is folded into the MLP input norm
+
+        # Expert deferral (EXL3_MOE_DEFER, moe_hybrid_dispatch.DeferredPartial): the previous
+        # block's hybrid CPU partial, folded into the residual at the end of this block
+        rec = params.get("moe_fold")
+        deferred = None
 
         if self.attn:
             if self.attn_hc:
@@ -170,6 +190,8 @@ class TransformerBlock(Module):
                 y *= self.attn_resid_scalar
             if self.attn_hc:
                 x = self.attn_hc.apply_(x, y, hc_post, hc_comb, params)
+                if rec is not None and rec.v is not None:
+                    rec.carry(hc_comb)
             elif self.attn_post_norm:
                 self.attn_post_norm.forward(y, params, residual = x)
             elif self.mlp is not None and self.mlp_norm is not None and self.mlp_norm.can_fuse_residual(x, y):
@@ -191,15 +213,33 @@ class TransformerBlock(Module):
                     y = self.mlp_norm.forward(x, params, out_dtype = torch.half)
                 else:
                     y = x.half()
+            defer_ok = self._moe_defer_ok(x, params, out_dtype, export_state)
+            if defer_ok:
+                params["moe_defer_ok"] = True
             y = self.mlp.forward(y, params)
+            if defer_ok:
+                del params["moe_defer_ok"]
+                deferred = params.pop("moe_deferred", None)
             if self.mlp_resid_scalar is not None:
                 y *= self.mlp_resid_scalar
             if self.mlp_hc:
                 x = self.mlp_hc.apply_(x, y, hc_post, hc_comb, params)
+                if rec is not None and rec.v is not None:
+                    rec.carry(hc_comb)
+                if deferred is not None:
+                    deferred.set_post(hc_post)
             elif self.mlp_post_norm:
                 self.mlp_post_norm.forward(y, params, residual = x)
             else:
                 x += y
+
+        if rec is not None:
+            params["moe_fold"] = None
+            if rec.v is not None:
+                hc_flush(params)
+            rec.dispatcher.fold(rec, x, rec.v)
+        if deferred is not None:
+            params["moe_fold"] = deferred
 
         if export_state:
             s = params.get("export_states")
