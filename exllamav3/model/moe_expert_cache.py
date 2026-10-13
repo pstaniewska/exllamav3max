@@ -52,7 +52,7 @@ import torch
 from . import moe_hybrid_ref as ref
 from .moe_hybrid_ref import (
     EMAX, MAX_TABLES, MAX_NODES, MAX_CLASSES, S_COUNT, CTL_SIZE, STATS_SIZE, STAT_NAMES,
-    CTL_HAND, CTL_CLASS_LO, CTL_CLASS_HI, ST_NO_LANE,
+    CTL_BG_ADMIT, CTL_HAND, CTL_CLASS_LO, CTL_CLASS_HI, ST_NO_LANE,
     OP_EVICT, OP_DISABLE, OP_ENABLE, OP_INSTALL, OP_RESET_LAYER,
 )
 
@@ -71,6 +71,9 @@ class CacheTuning:
         self.reserve_bytes = _env_int("EXL3_EXPERT_CACHE_RESERVE_MB", 1536) << 20
         self.min_free_bytes = _env_int("EXL3_EXPERT_CACHE_MIN_FREE_MB", 1024) << 20
         self.admit_max = _env_int("EXL3_EXPERT_CACHE_ADMIT_MAX", 64)
+        # Frequency-gated admissions of CPU-lane misses per decode layer call (0 = only GPU-lane
+        # misses are admitted, the old behaviour)
+        self.bg_admit = max(0, _env_int("EXL3_EXPERT_CACHE_BG_ADMIT", 1))
         self.warm = os.environ.get("EXL3_EXPERT_CACHE_WARM") or None
         self.save_stats = os.environ.get("EXL3_EXPERT_CACHE_SAVE_STATS") or None
         self.gmax = max(1, _env_int("EXL3_EXPERT_CACHE_GATHER_MAX", 64))
@@ -539,6 +542,7 @@ class ExpertCache:
             ctl[CTL_CLASS_LO + 2 * c.id] = c.lo
             ctl[CTL_CLASS_HI + 2 * c.id] = c.lo     # nothing enabled yet
             ctl[CTL_HAND + c.id] = 0
+        ctl[CTL_BG_ADMIT] = self.T.bg_admit
         epoch = int(self.arrays["ctl"][0].item())
         ctl[0] = epoch
         self._write(self.arrays["ctl"], 0, ctl)

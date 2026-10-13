@@ -45,6 +45,7 @@
 // ctl words
 #define HY_CTL_EPOCH      0
 #define HY_CTL_GCOUNT     1
+#define HY_CTL_BG_ADMIT   2      // max frequency-gated background admissions per decode call (0 = off)
 #define HY_CTL_HAND       8      // + class
 #define HY_CTL_CLASS_LO  16      // + 2 * class
 #define HY_CTL_CLASS_HI  17      // + 2 * class
@@ -63,6 +64,8 @@
 #define HY_ST_PREFILL     9
 #define HY_ST_ADMIT_BYTES 10     // bytes copied into slots by admissions (host -> VRAM over PCIe)
 #define HY_ST_ZC_BYTES   11      // expert bytes of zero-copy lanes (lower bound of the PCIe reads)
+#define HY_ST_BG_ADMITS  12      // admissions of CPU-lane misses (subset of HY_ST_ADMITS)
+#define HY_ST_BG_REJECTS 13      // CPU-lane misses not admitted: the CLOCK victim was used as often
 #define HY_ST_CPU_NODE   16      // + node: non-resident experts sent to that CPU node
 #define HY_STATS_SIZE    32
 
