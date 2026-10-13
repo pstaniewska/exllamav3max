@@ -2460,11 +2460,12 @@ typedef void (*PoolFn)(void* ctx, int worker, int num_workers);
 
 // Physical-core-first CPU ordering: one logical CPU per distinct physical core, SMT siblings
 // appended after. Pinning the workers to it keeps two of them off one physical core and, with
-// the host process confined to the reserved core (EXL3_MOE_HOST_CORES), off the host's spinning
-// threads. Whether that beats the OS scheduler depends on the scheduler: on Windows it does; on
-// Linux CFS places the host's spin-waits and the workers onto distinct cores by itself and the
-// fixed placement only pins each run to whichever layout it started with, so the default is
-// per platform (EXL3_MOE_CPU_PIN overrides either way).
+// the host process confined to the reserved core (EXL3_MOE_HOST_CORES), off the host's threads:
+// a worker that shares a core with other work is the straggler at every per-phase barrier. A
+// floating pool relies on the scheduler keeping the layout apart, which holds on some
+// hosts and fails badly on others (small L3 domains, VM guests), while a pinned layout can
+// only lose to whatever else lands on its cores, so pinning is the default (EXL3_MOE_CPU_PIN=0
+// floats the workers; the reserved core and the host confinement stay in effect either way).
 //
 // Linux: entries are plain logical CPU indices (as taken by CPU_SET). Windows: entries encode
 // (processor group << 16) | bit-within-group, decoded by Pool::pin_self -- SetThreadAffinityMask
@@ -2556,11 +2557,7 @@ inline bool pin_threads_enabled()
 {
     static const bool v = [] {
         const char* e = std::getenv("EXL3_MOE_CPU_PIN");
-#ifdef __linux__
-        return e && *e == '1';
-#else
         return !(e && *e == '0');
-#endif
     }();
     return v;
 }
@@ -3287,11 +3284,12 @@ static const MoeCpuLayer* get_layer(int64_t handle)
     return g_layers[handle];
 }
 
-// Topology as the pool sees it: physical-core-first order and the physical core count, so the
-// Python host can keep its own threads off the worker LPs. Empty when pinning is disabled.
+// Topology as the pool sees it: physical-core-first order and the physical core count, for the
+// Python host's worker-count default and for keeping its own threads on the reserved core(s).
+// Reported whether or not the workers themselves are pinned: a floating pool still leaves the
+// reserved cores alone on average, and the host on them is still out of the workers' way
 std::pair<std::vector<int64_t>, int64_t> exl3_moe_cpu_core_order()
 {
-    if (!pin_threads_enabled()) return { {}, 0 };
     const CoreOrder co = physical_core_order();
     return { std::vector<int64_t>(co.order.begin(), co.order.end()), co.n_phys };
 }

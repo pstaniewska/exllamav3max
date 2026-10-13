@@ -99,14 +99,14 @@ class MoeCpuTuning:
         self.num_slots = int(os.environ.get("EXL3_MOE_CPU_SLOTS", 4))
         assert 1 <= self.num_slots <= 8, "EXL3_MOE_CPU_SLOTS must be 1..8 (MOE_MAX_SLOTS in moe_handoff.h)"
         self.cap_rows = int(os.environ.get("EXL3_MOE_CPU_SLOT_ROWS", 64))
-        # Physical cores kept free of pool workers for the host process when the pool pins its
-        # workers (EXL3_MOE_CPU_PIN); the host is confined to them once the worker has started,
-        # see moe_cpu_affinity.py. 0 disables the reservation and the pinning
+        # Physical cores kept free of pool workers for the host process, whether the pool pins
+        # its workers (EXL3_MOE_CPU_PIN) or lets them float; the host is confined to them once
+        # the worker has started, see moe_cpu_affinity.py. 0 disables the reservation
         self.host_cores = int(os.environ.get("EXL3_MOE_HOST_CORES", 1))
         # Thread count fallback chain ends here; config.infer_params.moe_cpu_threads (or the
         # draft/MTP equivalent) takes precedence per host when set (MoeCpuHost.__init__).
-        # Default: physical cores minus host_cores; cpu_count/2 when host_cores is 0, pinning
-        # is off or the topology is unreadable
+        # Default: physical cores minus host_cores; cpu_count/2 when host_cores is 0 or the
+        # topology is unreadable
         _, n_phys = ext.exl3_moe_cpu_core_order()
         self.threads = int(os.environ.get(
             "EXL3_MOE_CPU_THREADS",

@@ -257,7 +257,7 @@ and thread pool:
 
 The host process keeps `EXL3_MOE_HOST_CORES` physical cores, both SMT siblings, on the GPU's node.
 It is confined to them only when the worker pools pin their threads. The rule is the pool's own:
-on Linux only with `EXL3_MOE_CPU_PIN=1`, elsewhere unless `EXL3_MOE_CPU_PIN=0`. A plan with one
+pinned unless `EXL3_MOE_CPU_PIN=0`. A plan with one
 unconfined worker (single node, NUMA off) uses the classic host placement unchanged. The per-node
 groups of the classic `-mcl` / `-mcs` path are placed after their workers start.
 

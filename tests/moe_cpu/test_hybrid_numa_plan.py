@@ -138,13 +138,10 @@ def test_memoryless_cpu_node_binds_to_the_nearest_memory(tmp_path):
 
 
 def test_pin_rule_matches_the_worker_pool(monkeypatch):
-    monkeypatch.setattr(H.numa_hosts.sys, "platform", "linux")
+    # Pins by default on every platform; only EXL3_MOE_CPU_PIN=0 turns it off (cpu/moe_mul1.cpp)
     monkeypatch.delenv("EXL3_MOE_CPU_PIN", raising = False)
-    assert not H.numa_hosts.pin_threads_enabled()
-    monkeypatch.setenv("EXL3_MOE_CPU_PIN", "1")
     assert H.numa_hosts.pin_threads_enabled()
-    monkeypatch.setattr(H.numa_hosts.sys, "platform", "win32")
-    monkeypatch.delenv("EXL3_MOE_CPU_PIN", raising = False)
+    monkeypatch.setenv("EXL3_MOE_CPU_PIN", "1")
     assert H.numa_hosts.pin_threads_enabled()
     monkeypatch.setenv("EXL3_MOE_CPU_PIN", "0")
     assert not H.numa_hosts.pin_threads_enabled()

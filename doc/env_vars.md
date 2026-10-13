@@ -739,28 +739,28 @@ Seconds the parent waits for the CPU worker to signal ready after every offloade
 been handed over. Startup is the shared-memory attach, layer registration and thread spawn,
 so the default is only a safety net against a wedged worker; raise it on very slow hosts.
 
-### `EXL3_MOE_CPU_PIN` (default: `1` on Windows, `0` on Linux)
+### `EXL3_MOE_CPU_PIN` (default: `1`)
 
 Pin each worker thread (and the worker's own main thread) to a distinct physical CPU core,
-SMT siblings last, instead of leaving placement to the OS scheduler, and reserve cores for the
-host process (`EXL3_MOE_HOST_CORES`). Two workers sharing a physical core, or a worker sharing
-one with the host's spin-waiting threads, becomes the straggler at every per-phase barrier of a
-job. Which side of that trade-off wins depends on the scheduler. On Windows the pinned layout
-with a reserved host core is faster and far steadier than floating threads. On Linux the
-opposite was measured end to end: CFS keeps the workers and the host's spin-waits on distinct
-cores by itself, while a pinned layout cannot adapt to whatever else lands on its cores and so
-settles on a different throughput level each run; unpinned runs are faster and repeatable.
-Hence the per-platform default; set it explicitly to test the other layout. Falls back to no
-pinning if the CPU topology can't be read.
+SMT siblings last, instead of leaving placement to the OS scheduler. Two workers sharing a
+physical core, or a worker sharing one with the host's threads, becomes the straggler at every
+per-phase barrier of a job. A floating pool depends on the scheduler keeping that layout apart
+on its own; that works on some hosts and loses a large share of decode throughput on others
+(hosts with small L3 domains, VM guests), while the pinned layout can only lose to whatever
+else lands on its cores, so pinning is the default on every platform. `0` lets the workers
+float, which can be worth testing on a host that also runs other work; the reserved host core
+(`EXL3_MOE_HOST_CORES`) stays in effect either way. Falls back to no pinning if the CPU
+topology can't be read.
 
 ### `EXL3_MOE_HOST_CORES` (default: `1`)
 
-Physical cores kept free of worker threads and reserved for the host process. Only in effect with
-`EXL3_MOE_CPU_PIN` on (the Windows default): the pool then pins one compute thread per physical core; the parent process (the thread driving the
-forward, CUDA's driver threads, an API server's executor threads) is otherwise free to land on a
-worker's logical processor, and a pinned worker cannot move away, so it becomes the straggler at
-every per-phase barrier. The default worker count leaves this many cores free, and once the worker
-has started the host process is confined to them (both SMT siblings). If an explicit thread count
+Physical cores kept free of worker threads and reserved for the host process. The pool runs one
+compute thread per physical core; the parent process (the thread driving the forward, CUDA's
+driver threads, an API server's executor threads) is otherwise free to land on a worker's logical
+processor, where a pinned worker cannot move away and a floating one is only moved after the
+damage, so it becomes the straggler at every per-phase barrier. The default worker count leaves
+this many cores free, and once the worker has started the host process is confined to them (both
+SMT siblings), whether or not the workers are pinned. If an explicit thread count
 covers every core, the host is confined to the SMT siblings no worker uses instead, so it never
 shares a logical processor with a worker. Measured on a 12-core Ryzen 9 7900X with an RTX 4090
 (Qwen3.8-Flash-Next, 408 of 512 experts per layer on the CPU): decode 11–32 tok/s with the host
