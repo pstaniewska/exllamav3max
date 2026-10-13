@@ -436,3 +436,722 @@ def test_kv_staging_joins_the_floor_once_per_load():
     D.note_kv_staging(model)
     assert H.cache._DEVICE_TRANSIENT[("cuda", 0)] == 2 << 30
     H.cache.ExpertCache._drop_registry()
+
+
+def test_prefill_cost_fit_separates_per_expert_and_per_row_cost():
+    f = D.PrefillCostFit()
+    assert f.solve() is None
+    for _ in range(20):                         # decode-shaped only: one assignment per expert
+        f.add(4, 4, 4 * 300 + 4 * 20)
+    assert f.solve() is None                    # a and b not separable yet
+    for ne, na in ((8, 120), (3, 90), (16, 200), (5, 15)):
+        f.add(ne, na, ne * 300 + na * 20)
+    a, b = f.solve()
+    assert a == pytest.approx(300, rel = 1e-6) and b == pytest.approx(20, rel = 1e-6)
+    g = D.PrefillCostFit()
+    for ne, na in ((2, 50), (4, 10), (6, 90)):
+        g.add(ne, na, 5.0 * na)                 # pure per-row cost: a clamps to zero
+    a, b = g.solve()
+    assert a == pytest.approx(0, abs = 1e-6) and b == pytest.approx(5, rel = 1e-6)
+
+
+def test_choose_prefill_gpu_min_balances_pcie_and_cpu():
+    counts = np.array([1, 2, 2, 3, 5, 8, 13, 21, 34, 55, 0])
+    pick = lambda **kw: D.choose_prefill_gpu_min(counts, **dict(dict(t_gpu0 = 0.0, t_zc = 1000.0, t_fixed = 50.0,
+                                                                      a = 100.0, b = 10.0, nodes = 2), **kw))
+    # Cheap CPU: every expert fits on the CPU before one PCIe read would finish
+    assert pick(a = 1.0, b = 0.1) == 56
+    # CPU slower than PCIe for any expert: everything stays on the GPU
+    assert pick(a = 1e6, b = 1e3) == 1
+    # In between: the small experts go to the CPU, the threshold never splits equal counts
+    t = pick()
+    assert 1 < t <= 55
+    c = np.sort(counts[counts > 0])
+    k = int((c < t).sum())
+    worst = lambda k: max((50.0 + (100 * k + 10 * c[:k].sum()) / 2) if k else 0.0, (c.size - k) * 1000.0)
+    assert worst(k) == min(worst(j) for j in range(c.size + 1) if j in (0, c.size) or c[j] != c[j - 1])
+    # More GPU work already queued (hits): more experts move to the CPU
+    assert pick(t_gpu0 = 5000.0) >= t
+    assert D.choose_prefill_gpu_min(np.zeros(4, dtype = np.int64), 0, 1, 0, 1, 1, 1) == D.PREFILL_GPU_MIN_BOOT
+
+
+def test_prefill_threshold_bootstrap_fixed_and_measured():
+    topk, E, N, rows = 4, 32, 2, 128
+    torch.manual_seed(7)
+    sel = torch.stack([torch.randperm(E)[:topk] for _ in range(rows)])
+    sel[:, 0] = 0                               # one heavy expert (128 rows), the rest ~12 each
+    y = torch.randn((rows, 8)).half()
+    w = torch.rand((rows, topk)).half()
+
+    def run(**ht):
+        d, hl, hosts, cache = make(E = E, N = N, rows = rows, topk = topk, dispatch = "hybrid", zc_max = None, **ht)
+        return d, hl, hosts, cache
+
+    d, hl, hosts, cache = run(prefill_gpu_min = None)
+    pend, sel_gpu = d.submit(hl, y, sel, w)
+    assert d.prefill_gpu_min_last == D.PREFILL_GPU_MIN_BOOT     # nothing measured yet
+
+    d, hl, hosts, cache = run(prefill_gpu_min = 40)
+    d.submit(hl, y, sel, w)
+    assert d.prefill_gpu_min_last == 40                         # fixed by the env
+
+    # Measured: PCIe read 5000 us per expert, CPU 100 us per expert + 5 us per row
+    d, hl, hosts, cache = run(prefill_gpu_min = None)
+    d.zc_us, d.hit_us, d.cpu_fixed_us = 5000.0, 50.0, 30.0
+    for q, h in enumerate(hosts):
+        h.tel = [(1, 4 * 100 + 4 * 5, 4, 4, 1), (2, 8 * 100 + 160 * 5, 160, 8, 40)]
+    d._update_lane_params()
+    assert d.prefill_cost == pytest.approx((100.0, 5.0))
+    pend, sel_gpu = d.submit(hl, y, sel, w)
+    t = d.prefill_gpu_min_last
+    assert t > int((sel == 0).sum())            # cheap CPU: even the heavy expert stays on the CPU
+    assert int((sel_gpu == E).sum()) == rows * topk
+    final = torch.zeros((rows, 8))
+    lanes = torch.tensor([e % N for e in range(E)])
+    assert torch.allclose(d.combine(hl, final, pend), fake_expert_sum(sel, w, y, lanes, E, N), atol = 1e-2)
+    assert d.summary()["prefill_gpu_min"] == t
+
+    # Slow CPU per row: the heavy expert is read over PCIe, the small ones stay on the CPU
+    d.prefill_cost = (100.0, 200.0)
+    pend, sel_gpu = d.submit(hl, y, sel, w)
+    t = d.prefill_gpu_min_last
+    assert 1 < t <= int((sel == 0).sum())
+    assert bool((sel_gpu[:, 0] == 0).all())
+    assert int((sel_gpu == E).sum()) > 0
+    d.combine(hl, torch.zeros((rows, 8)), pend)
+
+
+def test_prefill_threshold_remeasures_when_the_cpu_stays_idle():
+    topk, E, N, rows = 4, 16, 2, 100
+    d, hl, hosts, cache = make(E = E, N = N, rows = rows, topk = topk, dispatch = "hybrid", zc_max = None,
+                               prefill_gpu_min = None, remeasure = 2)
+    d.zc_us, d.hit_us, d.cpu_fixed_us = 10.0, 1.0, 1.0
+    d.prefill_cost = (1e5, 1e4)                  # pessimistic: the CPU never wins
+    sel = torch.stack([torch.randperm(E)[:topk] for _ in range(rows)])
+    y, w = torch.randn((rows, 8)).half(), torch.rand((rows, topk)).half()
+    got = []
+    for _ in range(4):
+        pend, _ = d.submit(hl, y, sel, w)
+        d.combine(hl, torch.zeros((rows, 8)), pend)
+        got.append(d.prefill_gpu_min_last)
+    assert got[2] == D.PREFILL_GPU_MIN_BOOT and got[0] == got[1] == got[3] != D.PREFILL_GPU_MIN_BOOT
+
+
+def test_mixed_rate_gpu_mask_picks_the_most_common_signature():
+    # Uniform layer: no mask, the one signature
+    assert D.mixed_rate_gpu_mask([[96, 96], [96, 96], [64, 64]]) == (None, (96, 96, 64))
+    # Gate/up/down widths per expert: (96, 96, 64) x 3, (80, 80, 64) x 2, (96, 96, 80) x 1
+    g = [96, 80, 96, 96, 80, 96]
+    u = [96, 80, 96, 96, 80, 96]
+    d = [64, 64, 64, 64, 64, 80]
+    mask, sig = D.mixed_rate_gpu_mask([g, u, d])
+    assert sig == (96, 96, 64)
+    assert mask.tolist() == [True, False, True, True, False, False]
+    # Ties go to the signature seen first
+    mask, sig = D.mixed_rate_gpu_mask([[64, 80], [64, 80]])
+    assert sig == (64, 64) and mask.tolist() == [True, False]
+
+
+def test_eligible_accepts_mixed_rates_with_one_shape(monkeypatch):
+    import sys, types
+    stub = types.ModuleType(f"{H.dispatch.__package__.rsplit('.', 1)[0]}.modules.block_sparse_mlp")
+    stub.BATCH_RECON = True
+    monkeypatch.setitem(sys.modules, stub.__name__, stub)
+    d, hl, hosts, cache = make(dispatch = "hybrid", zc_max = None)
+    E, h, i = 6, 256, 128
+    gu_w = [96, 80, 96, 96, 80, 96]
+    d_w = [64, 64, 64, 64, 64, 80]
+    shapes = {}
+    for e in range(E):
+        shapes[f"g{e}"] = [h // 16, i // 16, gu_w[e]]
+        shapes[f"u{e}"] = [h // 16, i // 16, gu_w[e]]
+        shapes[f"d{e}"] = [i // 16, h // 16, d_w[e]]
+
+    class Stc:
+        def list_tensors(self, key):
+            return {key + ".trellis": dict(shape = shapes[key]), key + ".mul1": {}}
+
+    class L:
+        fkey = None
+        def __init__(self, key):
+            self.key = key
+        def is_exl3_storage(self, key):
+            return True
+
+    m = types.SimpleNamespace(
+        config = types.SimpleNamespace(stc = Stc(), infer_params = types.SimpleNamespace(no_reconstruct = False)),
+        num_local_experts = E, num_experts = E, routing_first = None, routing_device = None, latent_in = None,
+        activation_fn = "silu", gated = True, expert_size = h,
+        gates = [L(f"g{e}") for e in range(E)], ups = [L(f"u{e}") for e in range(E)], downs = [L(f"d{e}") for e in range(E)])
+    ok, why, dims = d.eligible(m)
+    assert ok, why
+    assert dims["g"] == (h, i, 6) and dims["u"] == (h, i, 6) and dims["d"] == (i, h, 4)
+    assert dims["gpu"].tolist() == [True, False, True, True, False, False]
+    # Uniform layer: no mask
+    for e in range(E):
+        shapes[f"g{e}"][2] = shapes[f"u{e}"][2] = 96
+        shapes[f"d{e}"][2] = 64
+    ok, why, dims = d.eligible(m)
+    assert ok and dims["gpu"] is None
+    # Different (k, n) within a projection stays ineligible
+    shapes["d5"] = [i // 16, 2 * h // 16, 64]
+    assert d.eligible(m)[:2] == (False, "experts of one projection differ in shape")
+
+
+@pytest.mark.parametrize("rows", [1, 64])
+def test_experts_without_a_home_always_take_cpu_lanes(rows):
+    """CPU-only experts of a mixed-rate layer (no home copy): never a GPU lane, decode or prefill,
+    and the warm start never installs them"""
+    topk, E, N = 4, 16, 2
+    d, hl, hosts, cache = make(E = E, N = N, rows = rows, topk = topk, dispatch = "hybrid", zc_max = 16,
+                               prefill_gpu_min = 0)
+    layer = hl.cache_layer
+    eb = 1024
+    home = torch.zeros((E * eb,), dtype = torch.uint8)
+    gpu = np.array([e % 4 != 3 for e in range(E)])
+    cache.set_layer_homes(layer, np.array([home.data_ptr() + e * eb if gpu[e] else 0 for e in range(E)]),
+                          lambda e: home[e * eb:(e + 1) * eb] if gpu[e] else None)
+    torch.manual_seed(3)
+    sel = torch.stack([torch.randperm(E)[:topk] for _ in range(rows)])
+    y, w = torch.randn((rows, 8)).half(), torch.rand((rows, topk)).half()
+    for _ in range(3):
+        pend, sel_gpu = d.submit(hl, y, sel, w)
+        d.combine(hl, torch.zeros((rows, 8)), pend)
+        on_gpu = sel_gpu[sel_gpu < E]
+        assert on_gpu.numel() > 0
+        assert bool(torch.from_numpy(gpu)[on_gpu].all())
+        assert int((sel_gpu == E).sum()) >= int((~torch.from_numpy(gpu))[sel].sum())
+
+
+def test_choose_prefill_gpu_min_counts_forced_cpu_work():
+    counts = np.array([1, 2, 2, 3, 5, 8, 13, 21, 34, 55])
+    kw = dict(t_gpu0 = 0.0, t_zc = 1000.0, t_fixed = 50.0, a = 100.0, b = 10.0, nodes = 2)
+    t0 = D.choose_prefill_gpu_min(counts, **kw)
+    # CPU already busy with experts it must take: fewer flexible experts go to it
+    t1 = D.choose_prefill_gpu_min(counts, cpu0 = (20, 400), **kw)
+    assert t1 <= t0
+    c = np.sort(counts)
+    base = 100.0 * 20 + 10.0 * 400
+    worst = lambda k: max(50.0 + (base + 100 * k + 10 * c[:k].sum()) / 2, (c.size - k) * 1000.0)
+    k = int((c < t1).sum())
+    assert worst(k) == min(worst(j) for j in range(c.size + 1) if j in (0, c.size) or c[j] != c[j - 1])
+
+
+@pytest.mark.parametrize("memory, expect", [("replicate", "numa_adaptive"), ("shard", "numa_local")])
+def test_numa_policy_auto_spreads_replicated_experts(monkeypatch, memory, expect):
+    monkeypatch.setenv("EXL3_NUMA_MEMORY_POLICY", memory)
+    assert D.resolve_node_policy("auto") == expect
+    assert D.resolve_node_policy("numa_balanced") == "numa_balanced"
+
+
+def test_marginal_cost_fit_excludes_the_fixed_job_cost():
+    # Node A: 1000 us fixed + 100 us per expert, seen only with 1-2 experts per job;
+    # node B: 100 us fixed + 150 us per expert, seen with 6-8. Per-expert averages call A dearer
+    # (~900 vs ~165 us), the marginal costs B (150 vs 100 us)
+    a, b = D.MarginalCostFit(), D.MarginalCostFit()
+    for e in (1, 2) * 20:
+        a.add(e, 1000 + 100 * e)
+    for e in (6, 7, 8) * 20:
+        b.add(e, 100 + 150 * e)
+    assert abs(a.marginal() - 100) < 1e-6 and abs(b.marginal() - 150) < 1e-6
+    # One job size only: f and c cannot be separated
+    c = D.MarginalCostFit()
+    for _ in range(10):
+        c.add(4, 800)
+    assert c.marginal() is None
+
+
+def test_decode_thread_tuner_settles_on_the_fastest_fraction():
+    t = D.DecodeThreadTuner()
+    # Token time by fraction: fastest at 0.75
+    cost = {1.0: 0.080, 0.875: 0.070, 0.75: 0.050, 0.625: 0.055, 0.5: 0.060, 0.375: 0.075}
+    now, applied = 0.0, [t.on_pass(True, 0.0)]
+    per = (t.SETTLE + t.SAMPLES) * len(t.FRACTIONS) + 4
+    for _ in range(per):
+        now += cost[t.current()]
+        f = t.on_pass(True, now)
+        if f is not None:
+            applied.append(f)
+    assert applied[0] == 1.0 and t.best == 0.75 and t.current() == 0.75
+    # A prefill pass or an idle gap does not count as a token
+    assert t.on_pass(False, now + 0.01) is None
+    assert t.on_pass(True, now + 5.0) is None
+    # After the hold, only the winner's neighbours are searched again
+    t.hold = 1
+    t.on_pass(True, now + 5.05)
+    t.on_pass(True, now + 5.1)
+    assert t.cands == [0.875, 0.75, 0.625]
+
+
+def test_decode_thread_tuner_keeps_the_larger_pool_within_margin():
+    t = D.DecodeThreadTuner()
+    # 0.875 is 2% faster than the full pool, inside the noise margin; 0.5 is slower
+    t.results = {1.0: 0.0530, 0.875: 0.0520, 0.75: 0.0604, 0.5: 0.0575}
+    assert t._pick() == 1.0
+    # A clearly faster smaller share still wins
+    t.results = {1.0: 0.080, 0.875: 0.070, 0.75: 0.050}
+    assert t._pick() == 0.75
+
+
+def test_decode_thread_tuner_fixed_and_off():
+    assert D.DecodeThreadTuner(0.5).on_pass(True, 0.0) == 0.5
+    off = D.DecodeThreadTuner(-1.0)
+    assert off.on_pass(True, 0.0) is None and off.on_pass(True, 0.05) is None
+
+
+def defer_setup(rows = 1, **ht):
+    """Dispatcher with two hybrid layers on one device (the first may defer), every miss on the CPU"""
+    d, hl, hosts, cache = make(rows = rows, dispatch = "hybrid", zc_max = 0, defer = True, **ht)
+    hl2 = object.__new__(D.HybridLayer)
+    hl2.device = torch.device("cpu")
+    hl2.finalized, hl2.cache_layer = True, None
+    d.layers = [hl, hl2]
+    d.finalized = True
+    d._link_layers()
+    return d, hl, hl2, hosts, cache
+
+
+def defer_module(**kw):
+    m = type("M", (), {})()
+    m.latent_out = m.routed_post_norm = None
+    m.tp_reduce = False
+    for k, v in kw.items():
+        setattr(m, k, v)
+    return m
+
+
+def cpu_partial(hosts, rows):
+    out = torch.zeros((rows, 8))
+    for h in hosts:
+        if int(h.counts[0]):
+            out += h.out[:rows]
+    return out
+
+
+def test_defer_skips_collect_until_fold():
+    d, hl, hl2, hosts, cache = defer_setup()
+    assert hl.defer_next and not hl2.defer_next
+    assert d.can_defer(hl, defer_module(), 1)
+    pend, sel_gpu = d.submit(hl, torch.randn((1, 8)).half(), torch.tensor([[1, 2, 3, 4]]), torch.rand((1, 4)).half())
+    rec = d.defer(hl, pend, 1)
+    assert all(h.events == ["reserve", "publish"] for h in hosts)    # nothing waits for the CPU yet
+    assert len(d.inflight) == 2                                      # still drained if interrupted
+    x = torch.zeros((1, 1, 8))
+    params = {"moe_fold": rec}
+    D.fold_deferred(params, x)
+    assert params["moe_fold"] is None and d.inflight == []
+    assert all(h.events == ["reserve", "publish", "collect"] for h in hosts)
+    assert torch.allclose(x.view(1, 8), cpu_partial(hosts, 1))
+    D.fold_deferred(params, x)                                       # nothing pending: no-op
+    assert all(h.events.count("collect") == 1 for h in hosts)
+
+
+@pytest.mark.parametrize("rows", [65, 128])
+def test_prefill_never_defers(rows):
+    d, hl, hl2, hosts, cache = defer_setup(rows = rows)
+    assert not d.can_defer(hl, defer_module(), rows)
+    sel = torch.stack([torch.randperm(16)[:4] for _ in range(rows)])
+    pend, _ = d.submit(hl, torch.randn((rows, 8)).half(), sel, torch.rand((rows, 4)).half())
+    assert pend.kind == "prefill"
+
+
+def test_interrupted_deferral_is_drained_by_begin_pass():
+    d, hl, hl2, hosts, cache = defer_setup()
+    pend, _ = d.submit(hl, torch.randn((1, 8)).half(), torch.tensor([[1, 2, 3, 4]]), torch.rand((1, 4)).half())
+    d.defer(hl, pend, 1)                                             # the fold never runs
+    d._update_lane_params = lambda: None
+    d.begin_pass(None)
+    assert d.inflight == []
+    assert all(h.events.count("collect") == 1 for h in hosts)
+
+
+def test_can_defer_rejections():
+    d, hl, hl2, hosts, cache = defer_setup()
+    m = defer_module()
+    assert d.can_defer(hl, m, 1)
+    assert not d.can_defer(hl, m, d.decode_rows + 1)                 # prefill-shaped call
+    assert not d.can_defer(hl2, m, 1)                                # last hybrid layer
+    for k, v in (("latent_out", object()), ("routed_post_norm", object()), ("tp_reduce", True),
+                 ("mlp_resid_scalar", torch.ones(1)), ("mlp_post_norm", object()), ("layer_scalar_f", 0.5)):
+        assert not d.can_defer(hl, defer_module(**{k: v}), 1), k
+    hl2.device = torch.device("meta")                                # next hybrid layer elsewhere
+    d._link_layers()
+    assert not hl.defer_next
+    hl2.device = torch.device("cpu")
+    for h in hosts:
+        h.num_slots = 1                                              # the next reserve would wait on it
+    d._link_layers()
+    assert not d.can_defer(hl, m, 1)
+    for h in hosts:
+        h.num_slots = 2
+    d._link_layers()
+    assert d.can_defer(hl, m, 1)
+    D.HT.defer = False
+    assert not d.can_defer(hl, m, 1)
+
+
+def hc_site(x, y, post, comb):
+    """HyperConnection.apply_ reference: x <- post ⊗ y + combᵀ x, (R, H, D)"""
+    return post.unsqueeze(-1) * y.unsqueeze(-2) + torch.matmul(comb.transpose(-1, -2), x)
+
+
+def test_hc_fold_is_exact():
+    # Layer L's partial d enters the streams as post_m ⊗ d; deferred past the next block's two
+    # sites (comb_a, comb_m) it must still land as (comb_mᵀ comb_aᵀ post_m) ⊗ d
+    R, Hc, Dm = 2, 4, 8
+    d, hl, hl2, hosts, cache = defer_setup(rows = R)
+    torch.manual_seed(11)
+    sel = torch.stack([torch.randperm(16)[:4] for _ in range(R)])
+    pend, _ = d.submit(hl, torch.randn((R, 8)).half(), sel, torch.rand((R, 4)).half())
+    rec = d.defer(hl, pend, R)
+    part = cpu_partial(hosts, R)
+    assert part.abs().sum() > 0
+
+    x0 = torch.randn((R, Hc, Dm))
+    post_m = torch.rand((R, Hc)) * 2
+    y_a, y_m = torch.randn((R, Dm)), torch.randn((R, Dm))
+    post_a, post_b = torch.rand((R, Hc)) * 2, torch.rand((R, Hc)) * 2
+    comb_a, comb_m = torch.rand((R, Hc, Hc)), torch.rand((R, Hc, Hc))
+
+    want = x0 + post_m.unsqueeze(-1) * part.unsqueeze(-2)
+    want = hc_site(hc_site(want, y_a, post_a, comb_a), y_m, post_b, comb_m)
+
+    rec.set_post(post_m.view(1, R, Hc))
+    post_m.fill_(-1.0)                                               # mix scratch reused: v was copied
+    x = hc_site(hc_site(x0.clone(), y_a, post_a, comb_a), y_m, post_b, comb_m)
+    rec.carry(comb_a.view(1, R, Hc, Hc))
+    rec.carry(comb_m)
+    x = x.view(1, R, Hc, Dm).contiguous()
+    params = {"moe_fold": rec}
+    D.fold_deferred(params, x)
+    assert torch.allclose(x.view(R, Hc, Dm), want, atol = 1e-5)
+    assert d.inflight == [] and all(h.events.count("collect") == 1 for h in hosts)
+    # Static buffers: a second deferral reuses them
+    v_buf, d_buf = hl.defer_v, hl.defer_d
+    pend, _ = d.submit(hl, torch.randn((R, 8)).half(), sel, torch.rand((R, 4)).half())
+    rec = d.defer(hl, pend, R)
+    rec.set_post(torch.rand((R, Hc)))
+    rec.carry(comb_a)
+    assert hl.defer_v is v_buf and hl.defer_d is d_buf
+    assert rec.v.data_ptr() in (v_buf[0].data_ptr(), v_buf[1].data_ptr())
+    d.fold(rec, torch.zeros((R, Hc, Dm)), rec.v)
+
+
+class SlotHost(FakeHost):
+    """FakeHost with a ring of slots (as MoeCpuHost) whose collect runs the fake expert function
+    on what the slot holds: out[r] += w[r, k] * (local + 1 + 100 * node) * x[r] per pick >= 0"""
+
+    def __init__(self, rows, topk, h, num_slots):
+        super().__init__(rows * topk, rows, h, h)
+        self.num_slots, self.next_slot, self.topk, self.h = num_slots, 0, topk, h
+        self.ring = [dict(sel = torch.full((rows * topk,), -9, dtype = torch.int32),
+                          x = torch.zeros((rows * h,), dtype = torch.half),
+                          w = torch.zeros((rows * topk,), dtype = torch.half)) for _ in range(num_slots)]
+        self.collected = []
+
+    def fused_reserve(self, idx, rows, device):
+        self.events.append("reserve")
+        k = self.next_slot
+        self.next_slot = (k + 1) % self.num_slots
+        s = self.ring[k]
+        slot = dict(sel_dev = s["sel"].data_ptr(), x_dev = s["x"].data_ptr(), w_dev = s["w"].data_ptr(),
+                    x_cap = s["x"].numel(), sel_cap = s["sel"].numel(), **s)
+        return dict(seq = 1, slot_idx = k, slot = slot, counts = self.counts, ho = self.h, dev = device, rows = rows)
+
+    def fused_collect(self, r, final_2d):
+        self.events.append("collect")
+        k, rows = r["slot_idx"], r["rows"]
+        picks = set()
+        if int(self.counts[k]):
+            s = self.ring[k]
+            sel = s["sel"][:rows * self.topk].view(rows, self.topk)
+            w = s["w"][:rows * self.topk].view(rows, self.topk)
+            x = s["x"][:rows * self.h].view(rows, self.h)
+            for i in range(rows):
+                for j in range(self.topk):
+                    e = int(sel[i, j])
+                    if e >= 0:
+                        final_2d[i] += float(w[i, j]) * (e + 1 + 100 * self.node) * x[i].float()
+                        picks.add((i, j))
+        self.collected.append(picks)
+
+
+def split_setup(rows = 2, num_slots = 3, **ht):
+    """defer_setup with slot-ring hosts that compute their partial from the staged slot"""
+    d, hl, hl2, _, cache = defer_setup(rows = rows, **ht)
+    hosts = [SlotHost(rows, 4, 8, num_slots) for _ in range(2)]
+    for q, fh in enumerate(hosts):
+        fh.node = q
+    d.group.hosts = hosts
+    d._link_layers()
+    return d, hl, hl2, hosts, cache
+
+
+def split_case(d, hl, rows, w):
+    torch.manual_seed(5)
+    y = torch.randn((rows, 8)).half()
+    sel = torch.stack([torch.randperm(16)[:4] for _ in range(rows)])
+    pend, sel_gpu = d.submit(hl, y, sel, w, True)
+    cpu = {(i, j) for i in range(rows) for j in range(4) if int(sel_gpu[i, j]) == 16}
+    assert cpu, "expected CPU-lane picks"
+
+    def partial(picks):
+        out = torch.zeros((rows, 8))
+        for i, j in picks:
+            e = int(sel[i, j])
+            out[i] += float(w[i, j]) * (e // 2 + 1 + 100 * (e % 2)) * y[i].float()
+        return out
+    return pend, cpu, partial
+
+
+def lowest(cpu, w, cap, min_w = None):
+    want = set()
+    for i in range(w.shape[0]):
+        c = sorted((float(w[i, j]), j) for j in range(w.shape[1])
+                   if (i, j) in cpu and (min_w is None or float(w[i, j]) < min_w))
+        want |= {(i, j) for _, j in (c[:cap] if cap else c)}
+    return want
+
+
+@pytest.mark.parametrize("cap", [1, 2, 3])
+def test_partial_defer_takes_the_lowest_weight_cpu_picks(cap):
+    rows = 2
+    d, hl, hl2, hosts, cache = split_setup(rows, defer_max = cap)
+    assert d.can_defer(hl, defer_module(), rows)
+    w = torch.tensor([[0.5, 0.125, 0.25, 0.375], [0.0625, 0.75, 0.1875, 0.3125]]).half()
+    pend, cpu, partial = split_case(d, hl, rows, w)
+    assert pend.deferred is not None and len(d.inflight) == 4
+    assert all(h.events == ["reserve"] * 2 + ["publish"] * 2 for h in hosts)
+    rec = d.defer(hl, pend, rows)
+    # Immediate part: collected in the layer (combine), before the layer output
+    f = torch.zeros((rows, 8))
+    d.combine(hl, f, pend)
+    assert all(h.events.count("collect") == 1 for h in hosts) and len(d.inflight) == 2
+    deferred = lowest(cpu, w, cap)
+    assert set().union(*(h.collected[0] for h in hosts)) == cpu - deferred
+    assert torch.allclose(f, partial(cpu - deferred), atol = 1e-3)
+    # Deferred part: folded at the end of the next block
+    x = torch.zeros((1, rows, 8))
+    D.fold_deferred({"moe_fold": rec}, x)
+    assert d.inflight == [] and all(h.events.count("collect") == 2 for h in hosts)
+    assert set().union(*(h.collected[1] for h in hosts)) == deferred
+    assert torch.allclose(x.view(rows, 8), partial(deferred), atol = 1e-3)
+    assert torch.allclose(f + x.view(rows, 8), partial(cpu), atol = 1e-3)
+
+
+@pytest.mark.parametrize("cap", [0, 1])
+def test_partial_defer_keeps_heavy_experts_immediate(cap):
+    rows = 2
+    d, hl, hl2, hosts, cache = split_setup(rows, defer_max = cap, defer_min_w = 0.3)
+    w = torch.tensor([[0.5, 0.125, 0.25, 0.375], [0.0625, 0.75, 0.1875, 0.3125]]).half()
+    pend, cpu, partial = split_case(d, hl, rows, w)
+    rec = d.defer(hl, pend, rows)
+    f = torch.zeros((rows, 8))
+    d.combine(hl, f, pend)
+    x = torch.zeros((rows, 8))
+    d.fold(rec, x)
+    deferred = lowest(cpu, w, cap, 0.3)
+    assert all(float(w[i, j]) < 0.3 for i, j in deferred)
+    assert torch.allclose(f, partial(cpu - deferred), atol = 1e-3)
+    assert torch.allclose(x, partial(deferred), atol = 1e-3)
+
+
+def test_defer_max_zero_defers_every_cpu_pick_in_one_job():
+    rows = 2
+    d, hl, hl2, hosts, cache = split_setup(rows)
+    assert not D.HT.defer_partial()
+    w = torch.rand((rows, 4)).half()
+    pend, cpu, partial = split_case(d, hl, rows, w)
+    assert pend.deferred is None and len(d.inflight) == 2
+    assert all(h.events == ["reserve", "publish"] for h in hosts)
+    rec = d.defer(hl, pend, rows)
+    f = torch.zeros((rows, 8))
+    d.combine(hl, f, pend)                                           # nothing left to collect
+    assert f.abs().sum() == 0 and all(h.events.count("collect") == 0 for h in hosts)
+    x = torch.zeros((rows, 8))
+    d.fold(rec, x)
+    assert torch.allclose(x, partial(cpu), atol = 1e-3)
+
+
+def test_split_call_that_does_not_defer_collects_both_jobs():
+    rows = 2
+    d, hl, hl2, hosts, cache = split_setup(rows, defer_max = 1)
+    w = torch.rand((rows, 4)).half()
+    pend, cpu, partial = split_case(d, hl, rows, w)
+    f = torch.zeros((rows, 8))
+    d.combine(hl, f, pend)
+    assert d.inflight == [] and all(h.events.count("collect") == 2 for h in hosts)
+    assert torch.allclose(f, partial(cpu), atol = 1e-3)
+
+
+def test_interrupted_partial_deferral_is_drained_by_begin_pass():
+    rows = 2
+    d, hl, hl2, hosts, cache = split_setup(rows, defer_max = 1)
+    pend, cpu, partial = split_case(d, hl, rows, torch.rand((rows, 4)).half())
+    d.defer(hl, pend, rows)                                          # neither collect nor fold runs
+    d._update_lane_params = lambda: None
+    d.begin_pass(None)
+    assert d.inflight == [] and all(h.events.count("collect") == 2 for h in hosts)
+
+
+def test_partial_defer_needs_three_slots():
+    d, hl, hl2, hosts, cache = split_setup(1, num_slots = 2)
+    m = defer_module()
+    assert d.can_defer(hl, m, 1)                                     # whole-partial deferral: two
+    D.HT.defer_max = 2
+    assert not d.can_defer(hl, m, 1)
+    D.HT.defer_max, D.HT.defer_min_w = 0, 0.1
+    assert not d.can_defer(hl, m, 1)
+    for h in hosts:
+        h.num_slots = 3
+    d._link_layers()
+    assert d.can_defer(hl, m, 1)
+
+
+# ---- prefill stream lane (EXL3_EXPERT_PREFILL_STREAM) -------------------------------------------
+
+@pytest.mark.parametrize("mode, rows, cuda, want", [
+    ("auto", 2047, True, False), ("auto", 2048, True, True), ("auto", 1 << 14, False, False),
+    ("1", 65, True, True), ("1", 65, False, False), ("0", 1 << 14, True, False),
+])
+def test_prefill_stream_threshold(mode, rows, cuda, want):
+    D.HT.stream, D.HT.stream_rows = mode, 2048
+    assert D.prefill_stream_on(rows, cuda) is want
+
+
+def test_stream_ring_shape_respects_slots_and_mib():
+    D.HT.stream_slots, D.HT.stream_mb, D.HT.stream_bufs = 32, 512, 4
+    assert D.stream_ring_shape(3 << 20) == (4, 8, 3 << 20)          # 32 slots, 96 MiB
+    nb, per, stride = D.stream_ring_shape(17 << 20)                 # MiB-bound: 30 experts
+    assert stride == 17 << 20 and nb * per * stride <= 512 << 20 and (nb, per) == (4, 7)
+    assert D.stream_ring_shape((17 << 20) + 1)[2] % 256 == 0        # cache-slot alignment
+    D.HT.stream_slots = 3
+    assert D.stream_ring_shape(1 << 20) == (3, 1, 1 << 20)          # fewer experts than buffers
+    assert D.stream_ring_shape(300 << 20) is None                   # cannot double-buffer
+
+
+def test_select_stream_experts_takes_zero_copy_experts_hottest_first():
+    E = 8
+    lanes = np.full(ref.EMAX, ref.LANE_NONE, dtype = np.int32)
+    lanes[[1, 2, 3, 5, 6]] = ref.LANE_ZC
+    lanes[4] = ref.LANE_GPU                                         # resident: never streamed
+    lanes[0] = 1                                                    # CPU node 1
+    counts = np.array([90, 3, 40, 1, 70, 200, 0, 5], dtype = np.int32)
+    assert D.select_stream_experts(lanes, counts, 1).tolist() == [5, 2, 1, 3]
+    assert D.select_stream_experts(lanes, counts, 4).tolist() == [5, 2]
+    assert D.select_stream_experts(lanes, counts, 1, max_rows = 64).tolist() == [2, 1, 3]
+    assert D.select_stream_experts(lanes[:E], counts, 1000).size == 0
+
+
+def test_mask_streamed_drops_picks_like_cpu_lanes():
+    E = 8
+    sel_gpu = torch.tensor([0, 3, 5, 8, 3, 7])                      # 8: already a CPU pick
+    D.mask_streamed(sel_gpu, np.array([3, 7]), E)
+    assert sel_gpu.tolist() == [0, 8, 5, 8, 8, 8]
+
+
+def test_prefill_stream_lane_stays_off_on_the_reference_backend():
+    d, hl, hosts, cache = make(E = 16, N = 2, rows = 80, dispatch = "hybrid", zc_max = None,
+                               stream = "1", stream_rows = 1)
+    sel = torch.stack([torch.randperm(16)[:4] for _ in range(80)])
+    pend, sel_gpu = d.submit(hl, torch.randn((80, 8)).half(), sel, torch.rand((80, 4)).half())
+    assert pend.kind == "prefill" and pend.stream is None
+
+
+def test_worst_case_counts_the_stream_ring():
+    d, hl, hosts, cache = make(dispatch = "hybrid", zc_max = None)
+    mod = type("M", (), dict(batch_recon = None, prefill_worst_case_parts = lambda self, r, a: (0,)))()
+    hl.module_ref = lambda: mod
+    hl._worst = {}
+    hl.expert_bytes = 3 << 20
+    hl.device = torch.device("cuda", 0)                             # a device object, never used
+    D.HT.stream, D.HT.stream_rows = "0", 2048
+    D.HT.stream_slots, D.HT.stream_mb, D.HT.stream_bufs = 32, 512, 4
+    base, small = d.worst_case(hl, 4096), d.worst_case(hl, 1024)
+    D.HT.stream = "auto"
+    with_ring = d.worst_case(hl, 4096)
+    assert with_ring - base >= 32 * (3 << 20) + 4097 * hl.h * 4
+    assert d.worst_case(hl, 1024) == small                          # below the threshold: no ring
+    D.HT.stream = "0"
+    assert d.worst_case(hl, 4096) == base                           # cached per setting
+
+
+def test_run_staged_experts_tables_and_tiers(monkeypatch):
+    # The shared batch body of the streamed prefill and the stream lane, with the kernels stubbed:
+    # pointer tables address the staging buffer per (position, projection), the fused tier is
+    # split into row tiles, heavier experts form batched groups with buffer pointers, and experts
+    # above the batched tier's row cap come back to the caller
+    for name in ("silu_mul", "gelu_mul", "silu_oai_mul", "relu2_mul", "relu_mul"):
+        monkeypatch.setattr(H.ext, name, lambda *a: None, raising = False)
+    launches, groups = [], []
+
+    def exl3_moe(y, out, ec, tok, wts, b0, b1, b2, b3, act, Kg, Ku, Kd, *rest):
+        tbl = [t.tolist() for t in rest[:9]]
+        flags = rest[9:15]
+        lo, hi, mt = rest[-3:]
+        launches.append(dict(tbl = tbl, ec = ec.tolist(), tok = tok.tolist(), n_act = rest[16],
+                             tier = (lo, hi, mt), flags = flags, K = (Kg, Ku, Kd)))
+
+    monkeypatch.setattr(H.ext, "exl3_moe", exl3_moe, raising = False)
+
+    class Recon:
+        max_rows, cap, dims_u = 512, 4, (8, 16, 3)
+
+        def run_group(self, y_ext, out_ext, tok_ext, w_ext, ids, starts, counts, ptrs = None):
+            groups.append((ids, starts, counts, ptrs, y_ext.shape[0], tok_ext[-1].item()))
+
+    rows, base, stride, off = 1000, 1 << 32, 4096, (0, 1024, 2048)
+    counts = [5, 20, 40, 300, 900]
+    starts = np.concatenate(([0], np.cumsum(counts)))[:-1].tolist()
+    items = [(j, 10 + j, starts[j], c) for j, c in enumerate(counts)]
+    tok = torch.arange(sum(counts)) % rows
+    wts = torch.rand(sum(counts)).half()
+    y = torch.randn((rows, 8)).half()
+    out_ext = torch.zeros((rows + 1, 8))
+    scales = lambda e: tuple(e * 100 + i for i in range(6))
+    single = H.host.run_staged_experts(
+        y, out_ext, items, tok, wts, base, stride, off, True, scales, (3, 4, 5), 0, 0.0,
+        (False, True) * 3, 64, (None,) * 4, True, Recon(), {})
+    assert single == [(4, 14)]
+    assert [l["tier"] for l in launches] == [(33, 64, 64), (17, 32, 32), (1, 16, 16)]
+    assert [l["n_act"] for l in launches] == [1, 1, 1]
+    t = launches[0]
+    assert t["ec"] == counts + [0] and t["K"] == (3, 4, 5) and t["flags"] == (False, True) * 3
+    assert t["tbl"][0] == [base + j * stride for j in range(5)]
+    assert t["tbl"][3] == [base + j * stride + 1024 for j in range(5)]
+    assert t["tbl"][6] == [base + j * stride + 2048 for j in range(5)]
+    assert t["tbl"][1] == [(10 + j) * 100 for j in range(5)] and t["tbl"][8] == [(10 + j) * 100 + 5 for j in range(5)]
+    assert t["tok"] == tok.tolist()
+    ids, gs, gc, ptrs, ny, sentinel = groups[0]
+    assert len(groups) == 1 and ids == [13] and gs == [starts[3]] and gc == [300]
+    assert ptrs == ([base + 3 * stride], [base + 3 * stride + 1024], [base + 3 * stride + 2048])
+    assert ny == rows + 1 and sentinel == rows                    # padded inputs and the sink row
+
+
+def test_host_intraop_threads_caps_and_restores(monkeypatch):
+    # A pass with CPU MoE workers runs the host's CPU ops serially (ATen's parallel_for opens no
+    # OpenMP region at one thread), and the caller's setting comes back afterwards, nesting included
+    import importlib
+    aff = importlib.import_module(f"{hybrid_isolated.PKG}.model.moe_cpu_affinity")
+    prev = torch.get_num_threads()
+    try:
+        torch.set_num_threads(2)
+        monkeypatch.setattr(aff, "HOST_INTRAOP_THREADS", 1)
+        with aff.host_intraop_threads(True):
+            assert torch.get_num_threads() == 1
+            with aff.host_intraop_threads(True):
+                assert torch.get_num_threads() == 1
+            assert torch.get_num_threads() == 1
+        assert torch.get_num_threads() == 2
+        with pytest.raises(RuntimeError):
+            with aff.host_intraop_threads(True):
+                raise RuntimeError("interrupted pass")
+        assert torch.get_num_threads() == 2
+        # No workers, or the cap disabled: torch's setting is left alone
+        with aff.host_intraop_threads(False):
+            assert torch.get_num_threads() == 2
+        monkeypatch.setattr(aff, "HOST_INTRAOP_THREADS", 0)
+        with aff.host_intraop_threads(True):
+            assert torch.get_num_threads() == 2
+    finally:
+        torch.set_num_threads(prev)

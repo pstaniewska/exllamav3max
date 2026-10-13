@@ -106,6 +106,19 @@ class BlockSparseMLP_CPU:
         self._split_map = None        # dynamic placement: router id -> physical slot
         self.hybrid = None            # hybrid MoE layer state (model/moe_hybrid_dispatch.py)
 
+    def _cpu_uniform_rates(self, first: int, quiet: bool = False) -> bool:
+        """Header check: the experts from `first` on share one trellis shape per projection.
+        Mixed-rate layers (MixedK checkpoints) still run on the CPU kernels, which take any K per
+        expert, but not through the streamed prefill, whose staging assumes one block size"""
+        stc = self.config.stc
+        for ls in ([self.gates] if self.gated else []) + [self.ups, self.downs]:
+            shapes = {tuple(stc.list_tensors(l.key)[l.key + ".trellis"]["shape"]) for l in ls[first:]}
+            if len(shapes) > 1:
+                if not quiet:
+                    print(f" -- {self.key}: experts differ in bitrate, streamed prefill off for this layer")
+                return False
+        return True
+
     def cpu_maybe_offload_load(self, device, **kwargs) -> bool:
         """Whole-layer offload claim: when the budget allows and the layer is eligible,
         register the routed experts with the CPU worker instead of loading them; the caller
@@ -445,6 +458,7 @@ class BlockSparseMLP_CPU:
         ud = dims_of(self.ups[0])
         dd = dims_of(self.downs[0])
         hi, ho = ud[0], dd[1]
+        uniform = self._cpu_uniform_rates(0)
 
         # Small per-expert tensors resident on the GPU for the streamed-prefill dequant path
         # (lists, not stacks: the fetches may be deferred and fill in place)
@@ -471,8 +485,9 @@ class BlockSparseMLP_CPU:
             {"silu": 0, "gelu": 1, "relu2": 2, "swiglu_oai": 3}[self.activation_fn],
             float(self.act_limit or 0.0),
             hi, ho, self.num_experts_per_tok,
-            proj_dims = dict(g = gd, u = ud, d = dd),
-            aux = aux,
+            # Streamed prefill stages fixed-size expert blocks: uniform-rate layers only
+            proj_dims = dict(g = gd, u = ud, d = dd) if uniform else None,
+            aux = aux if uniform else None,
             interm_fp32 = self.interm_dtype == torch.float,
         )
         self.cpu_offload = True
@@ -531,8 +546,10 @@ class BlockSparseMLP_CPU:
         # both experts from the checkpoint: the promoted one into the GPU slot tensors in
         # place (all baked pointers stay valid), the demoted one into the worker's arena
         # via the install message (the child re-reads it from its own checkpoint handle)
+        # Mixed-rate layers keep static placement: a swap rewrites slots in place, which needs
+        # both experts to have the same shape
         self._split_dynamic = os.environ.get("EXL3_MOE_CPU_SWAP", "1") != "0" \
-            and not self.tid2eid_key
+            and not self.tid2eid_key and self._cpu_uniform_rates(0, quiet = True)
         stats_path = os.environ.get("EXL3_MOE_CPU_SPLIT_STATS")
         if stats_path and self._split_dynamic:
             # Static placement from a stats file only applies with dynamic swapping disabled
@@ -580,6 +597,7 @@ class BlockSparseMLP_CPU:
         ud = dims_of(self.ups[first])
         dd = dims_of(self.downs[first])
         hi, ho = ud[0], dd[1]
+        uniform = self._cpu_uniform_rates(first)
 
         def fetch_aux(ls, suffix, optional = False):
             out = [stc.get_tensor(l.key + suffix, self.device, optional = optional,
@@ -604,8 +622,9 @@ class BlockSparseMLP_CPU:
             {"silu": 0, "gelu": 1, "relu2": 2, "swiglu_oai": 3}[self.activation_fn],
             float(self.act_limit or 0.0),
             hi, ho, self.num_experts_per_tok,
-            proj_dims = dict(g = gd, u = ud, d = dd),
-            aux = aux,
+            # Streamed prefill stages fixed-size expert blocks: uniform-rate layers only
+            proj_dims = dict(g = gd, u = ud, d = dd) if uniform else None,
+            aux = aux if uniform else None,
             interm_fp32 = self.interm_dtype == torch.float,
         )
 

@@ -330,6 +330,9 @@ nothing else changes.
 
 `EXL3_NUMA_POLICY` chooses the node when an expert is held by several nodes (`replicate`):
 
+- `auto` (default): `numa_adaptive` under `replicate`, `numa_local` under `shard`. Sending every
+  replicated expert to the GPU's node leaves the other node's worker idle and roughly halves
+  prefill throughput.
 - `numa_local`, `numa_sharded`: the GPU's node when known, else the first holder. With shards,
   the owner is the only holder.
 - `numa_balanced`: the holder with the fewest assigned rows in this call.
@@ -343,8 +346,27 @@ the end of each slot before publishing `done`.
 
 Calls wider than the decode boundary (`EXL3_EXPERT_DECODE_MAX_ROWS`, default and maximum the CPU
 slot capacity `EXL3_MOE_CPU_SLOT_ROWS`) take the prefill path and mark hits only. A non-resident expert with a
-GPU-readable home runs zero-copy when it has at least `EXL3_EXPERT_PREFILL_GPU_MIN` rows in the
-chunk; otherwise it goes to its node's CPU lane. `gpu_exact` sends every readable expert to the GPU.
+GPU-readable home runs zero-copy when it has at least a threshold number of rows in the chunk;
+otherwise it goes to its node's CPU lane. `gpu_exact` sends every readable expert to the GPU.
+
+The threshold is chosen per call from measured costs (`choose_prefill_gpu_min`):
+- A zero-copy expert costs one PCIe read of its bytes, whatever its row count.
+- A CPU expert costs `a + b × rows` on its node. `a` and `b` are fitted per node by least squares
+  over the workers' job telemetry (`PrefillCostFit`). Decode jobs pin `a`, and prefill jobs
+  separate `b`. The slowest node's terms are used.
+- The CPU is the cheaper lane for small experts, so the smallest go to the CPU. The threshold is
+  the split that makes the PCIe reads (after the call's resident work) and the CPU nodes finish
+  closest together. A faster CPU kernel, such as the AMX tier, lowers `b`, and the threshold
+  rises with it.
+
+This costs one extra host sync per hybrid layer call, for the expert counts and residency. Until
+the costs are measured, the threshold is 8. It is 8 again for one call after
+`EXL3_MOE_COST_REMEASURE` calls that left the CPU idle, so a stale estimate gets new samples.
+This rule applies with `EXL3_EXPERT_PREFILL_GPU_MIN=auto`. The default is `1`, every
+non-resident expert on the GPU lanes: on an H100 NVL with two Xeon 6760P the per-call rule sent
+too many experts to the CPU (155-169 tok/s prefill against 252 with `1`). Another number fixes
+the threshold. `summary()` reports the fit
+(`prefill_cost_us`) and the last threshold (`prefill_gpu_min`).
 
 The CPU lanes' rows are compressed to tokens that have CPU work. They are issued on one side
 stream per node, so the GPU tiers and every node run concurrently, and they are joined with events
@@ -357,6 +379,19 @@ The GPU tiers are the upstream ones with two changes:
   an expert's weights once per row tile; the batched reconstruct tier reads them once per call. The
   slot-scratch accounting uses the same cap. The cap moves resident experts to another tier too, so
   `gpu_exact` never applies it and keeps the all-VRAM tier plan at the cost of more PCIe reads.
+- **Stream lane** (`EXL3_EXPERT_PREFILL_STREAM`, default `auto`: calls of at least
+  `EXL3_EXPERT_PREFILL_STREAM_ROWS` rows; CUDA only). Zero-copy experts with at least
+  `EXL3_EXPERT_PREFILL_STREAM_MIN_ROWS` rows leave the GPU tiers' selection like CPU picks. Their
+  native-layout blocks are copied from the pinned homes into a VRAM ring on a copy stream (a few
+  buffers, double-buffered with ready / consumed events, the `-mcl` / `-mcs` streamed prefill's
+  protocol) and computed from there by the layer's own fused and batched kernels
+  (`moe_cpu_host.run_staged_experts`, shared with that path) into an fp32 partial that `combine`
+  adds before the CPU lanes' partials. The first ring fill overlaps the call's GPU tiers. Same
+  kernels and weights, so each expert's output equals the all-VRAM one; only the fp32 summation
+  order differs. With every zero-copy expert streamed, the fused row cap above does not apply.
+  The ring (`_SLOTS` experts and `_MB` MiB in `_BUFS` buffers) is allocated per call and counted
+  in `worst_case`, so the cache gives back a chunk ahead of such passes. Layer L + 1 is not
+  prefetched during layer L yet.
 - **Leftover experts.** An expert neither tier takes (above the batched tier's per-expert row cap)
   runs as single-expert batched groups of at most that cap, accumulating weighted. Every group
   stays inside the batched tier's own buffer bound, and its weights come from the live tables.
@@ -372,8 +407,7 @@ cache or workers assumes one row.
 The boundary sits at the slot capacity rather than at `EXL3_MOE_STREAM_MIN_ROWS` (32) so that
 hybrid suffix-match drafting (`-hdt`), whose rounds verify `jobs × (1 + hybrid_draft_tokens)` rows,
 and batched speculative decoding keep the decode lane policy (measured cost model, no host sync per
-layer) instead of the prefill rule that sends every non-resident expert with fewer than
-`EXL3_EXPERT_PREFILL_GPU_MIN` rows to a CPU lane. Set `EXL3_EXPERT_DECODE_MAX_ROWS=31` for the former
+layer) instead of the prefill rule, which splits non-resident experts by row count. Set `EXL3_EXPERT_DECODE_MAX_ROWS=31` for the former
 boundary.
 
 Each component (main, `mtp`, a draft model) gets its own dispatcher and worker group, and they
@@ -407,7 +441,13 @@ classic paths, `EXL3_NUMA_ENABLE=1`) is set.
 | `EXL3_EXPERT_HOME` | `native_copy` | `native_copy` or `worker_arena` |
 | `EXL3_EXPERT_HOME_PIN_LIMIT_GB` | unset | registered-bytes cap for homes |
 | `EXL3_EXPERT_DECODE_MAX_ROWS` | slot rows (`64`) | widest call on the decode path; wider calls take the prefill path |
-| `EXL3_EXPERT_PREFILL_GPU_MIN` | `8` | prefill rows for a non-resident expert to go zero-copy |
+| `EXL3_EXPERT_PREFILL_GPU_MIN` | `1` | prefill rows for a non-resident expert to go zero-copy; `auto` chooses per call from measured costs |
+| `EXL3_EXPERT_PREFILL_STREAM` | `auto` | stream lane for zero-copy experts in prefill: `auto` (calls of at least `_ROWS` rows), `1`, `0` |
+| `EXL3_EXPERT_PREFILL_STREAM_ROWS` | `2048` | smallest prefill call that streams under `auto` |
+| `EXL3_EXPERT_PREFILL_STREAM_MIN_ROWS` | `1` | rows for a zero-copy expert to take the stream lane |
+| `EXL3_EXPERT_PREFILL_STREAM_SLOTS` | `32` | ring capacity in experts |
+| `EXL3_EXPERT_PREFILL_STREAM_MB` | `512` | ring capacity in MiB |
+| `EXL3_EXPERT_PREFILL_STREAM_BUFS` | `4` | ring buffers (DMA / compute pipeline depth) |
 | `EXL3_MOE_ZC_MAX` | `auto` | GPU quota of misses per decode call |
 | `EXL3_MOE_ZC_CPU_FRAC_INIT` | `0.5` | CPU share of flexible misses until the cost model is measured |
 | `EXL3_MOE_ADAPTIVE_EMA` | `0.1` | smoothing of measured CPU cost |
@@ -415,7 +455,7 @@ classic paths, `EXL3_NUMA_ENABLE=1`) is set.
 | `EXL3_HYBRID_MOE_DEBUG` | `0` | print the cost probes (PCIe, VRAM, CPU round trip) |
 | `EXL3_HYBRID_MOE_PROFILE` | `0` | GPU-side CPU-lane wait profile with CUDA events (see [Telemetry](#telemetry)) |
 | `EXL3_NUMA_ENABLE` | `0` | one CPU worker per NUMA node (hybrid: at most 8) |
-| `EXL3_NUMA_POLICY` | `numa_local` | `numa_local`, `numa_sharded`, `numa_balanced`, `numa_adaptive` |
+| `EXL3_NUMA_POLICY` | `auto` | `auto`, `numa_local`, `numa_sharded`, `numa_balanced`, `numa_adaptive` |
 | `EXL3_NUMA_MEMORY_POLICY` | `shard` | `shard` or `replicate` |
 | `EXL3_NUMA_SHARD` | `mod` | `mod` or `blocked` |
 | `EXL3_NUMA_CPU_MAP` | auto | node:cpulist override, `;`-separated |
@@ -438,12 +478,21 @@ Hybrid needs layer-split loading (no `-tp`) and excludes `-mcl` / `-mcs` for the
 **Eligibility** is checked per layer from headers only; ineligible layers load as usual. A layer
 qualifies when it has:
 
-- mul1-codebook experts stored as separate EXL3 tensors of one shape per projection, no
+- mul1-codebook experts stored as separate EXL3 tensors of one (k, n) shape per projection, no
   per-expert biases, and no padded hidden width;
 - a silu/gelu gated or relu2 gateless activation;
 - at most 512 experts, and at least as many experts as worker nodes;
 - no tensor-parallel or latent-MoE structure;
 - the batched reconstruct tier available.
+
+**Mixed-rate checkpoints** (MixedK quants, where each expert has its own bitrate) qualify too.
+The CPU kernels take any supported K per expert, while the GPU tiers take one K per projection.
+So only the experts of the layer's most common rate signature (gate, up, down widths) get GPU
+lanes: home copies, cache slots and zero-copy reads. The others have no home and always run on
+their CPU worker, under every dispatch policy including `gpu_exact`. The load log reports the
+split per layer, and the prefill cost model counts the forced-CPU work. Outside hybrid, mixed-rate
+layers run the dense per-expert GPU path, and `-mcl` / `-mcs` keep them off the streamed prefill
+and the dynamic split swap, both of which assume one expert size.
 
 ## Telemetry
 
@@ -549,10 +598,8 @@ codebase from the documented mechanisms.
     least `EXL3_MOE_CPU_AMX_MIN_ROWS` (default 4) rows. Decode (one row per expert) is unchanged.
     On a 4-vCPU Sapphire Rapids VM, GLM-5.3-Flash-sized experts (4096 → 2048, 8 experts × 64
     tokens, 4 threads) ran 3.4–4.8× faster per token than the `vbmi` tier at K2–K4.
-  - **Dispatch.** Prefill still sends non-resident experts with at least
-    `EXL3_EXPERT_PREFILL_GPU_MIN` rows to zero-copy reads, so the CPU lanes see few-row experts
-    unless that threshold is raised. Choosing the lane per expert from measured costs in prefill,
-    as decode does, is the follow-up.
+  - **Dispatch.** The prefill threshold is chosen from measured costs (see [Prefill](#prefill)),
+    so a faster CPU tier automatically gets the larger experts.
   - **Not used:** KTransformers' AMX kernels, which consume their own requantized int8/int4
     layouts and cannot read EXL3 trellis tensors.
 - **Audit notes (upstream, unchanged here).**

@@ -17,7 +17,6 @@ A few defaults differ between the CUDA and ROCm builds. They are collected in
 | `EXL3_MOE_FUSED_ROWS` | `128` | `512` | the RDNA fused MoE kernel tiles the rows itself |
 | `EXL3_MOE_BATCH_RECON` | `1` | `0` | same |
 | `EXL3_MOE_MTILE` | `1` | `0` | same (no 32 / 64-row instances of the RDNA kernel) |
-| `EXL3_HC_FOLD` | `0` | `1` | the per-launch cost dominates the mHC decode kernels on RDNA |
 
 ## Attention
 
@@ -84,14 +83,15 @@ shared experts with 128-aligned widths and no post-norm. Under tensor parallelis
 expert is placed whole on one rank (its contribution enters the all-reduce from that rank only)
 rather than split across ranks. Set to `0` to keep the separate graph and the tensor split.
 
-### `EXL3_HC_FOLD` (default: `0` on CUDA, `1` on ROCm)
+### `EXL3_HC_FOLD` (default: `1`)
 
 Launch-count folds for the mHC hyper-connection sites (DeepSeek V4, GLM 5.3) at decode row counts
 (up to 32 rows): a site's residual update (`hc_apply`) is deferred and run inside the next site's
 mix kernel, and the RMSNorm that follows a mix runs inside the mix's finalize kernel, two launches
 fewer per site. The folded kernels repeat the unfused kernels' arithmetic in the same order, so
-the outputs are bit-identical either way (`tests/test_hc_fold.py`). On by default on ROCm, where
-the per-launch cost is a large part of these small kernels; `1` enables it on CUDA as well.
+the outputs are bit-identical either way (`tests/test_hc_fold.py`). On by default: the per-launch
+cost is a large part of these small kernels (on H100 with GLM 5.3 hybrid-MoE decode about 15%
+faster). `0` restores the separate launches.
 
 ### `EXL3_GR_MIX_TILED` (default: `1`)
 
@@ -380,6 +380,61 @@ Worker thread count, set per component via `config.infer_params.moe_cpu_threads`
 ### `EXL3_MOE_CPU_THREADS` (default: physical cores minus `EXL3_MOE_HOST_CORES`; `cpu_count // 2` if that is `0`, pinning is off, or the topology is unreadable)
 
 Fallback worker thread count when the component's `-mclt`/`-dmclt` config value is not set.
+
+### `EXL3_MOE_DECODE_THREADS` (default: `auto`)
+
+Hybrid MoE (`-mh`): share of each CPU worker's pool that runs one-token (decode) jobs. `auto`
+measures the time per decode token for 1, 7/8, 3/4, 5/8, 1/2 and 3/8 of the pool, keeps the
+fastest and re-checks its neighbours every 2048 decode tokens. On a host whose cores other
+processes also use (VMs, kubelet), a full pool waits at every phase barrier for whichever
+thread was preempted, and a smaller share is faster. A number such as `0.75` fixes the share;
+`off` leaves the caps alone (as `eval/hybrid_perf.py -sweep` does).
+
+### `EXL3_MOE_DEFER` (default: `0`)
+
+Hybrid MoE (`-mh`): expert deferral for decode-sized passes. A layer's CPU expert partial is not
+waited for inside the layer; it is added to the residual at the end of the next transformer
+block, so the CPU job overlaps that block's GPU work. This is an approximation: the next layer's
+attention and router see the residual without the CPU partial (the partial still reaches the
+residual, and every later layer sees it). With hyperconnections (mHC) the partial is carried
+through the next block's stream mixes and lands exactly where the immediate add would have put
+it. Applies only to layers whose MoE output goes straight into the residual (no latent
+projection, post-norms, residual or layer scalars, tensor parallelism), not to the last hybrid
+layer or one whose successor is on another device, and needs `EXL3_MOE_CPU_SLOTS` of at least
+`2`. Prefill passes never defer.
+
+### `EXL3_MOE_DEFER_MAX` (default: `0`, every CPU expert)
+
+With `EXL3_MOE_DEFER`: partial deferral. Per token, only the CPU-lane experts with the smallest
+routing weights are deferred, at most this many; the token's other CPU-lane experts are computed
+and added inside the layer as without deferral. Each node's decode CPU job is then split into an
+immediate job and a deferred job (the worker runs the immediate one first), on two CPU slots per
+layer. This needs `EXL3_MOE_CPU_SLOTS` of at least `3`: the deferred slot stays unconsumed until
+the end of the next block, and that block's own two reserves must land on other slots (with
+fewer, layers do not defer, and a notice is printed once). `0` defers every CPU-lane expert in
+one job, as before. Also settable at runtime as `HT.defer_max` (`exllamav3.model.moe_hybrid_dispatch`),
+read at every layer call.
+
+### `EXL3_MOE_DEFER_MIN_W` (default: unset)
+
+With `EXL3_MOE_DEFER`: never defer a CPU-lane expert whose routing weight is at least this value
+(it is computed inside the layer). Combines with `EXL3_MOE_DEFER_MAX` (`0` there: every CPU-lane
+expert below the bound is deferred). Setting it also selects the split jobs, with the same slot
+requirement. Runtime: `HT.defer_min_w` (`None` for unset).
+
+### `EXL3_MOE_CPU_FUSED_DECODE` (default: `1`)
+
+Runs each single-token CPU expert job as one pool dispatch. Inside it, a step waits only for the data
+it reads: its own prepared input, its expert's activation, or the down outputs for its column blocks.
+The phased path instead puts a pool-wide barrier after each of five steps. Both paths give
+bit-identical outputs. `0` selects the phased path, for A/B timing.
+
+### `EXL3_MOE_CPU_DECODE_WORKERS` (default: `0`, no cap)
+
+Caps the worker threads that run a single-token (decode) job. With `EXL3_MOE_CPU_THREADS` set to
+every logical CPU (SMT siblings included) for prefill, set this to the physical core count to run
+decode on one thread per core. Applies per worker process, so with `EXL3_NUMA_ENABLE` it is per
+node. Pinning (`EXL3_MOE_CPU_PIN=1`) makes the first threads one per physical core.
 
 ### `EXL3_MOE_CPU_SLOTS` (default: `4`), `EXL3_MOE_CPU_SLOT_ROWS` (default: `64`)
 
@@ -752,6 +807,19 @@ float, which can be worth testing on a host that also runs other work; the reser
 (`EXL3_MOE_HOST_CORES`) stays in effect either way. Falls back to no pinning if the CPU
 topology can't be read.
 
+`EXL3_MOE_DRAFT_CPU_PIN` (default `0`) sets it for the MTP head's or draft model's workers only.
+Their pool runs between the main model's passes on the same node; pinned to the same cores, the
+idle pool's spin-wait takes cores from the active one (on a 2x Xeon 6760P host, MTP decode fell
+from 17.8 to 13 tok/s with both pinned while plain decode gained 47% from pinning the main pool).
+
+### `EXL3_MOE_HOST_INTRAOP_THREADS` (default: `1`)
+
+Caps torch's intra-op thread pool in the host process for the duration of each forward pass while
+CPU MoE workers are up; restored after the pass. The host's CPU ops in a pass (the CPU embedding
+lookup and its pinned staging copy) go parallel in ATen from 9 rows at hidden size 4096, and the
+OpenMP team then competes with the spinning workers. On a 2x Xeon 6760P host a 9-row pass (an MTP
+verify with hybrid drafting) took 1.39 s against 0.15 s at 8 rows. `0` leaves torch's setting alone.
+
 ### `EXL3_MOE_HOST_CORES` (default: `1`)
 
 Physical cores kept free of worker threads and reserved for the host process. The pool runs one
@@ -813,11 +881,25 @@ its default. In short:
   if that shortens the call's slowest lane. Also `EXL3_MOE_ZC_CPU_FRAC_INIT` (the share used
   until the costs are measured), `EXL3_MOE_COST_REMEASURE`, `EXL3_EXPERT_DECODE_MAX_ROWS` (widest
   call on the decode lane policy, default the CPU slot rows; wider calls use the prefill rule),
-  `EXL3_EXPERT_PREFILL_GPU_MIN`, `EXL3_MOE_ADAPTIVE_EMA`,
-  `EXL3_HYBRID_MOE_DEBUG`, and `EXL3_HYBRID_MOE_PROFILE` (CPU-lane wait measured with CUDA events,
-  no host sync).
+  `EXL3_EXPERT_PREFILL_GPU_MIN` (default `1`: every non-resident expert of a prefill call goes
+  to the GPU lanes; `auto` chooses the split between zero-copy and CPU lanes per call from
+  measured PCIe and CPU costs; another number fixes the row threshold),
+  `EXL3_EXPERT_PREFILL_STREAM` (default `auto`: in prefill calls of at least
+  `EXL3_EXPERT_PREFILL_STREAM_ROWS` rows, default 2048, zero-copy experts with at least
+  `EXL3_EXPERT_PREFILL_STREAM_MIN_ROWS` rows, default 1, are DMAed from their pinned home into a
+  VRAM ring on a copy stream and run by the layer's own fused / batched GPU kernels instead of
+  reading host memory inside the kernels; `1` every prefill call, `0` off; CUDA only, decode
+  unaffected; the ring holds at most `EXL3_EXPERT_PREFILL_STREAM_SLOTS` experts, default 32, and
+  `EXL3_EXPERT_PREFILL_STREAM_MB`, default 512, in `EXL3_EXPERT_PREFILL_STREAM_BUFS` buffers,
+  default 4, and counts toward the prefill transient the cache leaves free),
+  `EXL3_MOE_ADAPTIVE_EMA`,
+  `EXL3_HYBRID_MOE_DEBUG`, `EXL3_HYBRID_MOE_PROFILE` (CPU-lane wait measured with CUDA events,
+  no host sync), and `EXL3_MOE_DEFER` (decode CPU partials folded in one block later; an
+  approximation, default off) with `EXL3_MOE_DEFER_MAX` / `EXL3_MOE_DEFER_MIN_W` (defer only the
+  lowest-weight CPU experts).
 - **NUMA:** `EXL3_NUMA_ENABLE` (one CPU worker per node; also applies to `-mcl` / `-mcs`, whose
-  layers then go round-robin over the nodes), `EXL3_NUMA_POLICY`, `EXL3_NUMA_MEMORY_POLICY`
+  layers then go round-robin over the nodes), `EXL3_NUMA_POLICY` (default `auto`: measured
+  cost split under `replicate`, GPU-local under `shard`), `EXL3_NUMA_MEMORY_POLICY`
   (`shard` or `replicate`), `EXL3_NUMA_SHARD` (`mod` or `blocked`), `EXL3_NUMA_CPU_MAP`,
   `EXL3_NUMA_GPU_NODE` and `EXL3_NUMA_DEBUG`. An undeterminable GPU node stays unknown and is
   never assumed. Hybrid mode supports at most 8 worker nodes and stops with an error before

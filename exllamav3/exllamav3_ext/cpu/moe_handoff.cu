@@ -251,6 +251,10 @@ void exl3_moe_cpu_worker_run
     uint32_t* quit = reinterpret_cast<uint32_t*>(base + 0);
     uint32_t* pass_wake = reinterpret_cast<uint32_t*>(base + 64);
     uint32_t* ready = reinterpret_cast<uint32_t*>(base + 192);
+    // Runtime thread caps (0: none), set by the parent between passes (MoeCpuHost.set_thread_caps):
+    // pool participants for multi-row jobs and for single-row (decode) jobs
+    uint32_t* cap_multi = reinterpret_cast<uint32_t*>(base + 196);
+    uint32_t* cap_single = reinterpret_cast<uint32_t*>(base + 200);
     uint32_t* jobs_tail = reinterpret_cast<uint32_t*>(base + 256);
     uint32_t* jobs_head = reinterpret_cast<uint32_t*>(base + 320);
     MoeJob* jobs = reinterpret_cast<MoeJob*>(base + MOE_CTRL_JOBS_OFFSET);
@@ -396,6 +400,12 @@ void exl3_moe_cpu_worker_run
                         if (selp[i] >= 0) { run = true; break; }
                 }
             }
+            int job_threads = (int) threads;
+            if (run)
+            {
+                const uint32_t cap = load_acquire_u32(job.rows == 1 ? cap_single : cap_multi);
+                if (cap > 0 && (int) cap < job_threads) job_threads = (int) cap;
+            }
             if (run)
                 exl3_moe_cpu_forward_raw(
                     static_cast<int64_t>(job.layer),
@@ -405,7 +415,7 @@ void exl3_moe_cpu_worker_run
                     reinterpret_cast<float*>(slot + off_out),
                     static_cast<int>(job.rows),
                     static_cast<int>(job.topk),
-                    static_cast<int>(threads)
+                    job_threads
                 );
             if (telemetry_offset >= 0)
             {

@@ -8,6 +8,7 @@ threads) is not pinned, so the scheduler can drop it on a worker's LP, where the
 the straggler at every per-phase barrier of the job. This module plans and applies the host
 placement, with the workers pinned or floating alike (the pool reports its topology either way).
 """
+import contextlib
 import os
 import sys
 
@@ -89,3 +90,33 @@ def apply_process_affinity(cpus: list[int]) -> str | None:
         return "no affinity API on this platform"
     except OSError as e:
         return str(e)
+
+
+# Torch intra-op threads of the host process during a forward pass with CPU MoE workers
+# (EXL3_MOE_HOST_INTRAOP_THREADS, 0 leaves torch's setting alone)
+HOST_INTRAOP_THREADS = int(os.environ.get("EXL3_MOE_HOST_INTRAOP_THREADS", 1))
+
+
+@contextlib.contextmanager
+def host_intraop_threads(active: bool):
+    """Cap torch's intra-op (OpenMP) pool for the duration of a forward pass while CPU MoE workers
+    run. The host's own CPU ops in a pass are tiny, but ATen parallelizes them once they cross
+    its grain size: the CPU embedding lookup (index_select, parallel above 32768 / hidden rows,
+    i.e. from 9 rows at hidden 4096) and the pinned staging copy of its output (parallel above
+    32768 elements) open OpenMP regions from 9 decode rows on. Their team threads compete with
+    the workers, which spin on every core in-pass, or with the host thread on the few LPs the
+    host is confined to (_apply_host_affinity, HostGroup.after_start), and keep spinning after
+    the region, descheduling the host thread that launches the rest of the pass. Measured on two
+    sockets: one 9-row lookup took 277 ms and the 9-row pass 1.39 s against 0.15 s at 8 rows,
+    flat up to 32 rows. Serial, these ops take microseconds. Restored on exit; a nested pass
+    sees the cap already in place"""
+    import torch
+    n = HOST_INTRAOP_THREADS
+    prev = torch.get_num_threads() if active and n > 0 else 0
+    if prev > n:
+        torch.set_num_threads(n)
+    try:
+        yield
+    finally:
+        if prev > n:
+            torch.set_num_threads(prev)

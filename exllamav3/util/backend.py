@@ -52,8 +52,9 @@ MOE_MTILE = _env("EXL3_MOE_MTILE", 1, 0) != "0"
 
 # mHC launch-count folds at decode row counts (hc_mix_fused, hc_fuse.cuh): apply_ deferred into the next
 # site's mix, the following RMSNorm run inside its finalize. Bit-identical to the unfused launches; on by
-# default where the per-launch cost dominates these small kernels (RDNA)
-HC_FOLD = _env("EXL3_HC_FOLD", 0, 1) != "0"
+# default on both backends (measured ~15% faster hybrid-MoE decode on H100, GLM 5.3, where decode is a long
+# chain of small launches)
+HC_FOLD = _env("EXL3_HC_FOLD", 1, 1) != "0"
 
 # Split-decode attention (triton_paged.py, bc_attn.py): AMD's Triton backend runs the split kernel at
 # 8 warps / 1 stage without spilling to scratch, where 4 / 2 does. gfx1100 is measured separately: at
