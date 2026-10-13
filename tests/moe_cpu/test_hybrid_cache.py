@@ -858,3 +858,22 @@ def test_warm_start_runs_once_per_owner_generation(tmp_path):
     FakeLayer(c, "b", eb = 2048)                 # new class: re-layout
     c.begin_pass(1, 32)
     assert float(c.ref_state.hist[fl.layer.L * EMAX + 2]) == h2   # live history kept
+
+
+def test_stats_log_keeps_newest_counter_lines_only(tmp_path, monkeypatch):
+    path = tmp_path / "cache_stats.jsonl"
+    c, _ = make_cache(stats_log = str(path), stats_log_s = 60, stats_log_max = 3)
+    fl = FakeLayer(c, "a")
+    c.begin_pass(1, 32)
+    clock = [1000.0]
+    monkeypatch.setattr(H.cache.time, "time", lambda: clock[0])
+    for i in range(5):
+        issue(c, fl, [1, 2, 3])
+        c.idle_maintenance()
+        c.idle_maintenance()                 # same interval: no second line
+        clock[0] += 61
+    lines = [json.loads(x) for x in path.read_text().splitlines()]
+    assert len(lines) == 3
+    assert set(lines[-1]) >= {"t", "device", "hit_rate", "hits", "misses", "admits", "bg_admits"}
+    assert all(l["hits"] + l["misses"] == 3 for l in lines)      # per-interval deltas
+    assert lines[-1]["hit_rate"] == 1.0

@@ -444,6 +444,7 @@ classic paths, `EXL3_NUMA_ENABLE=1`) is set.
 | `EXL3_EXPERT_CACHE_CHUNK_SLOTS` | `32` | slots per allocation chunk |
 | `EXL3_EXPERT_CACHE_MAX_LAYERS` | `256` | hybrid layers per device |
 | `EXL3_EXPERT_CACHE_DECAY` | `0.5` | pick-history decay per idle period |
+| `EXL3_EXPERT_CACHE_STATS_LOG` | unset | file for a short-lived counter log: at idle points, at most once per `EXL3_EXPERT_CACHE_STATS_LOG_S` (`60`) seconds, one JSON line with the time, device, window hit rate and the counter deltas (hits, misses, admits, bg_admits, bg_rejects, evictions, zero_copy, cpu, calls, admit_bytes); only the newest `EXL3_EXPERT_CACHE_STATS_LOG_MAX` (`1440`) lines are kept. Counters only, never request content |
 | `EXL3_EXPERT_CACHE_WARM` | unset | warm-start stats (json) |
 | `EXL3_EXPERT_CACHE_SAVE_STATS` | unset | write stats (json) at unload / exit |
 | `EXL3_EXPERT_CACHE_ZC_FUSED_ROWS` | `32` | fused-tier row cap in calls with zero-copy experts |
