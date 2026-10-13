@@ -434,7 +434,7 @@ bit-identical outputs. `0` selects the phased path, for A/B timing.
 Caps the worker threads that run a single-token (decode) job. With `EXL3_MOE_CPU_THREADS` set to
 every logical CPU (SMT siblings included) for prefill, set this to the physical core count to run
 decode on one thread per core. Applies per worker process, so with `EXL3_NUMA_ENABLE` it is per
-node. Pinning (`EXL3_MOE_CPU_PIN=1`) makes the first threads one per physical core.
+node. Pinning (the default; `EXL3_MOE_CPU_PIN=0` turns it off) makes the first threads one per physical core.
 
 ### `EXL3_MOE_CPU_SLOTS` (default: `4`), `EXL3_MOE_CPU_SLOT_ROWS` (default: `64`)
 
