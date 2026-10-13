@@ -30,15 +30,16 @@ S_REG_BOUNCE, S_REG_BYTES, S_REG_CLASS, S_REG_CPULOC = 14, 15, 16, 17
 S_SCAP, S_LCAP, S_GMAX = 18, 19, 20
 S_COUNT = 21
 
-CTL_EPOCH, CTL_GCOUNT, CTL_BG_ADMIT, CTL_HAND, CTL_CLASS_LO, CTL_CLASS_HI = 0, 1, 2, 8, 16, 17
+CTL_EPOCH, CTL_GCOUNT, CTL_BG_ADMIT, CTL_GPU_GATE, CTL_HAND, CTL_CLASS_LO, CTL_CLASS_HI = 0, 1, 2, 3, 8, 16, 17
 CTL_SIZE = 32
 
 ST_HITS, ST_MISSES, ST_ADMITS, ST_EVICTS, ST_NO_VICTIM, ST_ZC, ST_CPU, ST_CALLS = range(8)
 ST_NO_LANE, ST_PREFILL, ST_ADMIT_BYTES, ST_ZC_BYTES, ST_BG_ADMITS, ST_BG_REJECTS = 8, 9, 10, 11, 12, 13
+ST_GPU_REJECTS = 14
 ST_CPU_NODE = 16
 STATS_SIZE = 32
 STAT_NAMES = ["hits", "misses", "admits", "evictions", "no_victim", "zero_copy", "cpu", "calls",
-              "no_lane", "prefill_calls", "admit_bytes", "zero_copy_bytes", "bg_admits", "bg_rejects"]
+              "no_lane", "prefill_calls", "admit_bytes", "zero_copy_bytes", "bg_admits", "bg_rejects", "gpu_rejects"]
 
 LC_HIT, LC_ZC, LC_CPU_FIXED, LC_CPU = 0, 1, 2, 3
 
@@ -252,6 +253,7 @@ def issue(st: RefState, nodes: dict, L: int, E: int, sel: np.ndarray, y: np.ndar
     gcount = 0
     bg = 0
     bg_max = int(st.ctl[CTL_BG_ADMIT])
+    gpu_gate = int(st.ctl[CTL_GPU_GATE])
     flex_gpu = 0
     ebytes = int(st.reg_bytes[L])
 
@@ -288,7 +290,10 @@ def issue(st: RefState, nodes: dict, L: int, E: int, sel: np.ndarray, y: np.ndar
                     t_gpu = f32(t_gpu + lc[LC_ZC])
                 if admit and not prefill and rng > 0 and gcount < st.gmax:
                     victim, hand = clock_victim(st, lo, rng, hand, ep)
-                    if victim >= 0:
+                    o = int(st.owner[victim]) if victim >= 0 else -1
+                    if victim >= 0 and gpu_gate and o >= 0 and f32(st.hist[hbase + e]) < f32(st.hist[o]):
+                        st.stats[ST_GPU_REJECTS] += 1
+                    elif victim >= 0:
                         install(st, L, e, victim)
                         st.refb[victim] = 1
                         st.pin[victim] = ep

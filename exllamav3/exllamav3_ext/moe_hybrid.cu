@@ -359,6 +359,7 @@ void moe_hybrid_issue_kernel
         int gcount = 0;
         int bg = 0;
         const int bg_max = st.ctl[HY_CTL_BG_ADMIT];
+        const int gpu_gate = st.ctl[HY_CTL_GPU_GATE];
         int flex_gpu = 0;
         const int64_t ebytes = st.reg_bytes[L];
 
@@ -400,8 +401,14 @@ void moe_hybrid_issue_kernel
                 if (pass == 1) t_gpu = __fadd_rn(t_gpu, lc.zc);
                 if (admit && !prefill && range > 0 && gcount < st.gmax)
                 {
+                    // With the gate on, a slot is only taken from an expert picked at most as often
+                    // than e (decayed history); otherwise e runs zero-copy this call, which reads
+                    // the same bytes over PCIe without evicting a hotter expert
                     const int victim = hy_clock_victim(st, lo, range, &hand, epoch);
-                    if (victim >= 0)
+                    const int o = victim >= 0 ? st.owner[victim] : -1;
+                    if (victim >= 0 && gpu_gate && o >= 0 && st.hist[hbase + e] < st.hist[o])
+                        st.stats[HY_ST_GPU_REJECTS] += 1;
+                    else if (victim >= 0)
                     {
                         hy_install(st, L, e, victim);
                         st.refb[victim] = 1;

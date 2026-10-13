@@ -339,6 +339,34 @@ def test_bg_admit_zero_keeps_cpu_lane_misses_out_of_the_cache():
     check_invariants(c, [fl])
 
 
+def _hot_then_cold_on_gpu_lane(gpu_gate):
+    c, _ = make_cache(free = 4 * 1024, bg_admit = 0, gpu_gate = gpu_gate)   # one chunk: 4 slots
+    fl = FakeLayer(c, "a")
+    c.begin_pass(1, 32)
+    for _ in range(8):                                       # 0..3 resident and hot
+        issue(c, fl, [0, 1, 2, 3])
+    r = issue(c, fl, [9])                                    # a cold GPU-lane miss
+    return c, fl, r
+
+
+def test_gpu_gate_runs_a_colder_miss_zero_copy_without_evicting():
+    c, fl, r = _hot_then_cold_on_gpu_lane(1)
+    st = c.ref_state
+    assert int(r["lane"][9]) == ref.LANE_ZC
+    assert int(st.slotof[fl.layer.L * EMAX + 9]) < 0
+    assert all(int(st.slotof[fl.layer.L * EMAX + e]) >= 0 for e in range(4))
+    assert c.stats()["gpu_rejects"] == 1
+    check_invariants(c, [fl])
+
+
+def test_gpu_gate_zero_admits_every_gpu_lane_miss():
+    c, fl, r = _hot_then_cold_on_gpu_lane(0)
+    assert int(r["lane"][9]) == ref.LANE_GPU
+    assert int(c.ref_state.slotof[fl.layer.L * EMAX + 9]) >= 0
+    assert c.stats()["gpu_rejects"] == 0
+    check_invariants(c, [fl])
+
+
 def test_cpu_frac_and_unmapped_homes():
     c, _ = make_cache()
     mapped = [e != 6 for e in range(16)]

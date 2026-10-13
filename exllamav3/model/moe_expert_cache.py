@@ -54,7 +54,7 @@ import torch
 from . import moe_hybrid_ref as ref
 from .moe_hybrid_ref import (
     EMAX, MAX_TABLES, MAX_NODES, MAX_CLASSES, S_COUNT, CTL_SIZE, STATS_SIZE, STAT_NAMES,
-    CTL_BG_ADMIT, CTL_HAND, CTL_CLASS_LO, CTL_CLASS_HI, ST_NO_LANE,
+    CTL_BG_ADMIT, CTL_GPU_GATE, CTL_HAND, CTL_CLASS_LO, CTL_CLASS_HI, ST_NO_LANE,
     OP_EVICT, OP_DISABLE, OP_ENABLE, OP_INSTALL, OP_RESET_LAYER,
 )
 
@@ -76,6 +76,9 @@ class CacheTuning:
         # Frequency-gated admissions of CPU-lane misses per decode layer call (0 = only GPU-lane
         # misses are admitted, the old behaviour)
         self.bg_admit = max(0, _env_int("EXL3_EXPERT_CACHE_BG_ADMIT", 1))
+        # GPU-lane misses evict only a slot whose expert was picked at most as often (else zero-copy);
+        # 0 = admit on every GPU-lane miss, the old behaviour
+        self.gpu_gate = 1 if _env_int("EXL3_EXPERT_CACHE_GPU_GATE", 1) else 0
         self.warm = os.environ.get("EXL3_EXPERT_CACHE_WARM") or None
         self.save_stats = os.environ.get("EXL3_EXPERT_CACHE_SAVE_STATS") or None
         self.gmax = max(1, _env_int("EXL3_EXPERT_CACHE_GATHER_MAX", 64))
@@ -550,6 +553,7 @@ class ExpertCache:
             ctl[CTL_CLASS_HI + 2 * c.id] = c.lo     # nothing enabled yet
             ctl[CTL_HAND + c.id] = 0
         ctl[CTL_BG_ADMIT] = self.T.bg_admit
+        ctl[CTL_GPU_GATE] = self.T.gpu_gate
         epoch = int(self.arrays["ctl"][0].item())
         ctl[0] = epoch
         self._write(self.arrays["ctl"], 0, ctl)
@@ -745,7 +749,7 @@ class ExpertCache:
             if self.sized:
                 self.grow(regrow = True)
 
-    _LOG_KEYS = ("hits", "misses", "admits", "bg_admits", "bg_rejects", "evictions", "zero_copy", "cpu",
+    _LOG_KEYS = ("hits", "misses", "admits", "bg_admits", "bg_rejects", "gpu_rejects", "evictions", "zero_copy", "cpu",
                  "calls", "admit_bytes")
 
     def _log_stats(self, st: dict):
