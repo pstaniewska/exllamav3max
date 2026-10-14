@@ -29,6 +29,7 @@
 #define HY_THREADS 1024
 #define HY_SCAN_MAX 8192
 #define HY_GATHER_THREADS 256
+#define HY_BG_HYST 1.25f   // background admission: candidate history must exceed the victim's by this factor
 
 struct HyState
 {
@@ -147,6 +148,23 @@ __device__ void hy_install(const HyState& st, int L, int e, int s)
     st.owner[s] = key;
     st.slotof[key] = s;
     hy_repoint(st, L, e, st.slot_base[s]);
+}
+
+// CLOCK victim in the class range [lo, lo + range), advancing *hand; skips disabled slots and
+// slots this call already uses (pin == epoch), clears reference bits on the way. -1 if none
+__device__ int hy_clock_victim(const HyState& st, int lo, int range, int* hand, int epoch)
+{
+    const int steps = min(2 * range, HY_SCAN_MAX);
+    for (int k = 0; k < steps; ++k)
+    {
+        const int s = lo + *hand;
+        *hand = *hand + 1 == range ? 0 : *hand + 1;
+        const int p = st.pin[s];
+        if (p < 0 || p == epoch) continue;
+        if (st.refb[s]) { st.refb[s] = 0; continue; }
+        return s;
+    }
+    return -1;
 }
 
 __device__ __forceinline__ int hy_cpuloc(const HyState& st, int L, int node, int e)
@@ -339,6 +357,9 @@ void moe_hybrid_issue_kernel
         int hand = cls >= 0 ? st.ctl[HY_CTL_HAND + cls] : 0;
         if (range > 0 && (hand < 0 || hand >= range)) hand = 0;
         int gcount = 0;
+        int bg = 0;
+        const int bg_max = st.ctl[HY_CTL_BG_ADMIT];
+        const int gpu_gate = st.ctl[HY_CTL_GPU_GATE];
         int flex_gpu = 0;
         const int64_t ebytes = st.reg_bytes[L];
 
@@ -380,19 +401,14 @@ void moe_hybrid_issue_kernel
                 if (pass == 1) t_gpu = __fadd_rn(t_gpu, lc.zc);
                 if (admit && !prefill && range > 0 && gcount < st.gmax)
                 {
-                    int victim = -1;
-                    const int steps = min(2 * range, HY_SCAN_MAX);
-                    for (int k = 0; k < steps; ++k)
-                    {
-                        const int s = lo + hand;
-                        hand = hand + 1 == range ? 0 : hand + 1;
-                        const int p = st.pin[s];
-                        if (p < 0 || p == epoch) continue;
-                        if (st.refb[s]) { st.refb[s] = 0; continue; }
-                        victim = s;
-                        break;
-                    }
-                    if (victim >= 0)
+                    // With the gate on, a slot is only taken from an expert picked at most as often
+                    // than e (decayed history); otherwise e runs zero-copy this call, which reads
+                    // the same bytes over PCIe without evicting a hotter expert
+                    const int victim = hy_clock_victim(st, lo, range, &hand, epoch);
+                    const int o = victim >= 0 ? st.owner[victim] : -1;
+                    if (victim >= 0 && gpu_gate && o >= 0 && st.hist[hbase + e] < st.hist[o])
+                        st.stats[HY_ST_GPU_REJECTS] += 1;
+                    else if (victim >= 0)
                     {
                         hy_install(st, L, e, victim);
                         st.refb[victim] = 1;
@@ -422,6 +438,39 @@ void moe_hybrid_issue_kernel
                 t_cpu_max = fmaxf(t_cpu_max, t_node[node]);
                 st.stats[HY_ST_CPU] += 1;
                 st.stats[HY_ST_CPU_NODE + node] += 1;
+
+                // Background admission: the CPU computes this call's picks of e either way, but
+                // when e is used clearly more often than the slot's CLOCK victim, copy it into
+                // the slot for the next calls. Without this, once the cost model routes most
+                // misses to the CPU the cache only refreshes from the few GPU-lane misses and
+                // goes stale. The copy is gated by frequency (decayed pick history) so a
+                // one-off expert never displaces a hot one, and bounded per call
+                if (admit && !prefill && mapped && range > 0 && gcount < st.gmax && bg < bg_max)
+                {
+                    const int victim = hy_clock_victim(st, lo, range, &hand, epoch);
+                    if (victim >= 0)
+                    {
+                        const int o = st.owner[victim];
+                        const float hv = o >= 0 ? st.hist[o] : 0.0f;
+                        if (o < 0 || st.hist[hbase + e] > __fmul_rn(hv, HY_BG_HYST))
+                        {
+                            hy_install(st, L, e, victim);
+                            st.refb[victim] = 1;
+                            st.pin[victim] = epoch;
+                            int64_t* job = st.gjobs + 3 * gcount;
+                            job[0] = st.slot_base[victim];
+                            job[1] = st.reg_home[hbase + e];
+                            job[2] = ebytes;
+                            gcount++;
+                            bg++;
+                            st.stats[HY_ST_ADMITS] += 1;
+                            st.stats[HY_ST_BG_ADMITS] += 1;
+                            st.stats[HY_ST_ADMIT_BYTES] += (unsigned long long) ebytes;
+                        }
+                        else st.stats[HY_ST_BG_REJECTS] += 1;
+                    }
+                    else st.stats[HY_ST_NO_VICTIM] += 1;
+                }
             }
             else st.stats[HY_ST_NO_LANE] += 1;
             s_lane[e] = lane;

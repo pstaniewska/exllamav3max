@@ -589,6 +589,14 @@ madvise` hosts, plus any compaction the kernel needs first), so it must not sit 
 startup path; the worker reads 4K pages until each chunk lands. `EXL3_MOE_ARENA_DEBUG=1`
 prints how long it took. Set to `0` to skip hugepage promotion entirely.
 
+Kernels older than 6.1 have no `MADV_COLLAPSE` and reject that pass, which used to leave the whole
+arena on 4K pages. There (or with `EXL3_MOE_ARENA_HUGEPAGE=eager`) each chunk is instead hinted
+with `MADV_HUGEPAGE` before its first touch, so loading faults 2 MiB pages directly, and the shared
+(memfd) chunks are committed through the mapping with `MADV_POPULATE_WRITE` instead of
+`fallocate`, since pages `fallocate` commits never get hugepages under `shmem_enabled=advise`.
+`EXL3_MOE_ARENA_HUGEPAGE=collapse` forces the post-load pass. Check with `ShmemPmdMapped` /
+`AnonHugePages` in `/proc/<worker pid>/smaps_rollup`.
+
 On Windows there is no post-hoc promotion, so the same flag instead makes each arena chunk
 attempt a `MEM_LARGE_PAGES` `VirtualAlloc` at creation (requires `SeLockMemoryPrivilege` on the
 account, enabled on the worker's token at runtime) and falls back to a plain mapping per chunk

@@ -46,13 +46,15 @@ import os
 import json
 import threading
 import atexit
+import time
+import collections
 import numpy as np
 import torch
 
 from . import moe_hybrid_ref as ref
 from .moe_hybrid_ref import (
     EMAX, MAX_TABLES, MAX_NODES, MAX_CLASSES, S_COUNT, CTL_SIZE, STATS_SIZE, STAT_NAMES,
-    CTL_HAND, CTL_CLASS_LO, CTL_CLASS_HI, ST_NO_LANE,
+    CTL_BG_ADMIT, CTL_GPU_GATE, CTL_HAND, CTL_CLASS_LO, CTL_CLASS_HI, ST_NO_LANE,
     OP_EVICT, OP_DISABLE, OP_ENABLE, OP_INSTALL, OP_RESET_LAYER,
 )
 
@@ -71,6 +73,12 @@ class CacheTuning:
         self.reserve_bytes = _env_int("EXL3_EXPERT_CACHE_RESERVE_MB", 1536) << 20
         self.min_free_bytes = _env_int("EXL3_EXPERT_CACHE_MIN_FREE_MB", 1024) << 20
         self.admit_max = _env_int("EXL3_EXPERT_CACHE_ADMIT_MAX", 64)
+        # Frequency-gated admissions of CPU-lane misses per decode layer call (0 = only GPU-lane
+        # misses are admitted, the old behaviour)
+        self.bg_admit = max(0, _env_int("EXL3_EXPERT_CACHE_BG_ADMIT", 1))
+        # GPU-lane misses evict only a slot whose expert was picked at most as often (else zero-copy);
+        # 0 = admit on every GPU-lane miss, the old behaviour
+        self.gpu_gate = 1 if _env_int("EXL3_EXPERT_CACHE_GPU_GATE", 1) else 0
         self.warm = os.environ.get("EXL3_EXPERT_CACHE_WARM") or None
         self.save_stats = os.environ.get("EXL3_EXPERT_CACHE_SAVE_STATS") or None
         self.gmax = max(1, _env_int("EXL3_EXPERT_CACHE_GATHER_MAX", 64))
@@ -82,6 +90,11 @@ class CacheTuning:
         self.policy = os.environ.get("EXL3_EXPERT_CACHE_POLICY", "clock").strip().lower()
         assert self.policy in ("clock", "none"), "EXL3_EXPERT_CACHE_POLICY must be clock or none"
         self.debug = os.environ.get("EXL3_EXPERT_CACHE_DEBUG", "0") not in ("", "0")
+        # Short-lived counter log: one JSON line per interval (counters only, never request
+        # content), the file holding only the newest stats_log_max lines
+        self.stats_log = os.environ.get("EXL3_EXPERT_CACHE_STATS_LOG") or None
+        self.stats_log_s = max(1, _env_int("EXL3_EXPERT_CACHE_STATS_LOG_S", 60))
+        self.stats_log_max = max(1, _env_int("EXL3_EXPERT_CACHE_STATS_LOG_MAX", 1440))
 
 
 TUNING = CacheTuning()
@@ -539,6 +552,8 @@ class ExpertCache:
             ctl[CTL_CLASS_LO + 2 * c.id] = c.lo
             ctl[CTL_CLASS_HI + 2 * c.id] = c.lo     # nothing enabled yet
             ctl[CTL_HAND + c.id] = 0
+        ctl[CTL_BG_ADMIT] = self.T.bg_admit
+        ctl[CTL_GPU_GATE] = self.T.gpu_gate
         epoch = int(self.arrays["ctl"][0].item())
         ctl[0] = epoch
         self._write(self.arrays["ctl"], 0, ctl)
@@ -725,12 +740,44 @@ class ExpertCache:
                 return
             self.arrays["hist"].mul_(self.T.decay)
             st = self.stats()
+            if self.T.stats_log:
+                self._log_stats(st)
             if st["no_lane"]:
                 raise RuntimeError(
                     f"Expert cache {self.device}: {st['no_lane']} expert picks had no execution lane "
                     f"(no GPU-readable home and no CPU worker copy); this is a configuration error")
             if self.sized:
                 self.grow(regrow = True)
+
+    _LOG_KEYS = ("hits", "misses", "admits", "bg_admits", "bg_rejects", "gpu_rejects", "evictions", "zero_copy", "cpu",
+                 "calls", "admit_bytes")
+
+    def _log_stats(self, st: dict):
+        """Append the counter deltas since the previous line to T.stats_log, at most once per
+        T.stats_log_s, keeping the newest T.stats_log_max lines (called at idle points only)"""
+        now = time.time()
+        last = getattr(self, "_log_last", None)
+        if last is not None and now - last[0] < self.T.stats_log_s:
+            return
+        if last is None:
+            self._log_lines = collections.deque(maxlen = self.T.stats_log_max)
+            prev = {k: 0 for k in self._LOG_KEYS}
+        else:
+            prev = last[1]
+        d = {k: int(st[k]) - int(prev[k]) for k in self._LOG_KEYS}
+        cur = {k: int(st[k]) for k in self._LOG_KEYS}
+        self._log_last = (now, cur)
+        hm = d["hits"] + d["misses"]
+        line = dict(t = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)), device = str(self.device),
+                    hit_rate = round(d["hits"] / hm, 4) if hm else None, **d)
+        self._log_lines.append(json.dumps(line))
+        try:
+            tmp = self.T.stats_log + ".tmp"
+            with open(tmp, "w", encoding = "utf8") as f:
+                f.write("\n".join(self._log_lines) + "\n")
+            os.replace(tmp, self.T.stats_log)
+        except OSError as e:
+            self._notice("stats_log", f" !! expert cache: cannot write EXL3_EXPERT_CACHE_STATS_LOG ({e})")
 
     def stats(self) -> dict:
         """Device counters (one D2H read: call between passes, never per token)"""

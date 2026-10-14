@@ -113,6 +113,15 @@ and clears reference bits on the way. Admission runs only for calls of at most
 `EXL3_EXPERT_CACHE_GATHER_MAX` per call. Prefill only marks hits. An evicted expert's rows go back
 to its home, or to the bounce block when the home is not GPU-readable.
 
+**Background admission.** A miss the cost model sends to a CPU lane is still computed on the CPU
+in that call, but up to `EXL3_EXPERT_CACHE_BG_ADMIT` such misses per decode call (hottest first)
+are also copied into a slot for the next calls, if the CLOCK victim's decayed pick history is
+lower: the candidate's must exceed the victim's by a factor of 1.25 (`HY_BG_HYST`), so a one-off
+expert never displaces a hot one and near-equal experts do not swap back and forth. Without it,
+once the CPU lanes are fast enough to take most misses, the cache refreshes only from the few
+GPU-lane misses and goes stale. The copy is the same gather as any admission and runs after the
+CPU jobs are published, off their critical path.
+
 **Why slot reuse is safe.** Admission, eviction and the copy into a slot are kernels on the compute
 stream. Every MoE kernel that could still read the old tenant was enqueued earlier on the same
 stream, so it has finished before the issue kernel runs. Within one call, the pin epoch keeps the
@@ -429,11 +438,14 @@ classic paths, `EXL3_NUMA_ENABLE=1`) is set.
 | `EXL3_EXPERT_CACHE_MIN_FREE_MB` | `1024` | added to the measured transient for the floor |
 | `EXL3_EXPERT_CACHE_GROW_HYST_MB` | `256` | hysteresis for regrowth when idle |
 | `EXL3_EXPERT_CACHE_ADMIT_MAX` | `64` | largest call (picks) that may admit |
+| `EXL3_EXPERT_CACHE_GPU_GATE` | `1` | a GPU-lane miss takes a slot only from an expert picked at most as often (decayed history); otherwise it runs zero-copy for that call. `0` = admit on every GPU-lane miss |
+| `EXL3_EXPERT_CACHE_BG_ADMIT` | `1` | frequency-gated admissions of CPU-lane misses per decode call; `0` = GPU-lane misses only |
 | `EXL3_EXPERT_CACHE_GATHER_MAX` | `64` | admissions per call |
 | `EXL3_EXPERT_CACHE_GATHER_BLOCKS` | `16` | blocks per admission copy |
 | `EXL3_EXPERT_CACHE_CHUNK_SLOTS` | `32` | slots per allocation chunk |
 | `EXL3_EXPERT_CACHE_MAX_LAYERS` | `256` | hybrid layers per device |
 | `EXL3_EXPERT_CACHE_DECAY` | `0.5` | pick-history decay per idle period |
+| `EXL3_EXPERT_CACHE_STATS_LOG` | unset | file for a short-lived counter log: at idle points, at most once per `EXL3_EXPERT_CACHE_STATS_LOG_S` (`60`) seconds, one JSON line with the time, device, window hit rate and the counter deltas (hits, misses, admits, bg_admits, bg_rejects, gpu_rejects, evictions, zero_copy, cpu, calls, admit_bytes); only the newest `EXL3_EXPERT_CACHE_STATS_LOG_MAX` (`1440`) lines are kept. Counters only, never request content |
 | `EXL3_EXPERT_CACHE_WARM` | unset | warm-start stats (json) |
 | `EXL3_EXPERT_CACHE_SAVE_STATS` | unset | write stats (json) at unload / exit |
 | `EXL3_EXPERT_CACHE_ZC_FUSED_ROWS` | `32` | fused-tier row cap in calls with zero-copy experts |
@@ -505,6 +517,8 @@ That read is one device-to-host copy, meant for use between passes and never per
 | `hits`, `misses`, `hit_rate` | unique (layer call, expert) pairs found resident or not |
 | `admits`, `admit_bytes` | admissions and the bytes copied into slots over PCIe |
 | `evictions`, `no_victim` | tenants displaced; admissions that found no victim (expert stayed zero-copy) |
+| `gpu_rejects` | GPU-lane misses run zero-copy because the CLOCK victim was picked more often |
+| `bg_admits`, `bg_rejects` | CPU-lane misses admitted in the background (part of `admits`); ones kept out because the victim was used as often |
 | `zero_copy`, `zero_copy_bytes` | experts computed from host homes; their bytes, a lower bound on PCIe reads |
 | `cpu`, `cpu_by_node` | experts sent to CPU lanes, total and per worker node |
 | `no_lane` | picks with no lane at all: a configuration error, raised at the next idle point |

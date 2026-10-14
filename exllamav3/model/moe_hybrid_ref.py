@@ -30,15 +30,16 @@ S_REG_BOUNCE, S_REG_BYTES, S_REG_CLASS, S_REG_CPULOC = 14, 15, 16, 17
 S_SCAP, S_LCAP, S_GMAX = 18, 19, 20
 S_COUNT = 21
 
-CTL_EPOCH, CTL_GCOUNT, CTL_HAND, CTL_CLASS_LO, CTL_CLASS_HI = 0, 1, 8, 16, 17
+CTL_EPOCH, CTL_GCOUNT, CTL_BG_ADMIT, CTL_GPU_GATE, CTL_HAND, CTL_CLASS_LO, CTL_CLASS_HI = 0, 1, 2, 3, 8, 16, 17
 CTL_SIZE = 32
 
 ST_HITS, ST_MISSES, ST_ADMITS, ST_EVICTS, ST_NO_VICTIM, ST_ZC, ST_CPU, ST_CALLS = range(8)
-ST_NO_LANE, ST_PREFILL, ST_ADMIT_BYTES, ST_ZC_BYTES = 8, 9, 10, 11
+ST_NO_LANE, ST_PREFILL, ST_ADMIT_BYTES, ST_ZC_BYTES, ST_BG_ADMITS, ST_BG_REJECTS = 8, 9, 10, 11, 12, 13
+ST_GPU_REJECTS = 14
 ST_CPU_NODE = 16
 STATS_SIZE = 32
 STAT_NAMES = ["hits", "misses", "admits", "evictions", "no_victim", "zero_copy", "cpu", "calls",
-              "no_lane", "prefill_calls", "admit_bytes", "zero_copy_bytes"]
+              "no_lane", "prefill_calls", "admit_bytes", "zero_copy_bytes", "bg_admits", "bg_rejects", "gpu_rejects"]
 
 LC_HIT, LC_ZC, LC_CPU_FIXED, LC_CPU = 0, 1, 2, 3
 
@@ -52,6 +53,7 @@ LANE_NONE, LANE_GPU, LANE_ZC = -2, -1, -3
 OP_EVICT, OP_DISABLE, OP_ENABLE, OP_INSTALL, OP_RESET_LAYER = 0, 1, 2, 3, 4
 
 SCAN_MAX = 8192
+BG_HYST = f32(1.25)
 
 
 class RefState:
@@ -144,6 +146,21 @@ def pick_node(st, L, e, cnt, nn, policy, pref, load, cost) -> int:
     return best
 
 
+def clock_victim(st: RefState, lo: int, rng: int, hand: int, ep: int):
+    """Mirror of hy_clock_victim. Returns (victim or -1, new hand)"""
+    for _ in range(min(2 * rng, SCAN_MAX)):
+        s = lo + hand
+        hand = 0 if hand + 1 == rng else hand + 1
+        p = int(st.pin[s])
+        if p < 0 or p == ep:
+            continue
+        if st.refb[s]:
+            st.refb[s] = 0
+            continue
+        return s, hand
+    return -1, hand
+
+
 def issue(st: RefState, nodes: dict, L: int, E: int, sel: np.ndarray, y: np.ndarray | None, hi: int,
           w: np.ndarray, sel_gpu: np.ndarray, lane_out: np.ndarray | None, cpu_sel: np.ndarray | None,
           prefill: int, admit: int, gpu_max: int, cpu_frac: float, prefill_gpu_min: int,
@@ -234,6 +251,9 @@ def issue(st: RefState, nodes: dict, L: int, E: int, sel: np.ndarray, y: np.ndar
     if rng > 0 and (hand < 0 or hand >= rng):
         hand = 0
     gcount = 0
+    bg = 0
+    bg_max = int(st.ctl[CTL_BG_ADMIT])
+    gpu_gate = int(st.ctl[CTL_GPU_GATE])
     flex_gpu = 0
     ebytes = int(st.reg_bytes[L])
 
@@ -269,19 +289,11 @@ def issue(st: RefState, nodes: dict, L: int, E: int, sel: np.ndarray, y: np.ndar
                 if pas == 1:
                     t_gpu = f32(t_gpu + lc[LC_ZC])
                 if admit and not prefill and rng > 0 and gcount < st.gmax:
-                    victim = -1
-                    for _ in range(min(2 * rng, SCAN_MAX)):
-                        s = lo + hand
-                        hand = 0 if hand + 1 == rng else hand + 1
-                        p = int(st.pin[s])
-                        if p < 0 or p == ep:
-                            continue
-                        if st.refb[s]:
-                            st.refb[s] = 0
-                            continue
-                        victim = s
-                        break
-                    if victim >= 0:
+                    victim, hand = clock_victim(st, lo, rng, hand, ep)
+                    o = int(st.owner[victim]) if victim >= 0 else -1
+                    if victim >= 0 and gpu_gate and o >= 0 and f32(st.hist[hbase + e]) < f32(st.hist[o]):
+                        st.stats[ST_GPU_REJECTS] += 1
+                    elif victim >= 0:
                         install(st, L, e, victim)
                         st.refb[victim] = 1
                         st.pin[victim] = ep
@@ -303,6 +315,27 @@ def issue(st: RefState, nodes: dict, L: int, E: int, sel: np.ndarray, y: np.ndar
                 t_cpu_max = max(t_cpu_max, t_node[node])
                 st.stats[ST_CPU] += 1
                 st.stats[ST_CPU_NODE + node] += 1
+                # Frequency-gated background admission (see the kernel)
+                if admit and not prefill and mapped and rng > 0 and gcount < st.gmax and bg < bg_max:
+                    victim, hand = clock_victim(st, lo, rng, hand, ep)
+                    if victim >= 0:
+                        o = int(st.owner[victim])
+                        hv = f32(st.hist[o]) if o >= 0 else f32(0.0)
+                        if o < 0 or f32(st.hist[hbase + e]) > f32(hv * BG_HYST):
+                            install(st, L, e, victim)
+                            st.refb[victim] = 1
+                            st.pin[victim] = ep
+                            st.gjobs[3 * gcount: 3 * gcount + 3] = (
+                                int(st.slot_base[victim]), int(st.reg_home[hbase + e]), ebytes)
+                            gcount += 1
+                            bg += 1
+                            st.stats[ST_ADMITS] += 1
+                            st.stats[ST_BG_ADMITS] += 1
+                            st.stats[ST_ADMIT_BYTES] += ebytes
+                        else:
+                            st.stats[ST_BG_REJECTS] += 1
+                    else:
+                        st.stats[ST_NO_VICTIM] += 1
             else:
                 st.stats[ST_NO_LANE] += 1
             lane[e] = ln

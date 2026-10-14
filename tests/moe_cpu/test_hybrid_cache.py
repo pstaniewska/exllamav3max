@@ -266,6 +266,107 @@ def test_cpu_lanes_quota_and_staging():
             assert torch.equal(nodes.x[q].view(1, 8), r["y"])
 
 
+def _cpu_layer(c, E = 16):
+    fl = FakeLayer(c, "a", E = E)
+    c.set_layer_cpuloc(fl.layer, np.arange(fl.E, dtype = np.int32)[None, :])   # every expert on node 0
+    return fl
+
+
+def test_cpu_lane_miss_is_admitted_in_the_background():
+    # gpu_max = 0 sends every flexible miss to the CPU. The CPU still computes this call's picks
+    # (lane and masking unchanged), but a free slot takes the expert for the next calls
+    c, _ = make_cache(bg_admit = 1)
+    fl = _cpu_layer(c)
+    c.begin_pass(1, 32)
+    nodes = Nodes(1, 2, 1, 8)
+    r = issue(c, fl, [3, 4], rows = 1, nodes = nodes, gpu_max = 0)
+    assert int(r["lane"][3]) == 0 and int(r["lane"][4]) == 0
+    assert (r["sel_gpu"] == fl.E).all()
+    st = c.stats()
+    assert st["bg_admits"] == 1 and st["admits"] == 1        # bounded: one per call
+    resident = [e for e in (3, 4) if int(c.ref_state.slotof[fl.layer.L * EMAX + e]) >= 0]
+    assert len(resident) == 1
+    e = resident[0]
+    assert torch.equal(slot_bytes(c, fl, e), fl.home[e * fl.eb: (e + 1) * fl.eb])
+    check_invariants(c, [fl])
+    # Next call: the admitted expert is a hit
+    r = issue(c, fl, [e], rows = 1, nodes = nodes, gpu_max = 0)
+    assert int(r["lane"][e]) == ref.LANE_GPU and c.stats()["hits"] == 1
+
+
+def test_background_admission_never_displaces_a_hotter_expert():
+    c, _ = make_cache(free = 4 * 1024, bg_admit = 1)        # one chunk: 4 slots
+    fl = _cpu_layer(c)
+    c.begin_pass(1, 32)
+    nodes = Nodes(1, 4, 1, 8)
+    for _ in range(8):                                       # 0..3 resident and hot
+        issue(c, fl, [0, 1, 2, 3], rows = 1, nodes = nodes)
+    st = c.ref_state
+    assert all(int(st.slotof[fl.layer.L * EMAX + e]) >= 0 for e in range(4))
+    before = c.stats()
+    for _ in range(3):                                       # a cold expert on the CPU lane
+        r = issue(c, fl, [9], rows = 1, nodes = Nodes(1, 1, 1, 8), gpu_max = 0)
+        assert int(r["lane"][9]) == 0
+    after = c.stats()
+    assert after["bg_admits"] == before["bg_admits"]
+    assert after["bg_rejects"] > before["bg_rejects"]
+    assert int(st.slotof[fl.layer.L * EMAX + 9]) < 0
+    assert all(int(st.slotof[fl.layer.L * EMAX + e]) >= 0 for e in range(4))
+    check_invariants(c, [fl])
+
+
+def test_background_admission_replaces_a_colder_expert():
+    c, _ = make_cache(free = 4 * 1024, bg_admit = 1)
+    fl = _cpu_layer(c)
+    c.begin_pass(1, 32)
+    issue(c, fl, [0, 1, 2, 3], rows = 1, nodes = Nodes(1, 4, 1, 8))    # resident, used once
+    for _ in range(6):                                                  # expert 9 gets hot on the CPU lane
+        issue(c, fl, [9], rows = 1, nodes = Nodes(1, 1, 1, 8), gpu_max = 0)
+    st = c.ref_state
+    assert int(st.slotof[fl.layer.L * EMAX + 9]) >= 0
+    assert c.stats()["bg_admits"] >= 1
+    check_invariants(c, [fl])
+
+
+def test_bg_admit_zero_keeps_cpu_lane_misses_out_of_the_cache():
+    c, _ = make_cache(bg_admit = 0)
+    fl = _cpu_layer(c)
+    c.begin_pass(1, 32)
+    for _ in range(4):
+        issue(c, fl, [3, 4], rows = 1, nodes = Nodes(1, 2, 1, 8), gpu_max = 0)
+    st = c.stats()
+    assert st["admits"] == 0 and st["bg_admits"] == 0 and st["bg_rejects"] == 0
+    check_invariants(c, [fl])
+
+
+def _hot_then_cold_on_gpu_lane(gpu_gate):
+    c, _ = make_cache(free = 4 * 1024, bg_admit = 0, gpu_gate = gpu_gate)   # one chunk: 4 slots
+    fl = FakeLayer(c, "a")
+    c.begin_pass(1, 32)
+    for _ in range(8):                                       # 0..3 resident and hot
+        issue(c, fl, [0, 1, 2, 3])
+    r = issue(c, fl, [9])                                    # a cold GPU-lane miss
+    return c, fl, r
+
+
+def test_gpu_gate_runs_a_colder_miss_zero_copy_without_evicting():
+    c, fl, r = _hot_then_cold_on_gpu_lane(1)
+    st = c.ref_state
+    assert int(r["lane"][9]) == ref.LANE_ZC
+    assert int(st.slotof[fl.layer.L * EMAX + 9]) < 0
+    assert all(int(st.slotof[fl.layer.L * EMAX + e]) >= 0 for e in range(4))
+    assert c.stats()["gpu_rejects"] == 1
+    check_invariants(c, [fl])
+
+
+def test_gpu_gate_zero_admits_every_gpu_lane_miss():
+    c, fl, r = _hot_then_cold_on_gpu_lane(0)
+    assert int(r["lane"][9]) == ref.LANE_GPU
+    assert int(c.ref_state.slotof[fl.layer.L * EMAX + 9]) >= 0
+    assert c.stats()["gpu_rejects"] == 0
+    check_invariants(c, [fl])
+
+
 def test_cpu_frac_and_unmapped_homes():
     c, _ = make_cache()
     mapped = [e != 6 for e in range(16)]
@@ -785,3 +886,22 @@ def test_warm_start_runs_once_per_owner_generation(tmp_path):
     FakeLayer(c, "b", eb = 2048)                 # new class: re-layout
     c.begin_pass(1, 32)
     assert float(c.ref_state.hist[fl.layer.L * EMAX + 2]) == h2   # live history kept
+
+
+def test_stats_log_keeps_newest_counter_lines_only(tmp_path, monkeypatch):
+    path = tmp_path / "cache_stats.jsonl"
+    c, _ = make_cache(stats_log = str(path), stats_log_s = 60, stats_log_max = 3)
+    fl = FakeLayer(c, "a")
+    c.begin_pass(1, 32)
+    clock = [1000.0]
+    monkeypatch.setattr(H.cache.time, "time", lambda: clock[0])
+    for i in range(5):
+        issue(c, fl, [1, 2, 3])
+        c.idle_maintenance()
+        c.idle_maintenance()                 # same interval: no second line
+        clock[0] += 61
+    lines = [json.loads(x) for x in path.read_text().splitlines()]
+    assert len(lines) == 3
+    assert set(lines[-1]) >= {"t", "device", "hit_rate", "hits", "misses", "admits", "bg_admits"}
+    assert all(l["hits"] + l["misses"] == 3 for l in lines)      # per-interval deltas
+    assert lines[-1]["hit_rate"] == 1.0

@@ -1,5 +1,8 @@
 from __future__ import annotations
+import errno
 import os
+import re
+import sys
 import multiprocessing
 from multiprocessing import shared_memory
 import numpy as np
@@ -81,6 +84,17 @@ def _align64(x):
     return (x + 63) & ~63
 
 
+def madv_collapse_supported() -> bool:
+    """MADV_COLLAPSE landed in Linux 6.1"""
+    if not sys.platform.startswith("linux"):
+        return False
+    m = re.match(r"(\d+)\.(\d+)", os.uname().release)
+    return bool(m) and (int(m.group(1)), int(m.group(2))) >= (6, 1)
+
+
+MADV_POPULATE_WRITE = 23   # Linux 5.14+
+
+
 class MoeCpuTuning:
     """
     Tunable knobs for the CPU MoE offload path, collected in one place: env vars are read once
@@ -122,6 +136,14 @@ class MoeCpuTuning:
         # VirtualAlloc time (no post-hoc promotion exists there), negotiating the request
         # size down per chunk and falling back to a plain mapping per chunk
         self.arena_hugepage = os.environ.get("EXL3_MOE_ARENA_HUGEPAGE", "1") != "0"
+        # How the Linux arena gets its hugepages: "collapse" = one MADV_COLLAPSE pass after loading
+        # (Linux 6.1+), "eager" = MADV_HUGEPAGE on each chunk before its first touch, so faults
+        # take 2 MiB pages directly. Kernels without MADV_COLLAPSE (e.g. 5.15) reject the collapse
+        # pass, leaving the whole arena on 4K pages, so they default to eager. Shared (memfd)
+        # chunks need eager mode on every kernel: fallocate commits their pages without a VMA, which
+        # shmem_enabled=advise never backs with hugepages
+        mode = os.environ.get("EXL3_MOE_ARENA_HUGEPAGE", "1").strip().lower()
+        self.arena_hugepage_eager = mode == "eager" or (mode != "collapse" and not madv_collapse_supported())
         # Packed ("swizzled") expert trellis layout: repacked at arena rehome so the banded
         # CPU kernels' tile groups stream sequentially from DRAM. The group is per matrix and
         # ISA-dependent -- exl3_moe_cpu_swizzle_group is the single rule (band-8 on the
@@ -496,16 +518,38 @@ class _HugeArena:
             elif self.huge == "2m":
                 flags = MFD_HUGETLB | MFD_HUGE_2MB
             fd = _memfd_create(f"exl3_moe_{self.kind}_{len(self.chunks)}", flags)
+            eager = not self.huge and TUNING.arena_hugepage and TUNING.arena_hugepage_eager
             try:
-                # Preallocate: a hugetlb memfd without enough reserved pages fails here with
-                # ENOMEM instead of SIGBUS on first touch. fallocate allocates the shmem pages
-                # itself (not through a mapping), so the node binding is this thread's policy
-                # for the duration of the call; the mapping is bound as well for later faults
-                with numa_mem.policy_scope(self.node):
-                    os.posix_fallocate(fd, 0, size)
-                m = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
-                if self.node is not None:
-                    numa_mem.bind_range_or_warn(_mmap_addr(m), size, self.node, f"CPU MoE {self.kind}")
+                if eager:
+                    # Commit through the mapping instead (MADV_POPULATE_WRITE also reports
+                    # ENOMEM up front): faults on a MADV_HUGEPAGE VMA take 2 MiB shmem pages
+                    # under shmem_enabled=advise, and follow the node binding of the range
+                    os.ftruncate(fd, size)
+                    m = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+                    if self.node is not None:
+                        numa_mem.bind_range_or_warn(_mmap_addr(m), size, self.node, f"CPU MoE {self.kind}")
+                    try:
+                        m.madvise(mmap.MADV_HUGEPAGE)
+                    except Exception:
+                        pass
+                    try:
+                        m.madvise(MADV_POPULATE_WRITE)
+                    except OSError as e:
+                        if e.errno != errno.EINVAL:
+                            m.close()
+                            raise
+                        with numa_mem.policy_scope(self.node):   # kernel < 5.14
+                            os.posix_fallocate(fd, 0, size)
+                else:
+                    # Preallocate: a hugetlb memfd without enough reserved pages fails here with
+                    # ENOMEM instead of SIGBUS on first touch. fallocate allocates the shmem pages
+                    # itself (not through a mapping), so the node binding is this thread's policy
+                    # for the duration of the call; the mapping is bound as well for later faults
+                    with numa_mem.policy_scope(self.node):
+                        os.posix_fallocate(fd, 0, size)
+                    m = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+                    if self.node is not None:
+                        numa_mem.bind_range_or_warn(_mmap_addr(m), size, self.node, f"CPU MoE {self.kind}")
             except OSError as e:
                 os.close(fd)
                 raise RuntimeError(
@@ -514,8 +558,9 @@ class _HugeArena:
                     + ("Reserve hugepages (vm.nr_hugepages / hugepages-1048576kB) or unset "
                        "EXL3_MOE_ARENA_HUGE." if self.huge else
                        "Check the memory cgroup limit, or unset EXL3_MOE_PINNED_ARENA.")) from e
-            if not self.huge and TUNING.arena_hugepage:
-                # Honoured only where shmem_enabled permits (advise/always/within_size)
+            if not self.huge and TUNING.arena_hugepage and not eager:
+                # Honoured only where shmem_enabled permits (advise/always/within_size), and
+                # only for pages faulted from now on, not the ones fallocate committed
                 try:
                     m.madvise(mmap.MADV_HUGEPAGE)
                 except Exception:
@@ -556,6 +601,12 @@ class _HugeArena:
             if self.node is not None:
                 # Private anonymous pages are placed at first touch (rehome's copy); bind first
                 numa_mem.bind_range_or_warn(_mmap_addr(m), size, self.node, f"CPU MoE {self.kind}")
+            if TUNING.arena_hugepage and TUNING.arena_hugepage_eager:
+                # Before the first touch, so rehome's copy faults 2 MiB pages directly
+                try:
+                    m.madvise(mmap.MADV_HUGEPAGE)
+                except Exception:
+                    pass
         self.chunks.append(m)
         self.cur = m
         self.cur_off = 0
@@ -600,6 +651,8 @@ class _HugeArena:
                       "(physical memory is too fragmented; large pages are usually available "
                       "again after a reboot)", flush = True)
             return
+        if TUNING.arena_hugepage_eager:
+            return   # chunks were hinted before their first touch (see _new_chunk)
         collapse = getattr(mmap, "MADV_COLLAPSE", 25)
         t0 = time.perf_counter()
         for c in self.chunks:
